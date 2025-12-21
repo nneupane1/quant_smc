@@ -1,12 +1,13 @@
-# QuantFund AI – Institutional-Grade Quant Trading Platform
+# QuantFund AI - Institutional-Grade Quant Trading Platform
+Riding the institutional liquidity wave
 
 QuantFund AI (founded by Nischal) is a full-stack quantitative research and trading platform that unifies data engineering, feature/label generation, ML model lifecycle, risk-aware execution, and rich monitoring dashboards. This repository houses the research-to-production pipeline for systematic digital asset trading.
 
 ## Why It Matters
-- **Research → Production, Seamlessly:** Same code paths for backtests, forward tests, and live trading to minimize sim/live drift.
-- **Feature-Rich Microstructure Intelligence:** Smart Money Concepts, liquidity signals, volatility regimes, confluence metrics, and hazard detection.
-- **Risk-First Execution:** Position sizing, exposure controls, EVR/MPCRisk, and execution adapters designed for real venues (e.g., Kraken).
-- **Operational Visibility:** Replayable timelines, dashboards for live/forward/backtest, equity and orderflow panels, and alerting.
+- **Research to production, seamlessly:** Same code paths for backtests, forward tests, and live trading to minimize sim/live drift.
+- **Feature-rich microstructure intelligence:** Smart Money Concepts, liquidity signals, volatility regimes, confluence metrics, and hazard detection.
+- **Risk-first execution:** Position sizing, exposure controls, EVR/MPCRisk, and execution adapters designed for real venues (e.g., Kraken).
+- **Operational visibility:** Replayable timelines, dashboards for live/forward/backtest, equity and orderflow panels, and alerting.
 
 ## Architecture Overview
 - **Data Layer (`data/`):** Ingestion (Kraken client + retry), resampling, session handling, builders, and persistence.
@@ -21,20 +22,20 @@ QuantFund AI (founded by Nischal) is a full-stack quantitative research and trad
 ## Project Layout (high level)
 ```
 quant_system/
-├── cli/                 # CLI entrypoints
-├── config/              # YAML configs + secrets template
-├── data/                # Ingestion, retry, resampling, sessions, builders
-├── features/            # Feature engineering + feature store
-├── label_generation/    # Labeling logic
-├── ml/                  # Model lifecycle (train/predict/optimize)
-├── execution/           # Risk, sizing, adapters
-├── backtest/            # Sim/replay/metrics/reporting
-├── forward_test/        # Paper trading / forward mode
-├── live/                # Live orchestrator + venue client
-├── dashboard/           # UI components (Python + JS/CSS)
-├── utils/               # Logging, time, rolling helpers, decorators
-├── train_orchestrator.py
-└── setup.py
+  cli/                 # CLI entrypoints
+  config/              # YAML configs + secrets template
+  data/                # Ingestion, retry, resampling, sessions, builders
+  features/            # Feature engineering + feature store
+  label_generation/    # Labeling logic
+  ml/                  # Model lifecycle (train/predict/optimize)
+  execution/           # Risk, sizing, adapters
+  backtest/            # Sim/replay/metrics/reporting
+  forward_test/        # Paper trading / forward mode
+  live/                # Live orchestrator + venue client
+  dashboard/           # UI components (Python + JS/CSS)
+  utils/               # Logging, time, rolling helpers, decorators
+  train_orchestrator.py
+  setup.py
 ```
 
 ## Quickstart
