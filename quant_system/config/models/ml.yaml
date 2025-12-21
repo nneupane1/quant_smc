@@ -1,0 +1,46 @@
+models:
+  regime_classifier:
+    type: "lightgbm"
+    max_depth: 5
+    num_leaves: 40
+
+  liquidity_flow:
+    type: "lightgbm"
+    max_depth: 4
+
+  bos_continuation:
+    type: "lightgbm"
+    max_depth: 4
+
+  micro_momentum:
+    type: "lightgbm"
+    max_depth: 3
+
+  eop:
+    type: "lightgbm"
+    max_depth: 4
+    horizon_bars: 96     # 24h
+
+  edp:
+    type: "lightgbm"
+    max_depth: 4
+    horizon_bars: 96     # 24h
+
+  meta:
+    type: "logistic_regression"
+    regularization: 1.0
+
+calibration:
+  method: "isotonic"      # isotonic | platt
+  validation_split_pct: 0.2
+
+features:
+  lagged_windows:
+    - 5
+    - 10
+    - 20
+  smc_features: true
+  regime_features: true
+  target_definition:
+    label_type: "direction_24h"
+    positive_threshold_r: 1.5

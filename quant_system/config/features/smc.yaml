@@ -1,0 +1,38 @@
+swings:
+  fractal:
+    "15m": { left: 2, right: 2 }
+    "1h":  { left: 3, right: 3 }
+    "5h":  { left: 3, right: 3 }
+    "10h": { left: 4, right: 4 }
+
+bos:
+  atr_buffer_multiplier:
+    "15m": 0.2
+    "1h":  0.3
+    "5h":  0.4
+    "10h": 0.5
+  close_over_structure: true
+
+choch:
+  enabled: true
+  require_body_confirm: true
+  wick_tolerance_atr: 0.15
+
+fvg:
+  min_gap_ticks: 1
+  validity_bars: 50
+  fill_threshold_pct: 80
+
+order_blocks:
+  max_age_bars: 200
+  min_displacement_atr: 1.0
+  mitigation_rule: "close_through"     # close_through | wick_touch
+
+sweeps:
+  equal_high_low_tolerance_atr: 0.1
+  require_displacement: true
+
+context:
+  external_range_lookback: 500
+  wick_pressure_window: 20
+  smc_density_window: 50

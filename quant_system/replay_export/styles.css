@@ -1,0 +1,74 @@
+body {
+    background: #0C0C0C;
+    margin: 0;
+    color: #E8E8E8;
+    font-family: "Inter", sans-serif;
+}
+
+#container {
+    display: flex;
+    flex-direction: row;
+    height: 100vh;
+    overflow: hidden;
+}
+
+#header {
+    width: 100%;
+    padding: 12px;
+    background: #111;
+    border-bottom: 1px solid #333;
+}
+
+#controls button {
+    background: #222;
+    border: 1px solid #444;
+    color: #EEE;
+    padding: 4px 8px;
+    border-radius: 4px;
+    margin-right: 4px;
+    cursor: pointer;
+}
+
+#controls button:hover {
+    background: #333;
+}
+
+#chart-area {
+    flex: 3;
+    position: relative;
+    background: #0A0A0A;
+}
+
+#ohlc-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+}
+
+#pnl-canvas {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+}
+
+#side-panel {
+    flex: 1.1;
+    padding: 14px;
+    background: #111;
+    border-left: 1px solid #333;
+    overflow-y: auto;
+}
+
+.reason-line {
+    margin-bottom: 8px;
+    font-size: 13px;
+}
+
+.reason-key {
+    color: #7FC3FF;
+    font-weight: 600;
+}
+
+.reason-value {
+    color: #FFF;
+}

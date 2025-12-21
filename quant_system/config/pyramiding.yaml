@@ -1,0 +1,48 @@
+pyramiding:
+  enable: true
+
+  base_risk_pct: 1.0          # initial risk % of equity per trade
+  add_unit_risk_pct: 0.5      # risk % per add-on
+  max_live_risk_pct: 2.0      # cap on total live risk while pyramiding
+
+  max_adds: 3
+
+  add1_trigger:
+    need_1h_bos: true
+    need_15m_displacement: true
+    need_15m_retest: true
+
+  add2_trigger:
+    need_new_15m_bos: true
+    need_small_pullback: true
+
+  add3_trigger:
+    need_new_1h_bos: true
+    drawdown_since_last_add_r: 0.5
+
+  absorption:
+    veto_threshold: 0.70
+    throttle_band: [0.40, 0.70]
+
+  regime:
+    allow: ["trend_up", "trend_down", "expansion", "distribution"]
+    block: ["chop", "vol_collapse"]
+
+  session:
+    min_weight: 0.2
+
+  confluence:
+    min_score: 0.60
+
+  be_after_add1: true
+  stop_to_pivot_after_each_add: true
+  min_stop_buffer_atr: 0.2
+
+  partial_on_r_multiple:
+    r_threshold: 2.0
+    partial_pct: 0.30
+    allow_once_per_trade: true
+
+  rl:
+    allow_override: true
+    include_absorption: true

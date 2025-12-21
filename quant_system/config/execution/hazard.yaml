@@ -1,0 +1,11 @@
+hazard_model:
+  type: "lightgbm"
+  lookahead_bars: 20
+  positive_label: "failure"   # stop-out, CHOCH, -1R
+
+policy:
+  thresholds:
+    hold:     0.10
+    tighten:  0.20
+    partial:  0.30
+    exit:     0.40

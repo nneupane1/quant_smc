@@ -1,0 +1,16 @@
+{
+  "name": "tv_chart_component",
+  "version": "1.0.0",
+  "private": true,
+  "description": "TradingView-style lightweight chart for Streamlit",
+  "scripts": {
+    "start": "parcel index.html --open",
+    "build": "parcel build index.html --dist-dir build --public-url ./"
+  },
+  "dependencies": {
+    "lightweight-charts": "^4.0.0"
+  },
+  "devDependencies": {
+    "parcel": "^2.9.0"
+  }
+}

@@ -1,0 +1,22 @@
+model_switcher:
+  # When regime probability is below this, fall back to performance ranking
+  min_prob: 0.25
+  max_disagreement: 0.25
+
+  # Regime-driven preferences (ordered)
+  rules:
+    min_prob: 0.25
+    trend:
+      long:
+        prefer: ["confluence_model", "meta_model"]
+      short:
+        prefer: ["confluence_model", "meta_model"]
+    range:
+      prefer: ["meta_model", "confluence_model"]
+    expansion:
+      prefer: ["confluence_model", "meta_model"]
+    collapse:
+      prefer: ["meta_model"]
+
+  # Performance memory file location (used by PerformanceMemory)
+  performance_store: "artifacts/model_performance.json"

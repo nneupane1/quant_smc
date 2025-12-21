@@ -1,0 +1,189 @@
+/* GLOBAL RESET */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+/* BODY */
+html, body {
+    background: #0D0D0F !important;
+    color: #E5E5E5 !important;
+    font-family: "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 15px;
+    line-height: 1.45;
+}
+
+/* STREAMLIT MAIN LAYOUT */
+.block-container {
+    padding-top: 1.5rem !important;
+    padding-bottom: 1.5rem !important;
+}
+
+/* HEADERS */
+h1, h2, h3, h4 {
+    font-weight: 600 !important;
+    letter-spacing: 0.2px;
+    color: #FAFAFA !important;
+}
+
+h1 { font-size: 30px !important; }
+h2 { font-size: 22px !important; }
+h3 { font-size: 18px !important; }
+
+/* TEXT + LINKS */
+p {
+    color: #D6D6D6 !important;
+}
+
+a {
+    color: #5DB1FF !important;
+    text-decoration: none !important;
+}
+a:hover {
+    color: #8BC7FF !important;
+}
+
+/* SIDEBAR */
+section[data-testid="stSidebar"] {
+    background: #111113 !important;
+    border-right: 1px solid #2A2A2D;
+}
+
+section[data-testid="stSidebar"] * {
+    color: #D8D8D8 !important;
+    font-size: 15px !important;
+}
+
+/* RADIO + CHECKBOX */
+.stRadio > label, .stCheckbox > label {
+    color: #e5e5e5 !important;
+    font-size: 15px !important;
+}
+
+/* SELECTBOX / MULTISELECT */
+.stSelectbox, .stMultiSelect {
+    background: #18181B !important;
+    border-radius: 6px !important;
+}
+
+/* METRIC WIDGETS */
+[data-testid="metric-container"] {
+    background: #151517;
+    border: 1px solid #2B2B2D;
+    border-radius: 6px;
+    padding: 10px 14px;
+}
+[data-testid="metric-container"] * {
+    color: #EAEAEA !important;
+}
+
+/* TABLES */
+.dataframe {
+    border-radius: 6px !important;
+    overflow: hidden !important;
+    border: 1px solid #2A2A2D !important;
+}
+thead {
+    background: #121214 !important;
+    color: #D9D9D9 !important;
+}
+
+/* SCROLLBARS */
+::-webkit-scrollbar {
+    width: 8px;
+}
+::-webkit-scrollbar-track {
+    background: #111;
+}
+::-webkit-scrollbar-thumb {
+    background: #2A2A2D;
+    border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: #3B3B3E;
+}
+
+/* PANELS (side info boxes) */
+.side-panel-box {
+    background: #151517 !important;
+    border: 1px solid #2A2A2D !important;
+    border-radius: 6px !important;
+    padding: 12px !important;
+}
+.side-panel-title {
+    font-size: 16px !important;
+    color: #DDEBFF !important;
+}
+
+/* HR */
+hr {
+    border: none;
+    height: 1px;
+    background: #2A2A2D;
+}
+
+/* CHART CONTAINER */
+#root {
+    border: 1px solid #2B2B2D;
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+/* STREAMLIT BUTTONS */
+.stButton button {
+    background: #1A1A1D !important;
+    border: 1px solid #333337 !important;
+    color: #F1F1F1 !important;
+    padding: 0.45rem 1.2rem !important;
+    border-radius: 6px !important;
+    transition: all 0.15s ease-in-out;
+    font-size: 15px;
+}
+.stButton button:hover {
+    background: #242428 !important;
+    border-color: #4A4A4F !important;
+}
+
+/* DOWNLOAD BUTTONS */
+.stDownloadButton button {
+    background: #1A1A1D !important;
+    color: #F1F1F1 !important;
+    border: 1px solid #333337 !important;
+    border-radius: 6px !important;
+}
+.stDownloadButton button:hover {
+    background: #242428 !important;
+}
+
+/* SELECTED ROW IN DATAFRAME */
+.highlight-row {
+    background-color: #26262A !important;
+}
+
+/* ALERT BOXES */
+.stAlert {
+    background: #18181C !important;
+    border-left: 4px solid #3A7CFF !important;
+    border-radius: 4px !important;
+}
+
+/* TOOLTIPS OVERRIDE */
+div[data-baseweb="tooltip"] {
+    background: #1D1D20 !important;
+    border: 1px solid #2A2A2D !important;
+    color: #E5E5E5 !important;
+}
+
+/* MODALS */
+.stModal {
+    background: #151517 !important;
+    border: 1px solid #2A2A2D !important;
+    border-radius: 6px !important;
+}
+
+/* FONT SIZE HELPERS */
+.small-text {
+    font-size: 13px !important;
+    color: #BEBEBE !important;
+}

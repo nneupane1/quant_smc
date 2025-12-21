@@ -1,0 +1,62 @@
+# assets.yaml — full multi-asset routing config
+
+assets:
+  enabled: ["BTCUSD", "ETHUSDT", "SOLUSDT", "AVAXUSDT", "BNBUSDT"]
+
+default_asset: "BTCUSD"
+
+metadata:
+  BTCUSD:
+    symbol: "BTC/USD"
+    # Kraken REST expects altname "XBTUSD" (legacy "XXBTZUSD" works too)
+    kraken_pair: "XBTUSD"
+    base: "BTC"
+    quote: "USD"
+    min_size: 0.0001
+    tick_size: 0.1
+    leverage_allowed: true
+
+  BTCUSDT:
+    symbol: "BTC/USDT"
+    kraken_pair: "XBTUSDT"
+    base: "BTC"
+    quote: "USDT"
+    min_size: 0.0001
+    tick_size: 0.1
+    leverage_allowed: true
+
+  ETHUSDT:
+    symbol: "ETH/USDT"
+    kraken_pair: "ETHUSDT"
+    base: "ETH"
+    quote: "USDT"
+    min_size: 0.001
+    tick_size: 0.01
+    leverage_allowed: true
+
+  SOLUSDT:
+    symbol: "SOL/USDT"
+    kraken_pair: "SOLUSDT"
+    base: "SOL"
+    quote: "USDT"
+    min_size: 0.01
+    tick_size: 0.01
+    leverage_allowed: true
+
+  AVAXUSDT:
+    symbol: "AVAX/USDT"
+    kraken_pair: "AVAXUSDT"
+    base: "AVAX"
+    quote: "USDT"
+    min_size: 0.01
+    tick_size: 0.01
+    leverage_allowed: true
+
+  BNBUSDT:
+    symbol: "BNB/USDT"
+    kraken_pair: "BNBUSDT"
+    base: "BNB"
+    quote: "USDT"
+    min_size: 0.001
+    tick_size: 0.01
+    leverage_allowed: true

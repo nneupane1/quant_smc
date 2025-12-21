@@ -1,0 +1,19 @@
+execution:
+  confluence:
+    weight_session: 1.10
+
+  tiers:
+    Aplus:
+      min_confluence: 0.75
+      min_evr: 1.55
+      max_hazard: 0.38
+
+  mpc:
+    risk_modes:
+      low: 0.006
+      medium: 0.011
+      high: 0.015
+
+features:
+  volatility:
+    realized_vol_lookback: 35

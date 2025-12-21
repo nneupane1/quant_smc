@@ -1,0 +1,7 @@
+ema:
+  enabled: true
+  slopes: true
+  distances: true
+  alignment_flags: true
+  min_slope_trend: 0.0
+  stretch_z_limit: 2.5

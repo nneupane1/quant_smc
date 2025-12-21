@@ -1,0 +1,13 @@
+execution:
+  gates:
+    ocean_12h:
+      trend_prob_min: 0.45
+      tox_max: 0.35
+
+    waves_6h:
+      zone_score_min: 0.60
+
+    flow_1h:
+      body_min: 0.60
+      vol_z_min: 0.80
+      freshness_bars: 4   # count of 15m bars since last flow confirmation

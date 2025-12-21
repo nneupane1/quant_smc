@@ -1,0 +1,16 @@
+stops:
+  atr_multiplier: 0.8
+  structural_buffer_atr: 0.3
+
+targets:
+  swing_levels: true
+  fvg_targets: true
+  liquidity_levels: true
+
+evr:
+  cost_bps:
+    taker: 4
+    maker: 2
+    slippage_market_bps: 3
+    slippage_limit_bps: 1.5
+  hazard_penalty_weight: 1.0

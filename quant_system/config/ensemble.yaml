@@ -1,0 +1,23 @@
+ensemble:
+  weights:
+    # default weights for models when no regime conditioning applies
+    default:
+      confluence_model: 0.6
+      meta_model: 0.4
+    # optional regime-specific overrides
+    trend:
+      confluence_model: 0.7
+      meta_model: 0.3
+    range:
+      meta_model: 0.6
+      confluence_model: 0.4
+    expansion:
+      confluence_model: 0.7
+      meta_model: 0.3
+    collapse:
+      meta_model: 0.7
+      confluence_model: 0.3
+
+  disagreement:
+    max_spread: 0.25
+    hedge_factor: 1.25

@@ -1,0 +1,30 @@
+execution:
+  confluence:
+    weight_smc: 0.65
+    weight_rsv: 0.70
+    weight_meta: 0.30
+
+  tiers:
+    Aplus:
+      min_confluence: 0.82
+      min_evr: 1.80
+      max_hazard: 0.28
+
+  mpc:
+    cvar_target: 0.012
+    risk_modes:
+      low: 0.003
+      medium: 0.005
+      high: 0.008
+    hedge_ratio_bounds: [0.50, 1.00]
+
+  shorting:
+    directional_short:
+      allow: true
+      apr_cap: 0.25
+      require_A_or_Aplus: true
+
+features:
+  smc:
+    compression:
+      volatility_drop_pct: 0.50

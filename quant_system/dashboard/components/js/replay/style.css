@@ -1,0 +1,176 @@
+/* ============================================================
+   GLOBAL LAYOUT
+   Smooth Bloomberg-style dark aesthetic
+   ============================================================ */
+
+body {
+    margin: 0;
+    padding: 0;
+    background: #0D0D0F;
+    font-family: "Inter", "Roboto", sans-serif;
+    overflow: hidden;
+    color: #e8e8e8;
+}
+
+#container {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    width: 100vw;
+}
+
+
+/* ============================================================
+   CHART AREA
+   ============================================================ */
+
+#chart {
+    flex: 1;
+    position: relative;
+    border-bottom: 1px solid #1C1C1E;
+    animation: fadeIn 0.5s ease-out;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+
+/* ============================================================
+   INFO PANEL
+   ============================================================ */
+
+#info-panel {
+    height: 80px;
+    background: #121214;
+    display: flex;
+    justify-content: space-evenly;
+    align-items: center;
+    border-bottom: 1px solid #1C1C1E;
+    padding: 0 20px;
+}
+
+.info-row {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    min-width: 80px;
+}
+
+.label {
+    font-size: 12px;
+    color: #888;
+    letter-spacing: 0.5px;
+}
+
+.value {
+    margin-top: 4px;
+    font-size: 16px;
+    font-weight: 600;
+    color: #e0e0e0;
+    transition: color 0.25s ease, transform 0.2s ease;
+}
+
+/* Glow when values update */
+.value.updated {
+    color: #4FC3F7;
+    text-shadow: 0 0 8px rgba(79, 195, 247, 0.7);
+    transform: scale(1.05);
+}
+
+
+/* ============================================================
+   CONTROLS (Replay Buttons)
+   ============================================================ */
+
+#controls {
+    height: 60px;
+    background: #121214;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    border-top: 1px solid #1C1C1E;
+}
+
+.ctrl-btn {
+    width: 50px;
+    height: 34px;
+    margin: 0 8px;
+    font-size: 18px;
+    background: #1A1A1D;
+    color: #ddd;
+    border: 1px solid #2C2C2F;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: background 0.25s ease, transform 0.1s ease;
+}
+
+.ctrl-btn:hover {
+    background: #27272A;
+    transform: scale(1.07);
+}
+
+.ctrl-btn:active {
+    background: #333;
+    transform: scale(0.95);
+}
+
+
+/* ============================================================
+   THEME VARIANTS
+   (switchable via HTML class injection from JS/Streamlit)
+   ============================================================ */
+
+body.high-contrast {
+    background: #000;
+    color: #fff;
+}
+
+body.high-contrast #chart {
+    border-bottom: 1px solid #444;
+}
+
+body.high-contrast #info-panel {
+    background: #000;
+}
+
+body.bloomberg {
+    background: #000105;
+}
+
+body.bloomberg #info-panel {
+    background: #02020A;
+}
+
+body.minimal {
+    background: #111;
+}
+
+body.minimal #info-panel {
+    background: #111;
+}
+
+
+/* ============================================================
+   SCROLLBAR (hidden for clean charts)
+   ============================================================ */
+
+::-webkit-scrollbar {
+    width: 0px;
+    height: 0px;
+}
+
+
+/* ============================================================
+   UTILITY CLASSES
+   ============================================================ */
+
+.fade-in {
+    animation: fadeIn 0.4s ease-out;
+}
+
+.glow {
+    text-shadow: 0 0 12px rgba(0, 200, 255, 0.8);
+}

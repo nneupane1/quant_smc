@@ -1,0 +1,157 @@
+models:
+
+  # =======================================================
+  # Specialist models
+  # =======================================================
+
+  liq_flow:
+    algorithm: "lightgbm"
+    horizon_bars: 12
+    calibrator: "auto"
+    hpo_trials: 50
+    cv_splits: 4
+    class_weight: "balanced"
+    features:
+      group: ["smc", "liquidity", "ema", "volatility", "regime", "session"]
+    hpo_space:
+      n_estimators: [200, 600]
+      num_leaves: [31, 255]
+      max_depth: [3, 12]
+      learning_rate: [0.001, 0.15]
+      subsample: [0.6, 1.0]
+      colsample_bytree: [0.6, 1.0]
+      reg_alpha: [0.0, 10.0]
+      reg_lambda: [0.0, 10.0]
+
+  bos_cont:
+    algorithm: "lightgbm"
+    horizon_bars: 48
+    calibrator: "auto"
+    hpo_trials: 50
+    cv_splits: 4
+    class_weight: "balanced"
+    features:
+      group: ["smc", "volatility", "ema", "regime", "session"]
+    hpo_space:
+      n_estimators: [200, 700]
+      num_leaves: [31, 255]
+      max_depth: [3, 12]
+      learning_rate: [0.001, 0.15]
+      subsample: [0.6, 1.0]
+      colsample_bytree: [0.6, 1.0]
+      reg_alpha: [0.0, 10.0]
+      reg_lambda: [0.0, 10.0]
+
+  momo:
+    algorithm: "lightgbm"
+    horizon_bars: 8
+    calibrator: "auto"
+    hpo_trials: 40
+    cv_splits: 4
+    features:
+      group: ["smc", "ema", "volatility", "liquidity", "regime", "session"]
+    hpo_space:
+      n_estimators: [100, 400]
+      num_leaves: [15, 200]
+      max_depth: [2, 10]
+      learning_rate: [0.001, 0.15]
+      subsample: [0.6, 1.0]
+      colsample_bytree: [0.6, 1.0]
+
+  eop:
+    algorithm: "xgboost"
+    horizon_bars: 96
+    calibrator: "isotonic"
+    hpo_trials: 40
+    cv_splits: 3
+    features:
+      group: ["smc", "ema", "volatility", "regime", "session"]
+    hpo_space:
+      n_estimators: [200, 800]
+      max_depth: [3, 12]
+      learning_rate: [0.001, 0.15]
+      subsample: [0.6, 1.0]
+      colsample_bytree: [0.6, 1.0]
+
+  edp:
+    algorithm: "xgboost"
+    horizon_bars: 96
+    calibrator: "isotonic"
+    hpo_trials: 40
+    cv_splits: 3
+    features:
+      group: ["smc", "volatility", "regime", "session"]
+    hpo_space:
+      n_estimators: [200, 800]
+      max_depth: [3, 12]
+      learning_rate: [0.001, 0.15]
+      subsample: [0.6, 1.0]
+      colsample_bytree: [0.6, 1.0]
+
+  regime_classifier:
+    algorithm: "logistic"
+    calibrator: "platt"
+    hpo_trials: 20
+    cv_splits: 3
+    features:
+      group: ["regime", "volatility", "ema"]
+    hpo_space:
+      C: [0.01, 10.0]
+
+  # =======================================================
+  # Meta-model (stacking specialist outputs)
+  # =======================================================
+  meta_model:
+    algorithm: "logistic"
+    calibrator: "platt"
+    hpo_trials: 20
+    cv_splits: 3
+    specialist_inputs: ["liq_flow", "bos_cont", "momo", "eop", "edp"]
+    hpo_space:
+      C: [0.01, 5.0]
+
+  # =======================================================
+  # Confluence model
+  # =======================================================
+  confluence_model:
+    algorithm: "logistic"
+    calibrator: "isotonic"
+    hpo_trials: 20
+    cv_splits: 3
+    specialist_inputs: ["liq_flow", "bos_cont", "momo", "eop", "edp"]
+    hpo_space:
+      C: [0.01, 4.0]
+
+  # =======================================================
+  # Hazard survival model (per-bin)
+  # =======================================================
+  hazard:
+    algorithm: "logistic"
+    horizon_bars: 48
+    min_event_fraction: 0.01
+    calibrate_bins: false
+    features:
+      group: ["smc", "ema", "volatility", "liquidity", "regime", "session"]
+    hpo:
+      enabled: true
+      trials_per_bin: 10
+    hpo_space:
+      C: [0.01, 10.0]
+
+  # =======================================================
+  # Quantile return forecaster (for MPC & CVaR)
+  # =======================================================
+  quantile_forecaster:
+    algorithm: "lightgbm"
+    quantiles: [0.05, 0.1, 0.5, 0.9, 0.95]
+    hpo_trials: 40
+    cv_splits: 4
+    features:
+      group: ["smc", "volatility", "ema", "regime"]
+    hpo_space:
+      n_estimators: [200, 600]
+      num_leaves: [31, 255]
+      max_depth: [3, 12]
+      learning_rate: [0.001, 0.15]
+      subsample: [0.6, 1.0]
+      colsample_bytree: [0.6, 1.0]

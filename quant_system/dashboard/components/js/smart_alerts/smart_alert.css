@@ -1,0 +1,60 @@
+/* smart_alerts.css */
+
+#smart-alerts-sidebar {
+    width: 340px;
+    height: 100%;
+    overflow-y: auto;
+    background: rgba(22,22,26,0.90);
+    backdrop-filter: blur(8px);
+    border-left: 1px solid rgba(255,255,255,0.1);
+    padding: 14px;
+    color: #eee;
+    font-family: Arial, sans-serif;
+    transition: 0.3s ease;
+}
+
+.sa-header {
+    display: flex;
+    justify-content: space-between;
+    font-size: 13px;
+    margin-bottom: 12px;
+    opacity: 0.85;
+}
+
+.sa-side.long { color: #00e676; font-weight: bold; }
+.sa-side.short { color: #ff5252; font-weight: bold; }
+
+.sa-block {
+    background: rgba(255,255,255,0.05);
+    margin-bottom: 14px;
+    padding: 10px;
+    border-radius: 6px;
+    animation: fadeIn 0.25s ease;
+}
+
+.sa-title {
+    font-weight: bold;
+    font-size: 14px;
+    margin-bottom: 6px;
+}
+
+.sa-body {
+    font-size: 12px;
+}
+
+.sa-table {
+    width: 100%;
+}
+
+.sa-table td {
+    padding: 2px 0;
+}
+
+.sa-pop {
+    transform: translateX(6px);
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+}

@@ -1,0 +1,93 @@
+labels:
+
+  # =======================================================
+  # Liquidity Flow Label
+  # Success if:
+  #   sweep → displacement → retrace → +1R continuation
+  #   within 12×15m bars
+  # =======================================================
+  liq_flow:
+    horizon_bars: 12
+    displacement_min_body_pct: 0.55
+    volume_z_threshold: 0.8
+    retrace_min_ratio: 0.25
+    continuation_min_R: 1.0
+    smc_requirements:
+      require_sweep: true
+      require_displacement: true
+
+
+  # =======================================================
+  # BOS Continuation Label
+  # Success if:
+  #   BOS on 1h/6h leads to ≥3R before invalidation
+  #   within 48×15m bars
+  # =======================================================
+  bos_cont:
+    horizon_bars: 48
+    min_R: 3.0
+    bos_min_displacement_body_pct: 0.60
+    bos_atr_buffer_mult: 0.30
+    invalidation_on_choch: true
+    smc_requirements:
+      require_bos: true
+      use_1h: true
+      use_6h: true
+
+
+  # =======================================================
+  # Micro-Momentum Label
+  # Success if forward return (4–8 bars) exceeds noise threshold
+  # =======================================================
+  momo:
+    min_horizon: 4
+    max_horizon: 8
+    noise_band_sigma: 0.75
+    return_threshold_sigma: 1.20
+
+
+  # =======================================================
+  # EOP — Expected Opportunity Probability
+  # Success if an A+ setup appears within 96 bars
+  # =======================================================
+  eop:
+    horizon_bars: 96
+    require_Aplus: true
+    Aplus_min_evr: 1.50
+    Aplus_min_medianR: 5.0
+    hazard_cap: 0.35
+
+
+  # =======================================================
+  # EDP — Expected Drawdown Probability
+  # Success if equity drawdown exceeds −3R within 96 bars
+  # =======================================================
+  edp:
+    horizon_bars: 96
+    drawdown_R_threshold: -3.0
+    fail_on_stop: true
+    fail_on_choch: true
+
+
+  # =======================================================
+  # Hazard Survival Labels
+  # Event = first failure:
+  #   stop OR CHOCH OR −1R within 48 bars.
+  # Censored if not hit.
+  # =======================================================
+  hazard:
+    horizon_bars: 48
+    event_R_threshold: -1.0
+    treat_choch_as_event: true
+    treat_stop_as_event: true
+
+
+  # =======================================================
+  # Quantile Return Forecaster (for MPC / CVaR)
+  # Predict return distribution over next bars.
+  # =======================================================
+  quantile_forecaster:
+    horizon_bars: 12
+    use_log_returns: true
+    volatility_adjust_target: true
+    quantiles: [0.05, 0.10, 0.50, 0.90, 0.95]

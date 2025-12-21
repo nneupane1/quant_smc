@@ -1,0 +1,5 @@
+/* Dark theme override */
+body {
+    background: #0D0D0F !important;
+    color: #E6E6E6 !important;
+}

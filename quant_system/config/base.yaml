@@ -1,0 +1,97 @@
+# ================================================
+# Base configuration (lowest priority)
+# All overrides come from:
+#   models.yaml
+#   features.yaml
+#   labels.yaml
+#   execution.yaml
+#   regime_overrides/*
+#   session_overrides/*
+#   DEV.yaml / LIVE.yaml
+# ================================================
+
+global:
+  env: "${QS_ENV}"            # DEV / TEST / LIVE
+  seed: 2024
+  print_logs: true
+  data_root: "data/"
+  model_root: "models/"
+  results_root: "results/"
+  cache_root: "cache/"
+
+logging:
+  level: "INFO"
+  file: "logs/system.log"
+  rotate_size_mb: 20
+  rotate_backups: 5
+
+# ------------------------------------------------
+# Timeframes used in the system
+# ------------------------------------------------
+timeframes:
+  base: "1m"
+  execution: "15m"
+  flow: "1h"
+  structure: "6h"
+  regime: "12h"
+
+# ------------------------------------------------
+# Data ingestion configuration
+# ------------------------------------------------
+data:
+  provider: "kraken"
+  symbol: "BTC/EUR"
+  start_date: "2017-01-01"
+  end_date: "2026-01-01"
+  write_csv: true
+  chunk_days: 5           # API pull window per request
+  rate_limit_sleep: 2
+  retry_attempts: 5
+
+api:
+  kraken:
+    key: "${KRAKEN_API_KEY}"
+    secret: "${KRAKEN_API_SECRET}"
+    url: "https://api.kraken.com"
+
+# ------------------------------------------------
+# Model registry + versioning
+# ------------------------------------------------
+models:
+  registry_path: "models/"
+  version_index: ".model_versions.json"
+
+# ------------------------------------------------
+# Backtesting engine defaults
+# ------------------------------------------------
+backtest:
+  slippage_bps: 3
+  maker_fee_bps: 2
+  taker_fee_bps: 4
+  borrow_rate_apr: 0.15
+  hazard_horizon_bars: 48
+  evr_costs:
+    spread_bps: 2
+    funding_rate_cap: 0.03
+
+# ------------------------------------------------
+# Live engine defaults
+# ------------------------------------------------
+live:
+  update_interval_sec: 60
+  dashboard_port: 8501
+  max_plot_candles: 1500
+  show_smc_layers: true
+  show_regime_probs: true
+  show_confluence_tree: true
+
+# ------------------------------------------------
+# General paths
+# ------------------------------------------------
+paths:
+  data: "data/"
+  features: "data/features/"
+  labels: "data/labels/"
+  models: "models/"
+  logs: "logs/"
+  dashboards: "dashboards/"

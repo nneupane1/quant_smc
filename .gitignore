@@ -1,0 +1,70 @@
+# Environment / virtualenv
+.env
+.env.*
+.venv/
+venv/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.python-version
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Coverage / testing
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Frontend
+node_modules/
+
+# Logs / runtime output
+logs/
+**/logs/
+*.log
+*.out
+
+# Data dumps and large artifacts
+*.csv
+*.tsv
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.db
+*.sqlite
+*.sqlite3
+*.pkl
+*.joblib
+*.npz
+*.npy
+*.arrow
+*.orc
+*.gz
+*.bz2
+*.zip
+
+# Generated artifacts
+outputs/
+artifacts/
+checkpoints/
+reports/
+tmp/
+temp/
+*.bak

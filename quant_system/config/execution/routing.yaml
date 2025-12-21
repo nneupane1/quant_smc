@@ -1,0 +1,9 @@
+spot:
+  enabled: true
+  borrow_ltv_max: 0.5
+  max_borrow_apr: 0.12
+
+perp:
+  enabled: true
+  hedge_mode: "one_way"
+  max_hedge_pct: 1.0

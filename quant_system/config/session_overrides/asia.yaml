@@ -1,0 +1,25 @@
+execution:
+  confluence:
+    weight_session: 0.85
+
+  tiers:
+    Aplus:
+      min_confluence: 0.82
+      min_evr: 1.65
+      max_hazard: 0.30
+
+  trade_rate:
+    top_k_per_hour: 1
+    cooldown_bars: 3
+
+  mpc:
+    risk_modes:
+      low: 0.004
+      medium: 0.007
+      high: 0.010
+    hedge_ratio_bounds: [0.40, 0.90]
+
+features:
+  liquidity:
+    eql_window: 60
+    liquidity_density_window: 80

@@ -1,0 +1,14 @@
+{
+  "confluence_model": {
+    "evr": 1.05,
+    "precision": 0.68,
+    "max_dd": 0.12,
+    "cvar95": 0.18
+  },
+  "meta_model": {
+    "evr": 0.92,
+    "precision": 0.62,
+    "max_dd": 0.10,
+    "cvar95": 0.15
+  }
+}

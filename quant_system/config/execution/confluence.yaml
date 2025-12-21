@@ -1,0 +1,24 @@
+weights:
+  bos_continuation: 0.30
+  liquidity_flow:  0.25
+  micro_momentum:  0.15
+  regime_signal:   0.15
+  smc_context:     0.15
+
+session_weights:
+  london: 1.00
+  new_york: 1.00
+  overlap: 1.10
+  asia: 0.85
+
+thresholds:
+  segments:
+    bull_trend:
+      a_plus: 0.72
+      a: 0.60
+    bear_trend:
+      a_plus: 0.70
+      a: 0.58
+    range:
+      a_plus: 0.67
+      a: 0.55

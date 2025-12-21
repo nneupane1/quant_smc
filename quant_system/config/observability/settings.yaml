@@ -1,0 +1,30 @@
+project:
+  name: quant_system
+  mode: development          # or production
+
+data:
+  base_path: "./data"
+  raw_path: "./data/raw"
+  tf_path: "./data/tf"
+  feature_path: "./data/features"
+  label_path: "./data/labels"
+  registry_path: "./models/registry"
+  log_path: "./logs"
+
+timeframes:
+  base: "1m"
+  list: ["1m", "15m", "1h", "5h", "10h"]
+
+data_fetch:
+  exchange: "kraken"
+  symbol: "BTC/USD"
+  start_date: "2017-01-01"
+  end_date: "2026-01-01"
+  max_rows: 999999999
+
+storage:
+  format: "csv"         # always CSV, never parquet
+  compression: false
+
+environment:
+  env_file: ".env"

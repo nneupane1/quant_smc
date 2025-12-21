@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>Replay Export</title>
+
+    <style>
+        /*__CSS__*/
+    </style>
+</head>
+
+<body>
+
+<div id="container">
+
+    <div id="header">
+        <h2>Replay Export</h2>
+        <div id="controls">
+            <button id="btn-back">◀</button>
+            <button id="btn-play">⏵</button>
+            <button id="btn-pause">⏸</button>
+            <button id="btn-forward">▶</button>
+
+            <span style="margin-left:20px;">Speed:</span>
+            <input id="speed" type="range" min="1" max="60" value="24">
+
+            <span style="margin-left:20px;">Frame:</span>
+            <input id="frame-slider" type="range" min="0" max="1" value="0">
+        </div>
+    </div>
+
+    <div id="chart-area">
+        <canvas id="ohlc-canvas"></canvas>
+        <canvas id="pnl-canvas"></canvas>
+    </div>
+
+    <div id="side-panel">
+        <h3>Reasoning</h3>
+        <div id="reasoning-panel"></div>
+    </div>
+
+</div>
+
+<script>
+const PAYLOAD = __DATA__;
+</script>
+
+<script>
+//__JS__
+</script>
+
+</body>
+</html>

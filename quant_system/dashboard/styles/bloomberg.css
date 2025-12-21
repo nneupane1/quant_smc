@@ -1,0 +1,14 @@
+/* Bloomberg-inspired theme */
+body {
+    background: #0A0A0C !important;
+    color: #F0F0F0 !important;
+}
+
+.block-container {
+    max-width: 1400px !important;
+}
+
+.stButton button {
+    background: #1e1e28 !important;
+    border: 1px solid #3a3a45 !important;
+}

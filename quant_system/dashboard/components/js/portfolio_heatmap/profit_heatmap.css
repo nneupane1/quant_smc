@@ -1,0 +1,62 @@
+/* heatmap.css */
+
+.heatmap-grid {
+    display: grid;
+    grid-template-columns: 130px repeat(4, 80px) 120px;
+    gap: 6px;
+    background: #111;
+    padding: 8px;
+    border-radius: 8px;
+    font-family: "Inter", sans-serif;
+    color: #E0E0E0;
+}
+
+.heatmap-header {
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 12px;
+    opacity: 0.7;
+    padding-bottom: 4px;
+}
+
+.cell {
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 13px;
+    text-align: center;
+    transition: background-color 700ms ease, color 700ms ease;
+}
+
+/* Gradient maps */
+.cell-long {
+    background: linear-gradient(90deg, #103510, #1E6020);
+}
+
+.cell-short {
+    background: linear-gradient(90deg, #3A1010, #6A1E1E);
+}
+
+.cell-net-pos {
+    background: linear-gradient(90deg, #0A3A52, #11688C);
+}
+
+.cell-net-neg {
+    background: linear-gradient(90deg, #4A1D05, #7A310A);
+}
+
+/* Regime framing */
+.cell-regime-trend {
+    border: 1px solid #3FD47F;
+}
+
+.cell-regime-range {
+    border: 1px solid #C0C040;
+}
+
+.cell-regime-collapse {
+    border: 1px solid #D43F3F;
+}
+
+.cell-regime-expansion {
+    border: 1px solid #3F82D4;
+}

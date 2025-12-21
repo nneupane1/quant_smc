@@ -1,0 +1,23 @@
+optimization:
+  bayesian:
+    enabled: true
+    n_trials: 60
+    timeout: 3600
+
+  genetic:
+    enabled: true
+    population_size: 40
+    generations: 8
+    crossover_rate: 0.7
+    mutation_rate: 0.1
+
+  search_spaces:
+    lightgbm:
+      num_leaves: [32, 256]
+      learning_rate: [0.001, 0.2]
+      min_child_samples: [20, 200]
+      feature_fraction: [0.6, 1.0]
+    xgboost:
+      max_depth: [3, 12]
+      eta: [0.001, 0.2]
+      subsample: [0.6, 1.0]

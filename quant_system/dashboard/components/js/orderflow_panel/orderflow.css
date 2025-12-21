@@ -1,0 +1,36 @@
+/* orderflow.css */
+
+.of-container {
+    display: flex;
+    gap: 12px;
+    height: 100%;
+    padding: 6px;
+}
+
+.of-col {
+    flex: 1;
+    overflow-y: auto;
+    background: rgba(18,18,20,0.9);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 6px;
+    padding: 6px;
+}
+
+.of-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 3px 6px;
+    font-size: 11px;
+    color: #ddd;
+    margin-bottom: 2px;
+    border-radius: 3px;
+}
+
+#delta-bars {
+    height: 80px;
+    overflow-y: hidden;
+    background: rgba(18,18,20,0.9);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 6px;
+    padding: 4px;
+}

@@ -1,0 +1,9 @@
+/* Minimal clean theme */
+body {
+    background: #111 !important;
+    color: #EEE !important;
+}
+
+hr {
+    opacity: 0.1 !important;
+}

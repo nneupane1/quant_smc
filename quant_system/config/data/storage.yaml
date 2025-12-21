@@ -1,0 +1,10 @@
+paths:
+  raw_1m:      "data/raw_1m"
+  tf:          "data/tf"
+  features:    "data/features"
+  labels:      "data/labels"
+  cache:       "data/cache"
+
+duckdb:
+  file: "data/system.duckdb"
+  threads: 4

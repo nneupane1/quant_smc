@@ -1,0 +1,24 @@
+timeframes:
+  base: "1m"
+
+  derived:
+    - name: "15m"
+      multiple: 15
+      closed_bar_rule: "left_closed_right_open"
+
+    - name: "1h"
+      multiple: 60
+
+    - name: "5h"
+      multiple: 300
+
+    - name: "10h"
+      multiple: 600
+
+resample:
+  volume_aggregation: "sum"
+  price_aggregation:
+    open: "first"
+    high: "max"
+    low: "min"
+    close: "last"

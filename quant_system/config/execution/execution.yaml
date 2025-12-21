@@ -1,0 +1,202 @@
+execution:
+  starting_equity: 20000
+
+  # =======================================================
+  # Confluence Model / Score Configuration
+  # =======================================================
+  confluence:
+    weight_specialist: 1.0
+    weight_meta: 0.5
+    weight_rsv: 0.5
+    weight_smc: 0.5
+    weight_session: 1.0
+    normalize: true
+
+  # =======================================================
+  # Tier Criteria for A+/A/B classification
+  # =======================================================
+  tiers:
+    Aplus:
+      min_confluence: 0.75
+      min_evr: 1.50
+      min_medianR: 5.0
+      max_hazard: 0.35
+      auto_execute: true
+
+    A:
+      min_confluence: 0.60
+      min_evr: 1.20
+      min_medianR: 4.0
+      max_hazard: 0.45
+      auto_execute: false
+
+    B:
+      min_confluence: 0.45
+      min_evr: 0.80
+      min_medianR: 2.0
+      max_hazard: 0.60
+      auto_execute: false
+
+  # =======================================================
+  # Stop-Loss and Target Configuration
+  # =======================================================
+  stops_targets:
+    stop_atr_mult: 0.80
+    stop_atr_bounds: [0.40, 2.00]
+    target_order: ["swing", "fvg", "liquidity", "range"]
+    require_rr_min: true
+
+  # =======================================================
+  # EVR Calculation
+  # =======================================================
+  evr:
+    include_fees: true
+    include_slippage: true
+    include_borrow_costs: true
+    fee_bps:
+      maker: 2
+      taker: 4
+    slippage_bps:
+      limit_hit: 1.5
+      market: 3.0
+    borrow_apr_cap: 0.15
+
+  # =======================================================
+  # Hazard-Based Trailing / Exit
+  # =======================================================
+  hazard_trailing:
+    thresholds:
+      hold: 0.20
+      tighten: 0.30
+      partial: 0.40
+      exit: 0.50
+    runner_thresholds:
+      hold: 0.25
+      tighten: 0.40
+      partial: 0.55
+      exit: 0.65
+    atr_multipliers:
+      tighten: 0.50
+      exit_band: 1.00
+    runner_multipliers:
+      tighten: 0.25
+      exit_band: 1.80
+    ema_stretch_z: 2.5
+    freshness_decay_bars: 32
+    segment_thresholds: {}
+
+  # =======================================================
+  # MPC: CVaR-Constrained Risk Manager
+  # =======================================================
+  mpc:
+    cvar_target: 0.015              # max allowed CVaR per 15m
+    risk_modes:
+      low: 0.005
+      medium: 0.010
+      high: 0.015
+    hedge_ratio_bounds: [0.30, 0.80]
+    lock_fraction_bounds: [0.00, 0.50]
+    objective: "maximize_log_equity"
+
+  # =======================================================
+  # Short-Selling Logic
+  # =======================================================
+  shorting:
+    directional_short:
+      allow: true
+      apr_cap: 0.20
+      ltv_limit: 0.80
+      require_A_or_Aplus: true
+    hedge_short:
+      enable: true
+      max_ratio: 1.00
+      decay_on_recovery: true
+      min_profit_gap_R: 1.0
+
+  # =======================================================
+  # Trade Rate Control
+  # =======================================================
+  trade_rate:
+    top_k_per_hour: 2
+    cooldown_bars: 2
+    target_daily_min: 3
+    target_daily_max: 5
+    precision_floor: 0.65
+    pid_nudge:
+      enabled: true
+      delta_per_day: 0.05
+
+  # =======================================================
+  # Multi-TF Gate / Permissions
+  # (10h → 6h → 1h → 15m equivalent)
+  # =======================================================
+  gates:
+    regime_12h:
+      trend_prob_min: 0.45
+      tox_max: 0.35
+
+    structure_6h:
+      zone_score_min: 0.60
+
+    flow_1h:
+      displacement_body_pct_min: 0.60
+      volume_z_min: 0.80
+      freshness_bars: 4        # 4×15m
+
+    execution_15m:
+      allow_if_bias_aligned: true
+      enforce_confluence_threshold: true
+      enforce_evr_threshold: true
+      enforce_hazard_threshold: true
+
+
+
+live_trading:
+  enabled: false
+  leverage:
+    enabled: false      # master switch
+    default: 1          # 1 = no leverage
+    min: 1
+    max: 5
+
+  venue:
+    mode: "spot"        # spot | margin | futures
+    pair: "XXBTZUSD"
+    max_retry: 5
+    retry_sleep: 1.0
+
+
+
+
+  cooling:
+    min_bars: 4
+    max_bars: 20
+
+    conf_boost: 0.15
+    evr_boost: 0.30
+    hazard_cut: -0.10
+
+  moon_conf_add: 0.10
+  moon_evr_min: 1.80
+  moon_medR_min: 6.0
+  moon_hazard_max: 0.25
+
+  twoR_conf_add: 0.05
+    twoR_evr_min: 1.20
+    twoR_medR_min: 2.0
+    twoR_hazard_max: 0.40
+
+    # equity-based cooling
+    cooling_dd_trigger: 0.08
+    cooling_minutes: 60
+
+    # runner/core split for compounding logic
+    runner_split:
+      core_frac: 0.70
+    # regime/session hazard overrides (optional)
+    hazard_trailing_segment:
+      trend:
+        london:
+          exit: 0.60
+        ny:
+          exit: 0.60

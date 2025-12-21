@@ -1,0 +1,21 @@
+dashboards:
+  signals: true
+  smc: true
+  regime: true
+  liquidity: true
+  equity: true
+  risk: true
+  hazard: true
+  calibration: true
+  simulator_stats: true
+  heartbeat: true
+
+reasoning_log:
+  enabled: true
+  store_inputs:
+    - confluence
+    - evr
+    - hazard
+    - rsv
+    - stops
+    - targets

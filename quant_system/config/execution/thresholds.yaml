@@ -1,0 +1,22 @@
+thresholds:
+  trade_rate:
+    target_min: 3
+    target_max: 5
+
+  precision_floor: 0.65
+
+  tiers:
+    A_plus:
+      confluence: 0.85
+      evr_min: 1.50
+      median_r: 5.0
+      hazard_max: 0.35
+
+    A:
+      confluence: 0.70
+      evr_min: 1.20
+      median_r: 4.0
+      hazard_max: 0.45
+
+  ema_stretch:
+    z_abs_skip: 2.5

@@ -1,0 +1,23 @@
+execution:
+  confluence:
+    weight_smc: 0.60
+    weight_rsv: 0.40
+    weight_meta: 0.55
+
+  tiers:
+    Aplus:
+      min_confluence: 0.70
+      min_evr: 1.40
+      max_hazard: 0.38
+
+  mpc:
+    risk_modes:
+      low: 0.007
+      medium: 0.012
+      high: 0.015
+    hedge_ratio_bounds: [0.20, 0.60]
+
+features:
+  smc:
+    premium_discount:
+      discount_threshold: 0.55

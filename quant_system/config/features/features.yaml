@@ -1,0 +1,146 @@
+# =======================================================
+# Feature configuration
+# =======================================================
+
+features:
+
+  # -----------------------------------------------------
+  # Core SMC features (all timeframes)
+  # -----------------------------------------------------
+  smc:
+    swings:
+      fractal:
+        "15m": { left: 2, right: 2 }
+        "1h":  { left: 3, right: 3 }
+        "6h":  { left: 3, right: 3 }
+        "12h": { left: 4, right: 4 }
+
+    bos:
+      atr_buffer_mult: 0.30
+      min_displacement_body_pct: 0.55
+
+    choch:
+      atr_buffer_mult: 0.35
+
+    fvg:
+      min_gap_ratio: 0.002
+      max_age_bars: 120
+      fill_pct_threshold: 0.6
+
+    sweep:
+      wick_ratio_min: 0.35
+      eql_tolerance_atr_mult: 0.20
+      min_liquidity_cluster: 2
+
+    zones:
+      max_zone_age_bars: 200
+      score_weights:
+        recency: 0.35
+        displacement: 0.30
+        mitigation: 0.20
+        premium_discount: 0.10
+        ema_alignment: 0.05
+
+    premium_discount:
+      external_range_lookback: 150
+      discount_threshold: 0.50
+      premium_threshold: 0.65
+
+    compression:
+      range_ratio_threshold: 0.18
+      volatility_drop_pct: 0.35
+
+  # -----------------------------------------------------
+  # EMA features (multi-timeframe)
+  # -----------------------------------------------------
+  ema:
+    enabled: true
+    periods:
+      "15m": [21, 55]
+      "1h":  [50, 200]
+      "6h":  [100]
+      "12h": [200]
+    band_k_atr: 1.5
+    z_window: 200
+
+  # -----------------------------------------------------
+  # Volatility features
+  # -----------------------------------------------------
+  volatility:
+    atr_period: 14
+    realized_vol_lookback: 30
+    atr_slope_lookback: 20
+    range_pct_lookback: 40
+    volatility_z_window: 200
+
+  # -----------------------------------------------------
+  # Liquidity features
+  # -----------------------------------------------------
+  liquidity:
+    eql_window: 50
+    eql_cluster_min: 2
+    wick_pressure_lookback: 14
+    liquidity_density_window: 60
+
+  # -----------------------------------------------------
+  # Regime (HDBSCAN + HMM) features
+  # -----------------------------------------------------
+  regime:
+    hdbscan_min_cluster_size: 20
+    hdbscan_min_samples: 10
+    cluster_features_lookback: 50
+    hmm_states: 5
+    hmm_covariance: "full"
+    smoothing_factor: 0.7
+    volatility_percentile_window: 200
+    toxicity_window: 30
+    compression_lookback: 30
+
+  # -----------------------------------------------------
+  # Session features (weights used in confluence)
+  # -----------------------------------------------------
+  session:
+    timezone: "Europe/Berlin"
+    london:
+      start: "08:00"
+      end: "17:00"
+      weight: 1.00
+    ny:
+      start: "14:30"
+      end: "21:00"
+      weight: 1.00
+    overlap:
+      weight: 1.10
+    off_hours:
+      weight: 0.20
+
+  # -----------------------------------------------------
+  # Absorption / iceberg proxy
+  # -----------------------------------------------------
+  absorption:
+    enable: true
+    window_minutes: 60
+    use_spread_ofi: true
+    veto_threshold: 0.70
+    throttle_band: [0.40, 0.70]
+
+  # -----------------------------------------------------
+  # Feature joining and merging policies
+  # -----------------------------------------------------
+  join:
+    interpolate_missing: false
+    ffill_limit: 2
+    drop_incomplete_rows: true
+
+  # -----------------------------------------------------
+  # Time-series lag/rolling settings
+  # -----------------------------------------------------
+  lagging:
+    columns: ["close", "high", "low", "open", "volume", "atr"]
+    lags: [1, 2, 3, 4]
+    rolling_windows: [4, 8, 16]
+
+  scale:
+    enabled: true
+    type: "standard"     # standard | minmax
+    clip_pct: 0.995

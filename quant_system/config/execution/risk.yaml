@@ -1,0 +1,14 @@
+risk:
+  max_daily_loss_r: -3
+  max_weekly_loss_r: -6
+  max_gross_exposure: 2.0
+  borrow_rate_limit: 0.30        # 30% APR
+  funding_cost_limit: 0.1
+  leverage_limit: 5.0
+  circuit_breaker_cooldown_bars: 32
+
+fees:
+  maker: 0.0002
+  taker: 0.0004
+  borrow_hourly_rate: 0.30
+  slippage_bps: 3

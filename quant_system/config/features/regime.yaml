@@ -1,0 +1,18 @@
+regimes:
+  hdbscan:
+    min_cluster_size: 15
+    min_samples: 5
+    metric: "euclidean"
+
+  hmm:
+    n_states: 5
+    covariance_type: "diag"
+    smooth_probabilities: true
+
+  canonical_mapping:
+    states:
+      - trend_up
+      - trend_down
+      - range
+      - expansion
+      - collapse

@@ -1,0 +1,10 @@
+/* High-contrast theme */
+body {
+    background: #000 !important;
+    color: #FFF !important;
+}
+
+.stButton button {
+    background: #222 !important;
+    border: 1px solid #FFF !important;
+}

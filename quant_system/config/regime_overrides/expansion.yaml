@@ -1,0 +1,24 @@
+execution:
+  confluence:
+    weight_smc: 0.55
+    weight_meta: 0.45
+    weight_rsv: 0.55
+
+  tiers:
+    Aplus:
+      min_confluence: 0.72
+      min_evr: 1.50
+      max_hazard: 0.40
+
+  mpc:
+    cvar_target: 0.020
+    risk_modes:
+      low: 0.010
+      medium: 0.015
+      high: 0.020
+    hedge_ratio_bounds: [0.10, 0.40]
+
+features:
+  volatility:
+    atr_slope_lookback: 10
+    volatility_z_window: 150

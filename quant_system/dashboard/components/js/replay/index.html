@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Replay Engine</title>
+
+<link rel="stylesheet" href="style.css">
+
+<!-- TradingView Lightweight Charts -->
+<script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+
+</head>
+
+<body>
+
+<div id="container">
+    <div id="chart"></div>
+
+    <div id="info-panel">
+        <div class="info-row">
+            <span class="label">Conf:</span>
+            <span id="conf-value" class="value">--</span>
+        </div>
+        <div class="info-row">
+            <span class="label">EVR:</span>
+            <span id="evr-value" class="value">--</span>
+        </div>
+        <div class="info-row">
+            <span class="label">Hazard:</span>
+            <span id="hazard-value" class="value">--</span>
+        </div>
+        <div class="info-row">
+            <span class="label">Risk:</span>
+            <span id="risk-value" class="value">--</span>
+        </div>
+    </div>
+
+    <div id="controls">
+        <button id="btn-prev" class="ctrl-btn">◀</button>
+        <button id="btn-play" class="ctrl-btn">▶</button>
+        <button id="btn-next" class="ctrl-btn">►</button>
+    </div>
+</div>
+
+<script src="replay.js"></script>
+
+</body>
+</html>

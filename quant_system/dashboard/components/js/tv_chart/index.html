@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>TV Chart Component</title>
+    <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+    // Streamlit communication
+    let pendingData = null;
+
+    // Message from Streamlit → component
+    window.addEventListener("message", event => {
+        const msg = event.data;
+        if (msg.type === "streamlit:render") {
+            pendingData = msg.args.data;
+            if (window.tv_chart_update) {
+                window.tv_chart_update(pendingData);
+            }
+        }
+    });
+</script>
+
+<script src="main.js"></script>
+</body>
+</html>

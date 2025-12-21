@@ -1,0 +1,29 @@
+execution:
+  confluence:
+    weight_smc: 0.50
+    weight_rsv: 0.60
+    weight_meta: 0.40
+
+  tiers:
+    Aplus:
+      min_confluence: 0.78
+      min_evr: 1.60
+      max_hazard: 0.32
+
+  gates:
+    execution_15m:
+      enforce_confluence_threshold: true
+      enforce_evr_threshold: true
+      enforce_hazard_threshold: true
+
+  mpc:
+    risk_modes:
+      low: 0.005
+      medium: 0.007
+      high: 0.010
+    hedge_ratio_bounds: [0.40, 0.80]
+
+features:
+  smc:
+    compression:
+      range_ratio_threshold: 0.15
