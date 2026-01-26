@@ -94,3 +94,4 @@ def compute_equity(trades: pd.DataFrame, starting_capital: float = 10_000.0) -> 
     ----------
     trades : pandas.DataFrame
         Trades DataFrame with at least the ``timestamp`` and 
+
