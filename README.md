@@ -94,4 +94,39 @@ streamlit run quant_system/dashboard/app.py
 - Enhance dashboards (real-time PnL attribution, execution quality KPIs).
 
 ## Support
-Questions or issues? Open a ticket, ping the team, or reach out to the QuantFund AI (Nischal) ops channel. Please include environment details, configs used, and relevant logs when reporting problems.
+Questions 
+or issues? Open a ticket, ping the team, or reach out to the QuantFund AI (Nischal) ops channel. Please include environment details, configs used, and relevant logs when reporting problems.
+
+## Detailed Pipeline Explanation
+
+This section summarises the full QuantFund AI Smart Money Concept pipeline end-to-end, from data ingestion to execution. For an expanded explanation, please refer to the file `quant_smc_pipeline_report.md`.
+
+### Data ingestion and resampling
+- Historical 1‑minute OHLCV data are downloaded from Kraken via a resilient client with exponential backoff.
+- A timeframe builder resamples 1‑min data into 15‑min, 1‑h, 6‑h and 12‑h bars with deterministic bar alignment.
+- Typed dataclasses ensure consistent field names; resampled bars and raw bars are persisted to disk for reproducibility.
+
+### Feature engineering
+- Multi‑timeframe feature builders compute technical indicators (EMAs, ATR, volatility metrics) and liquidity/order‑flow features such as equal‑high/low density, sweeps, wick ratios and volume pressure.
+- SMC detectors extract structural context: swing highs/lows, break of structure (BOS) and change of character (CHOCH), fair‑value gaps (FVGs), liquidity sweeps and order blocks. These detectors provide anchors, zones and structure context used for confluence calculations.
+- Additional regime features (e.g., Gaussian HMM regimes) classify broad market conditions, while a feature store and resampler align multi‑TF features to 15‑min anchors.
+
+### Label generation
+- Specialist labels are derived from SMC events: BOS continuation, liquidity flow and micro‑momentum labels measure whether price reaches +3R or +1R targets before invalidation within defined horizons.
+- Risk labels capture expected opportunity (EOP) and expected drawdown probability (EDP), while a hazard model defines survival labels tracking time‑to‑failure when stop loss or CHOCH occurs.
+
+### Model training
+- The training pipeline uses time‑series cross‑validation and Optuna‑based hyperparameter tuning for LightGBM/XGBoost classifiers. Each specialist label, meta model and hazard bin has its own calibrated classifier.
+- A confluence engine combines specialist probabilities, meta probabilities, SMC strength and regime scores; an empirical calibrator ensures well‑behaved probability outputs.
+- The model registry versioning system persists trained models, calibrators and metrics.
+
+### Execution and risk management
+- Gating and tiering logic apply multi‑step checks (Ocean/Waves/Flow) based on 12h, 6h and 1h contexts, plus hazard and EVR scores, to decide whether to trade.
+- A multi‑parameter confluence score informs the TieringEngine, which assigns trades to tiers (A+, A, B or skip) and drives order execution and sizing.
+- The MPC risk manager computes risk mode, lock fractions and hedge ratios using hazard/EDP/EOP probabilities and quantile forecasts; a position sizer scales position size based on risk mode and ATR.
+- Hazard trailing, exposure tracking and cooling engines manage open positions, apply trailing stops and enforce cooldowns after large wins.
+
+### Backtesting, forward testing and live trading
+- A deterministic intrabar execution simulator and backtester evaluate strategies on historical data, accounting for slippage, fees and borrow/funding costs.
+- Forward and live engines aggregate real‑time feeds to multi‑timeframe bars, evaluate SMC and ML signals, manage risk and execute orders via real or simulated adapters.
+- Dashboard components provide real‑time analytics and trade monitoring, while a CLI orchestrates data ingestion, feature generation, labeling, training and backtesting tasks.
