@@ -1,0 +1,124 @@
+/* Styles for Equity Heatmap component */
+
+/* Define color variables for profit and loss */
+:root {
+    --profit-color: #00b884; /* green for positive returns */
+    --loss-color: #de3f31;   /* red for negative returns */
+    --neutral-color: #888888; /* grey for neutral values */
+    --bg-color: #1e1e1e; /* dark background */
+    --text-color: #e5e5e5; /* light text */
+}
+
+/* Container for the equity heatmap */
+.equity-container {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    padding: 1rem;
+    box-sizing: border-box;
+    background-color: var(--bg-color);
+    color: var(--text-color);
+    font-family: 'Inter', sans-serif;
+}
+
+/* Title or header styling */
+.equity-container h3 {
+    margin: 0 0 0.5rem 0;
+    font-size: 1.2rem;
+    font-weight: 600;
+}
+
+/* Heatmap grid */
+.equity-heatmap {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(6px, 1fr));
+    grid-auto-rows: 6px;
+    gap: 2px;
+    width: 100%;
+    border: 1px solid #333;
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+/* Each cell in the heatmap */
+.equity-cell {
+    width: 100%;
+    height: 100%;
+    border-radius: 1px;
+    cursor: pointer;
+    transition: background-color 0.2s ease-in-out;
+}
+
+.equity-cell--profit {
+    background-color: var(--profit-color);
+}
+
+.equity-cell--loss {
+    background-color: var(--loss-color);
+}
+
+.equity-cell--neutral {
+    background-color: var(--neutral-color);
+}
+
+/* Hover effect to highlight a cell */
+.equity-cell:hover {
+    filter: brightness(1.3);
+}
+
+/* Tooltip for heatmap cells */
+.equity-tooltip {
+    position: absolute;
+    padding: 0.4rem 0.6rem;
+    background-color: rgba(0, 0, 0, 0.8);
+    color: var(--text-color);
+    border-radius: 4px;
+    font-size: 0.8rem;
+    pointer-events: none;
+    z-index: 1000;
+    white-space: nowrap;
+}
+
+/* Legend for heatmap */
+.equity-legend {
+    display: flex;
+    align-items: center;
+    margin-top: 0.5rem;
+    gap: 0.5rem;
+}
+
+.equity-legend-item {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    font-size: 0.8rem;
+}
+
+.equity-legend-color {
+    width: 12px;
+    height: 12px;
+    border-radius: 2px;
+}
+
+/* Example usage of legend colors */
+.equity-legend-color.profit {
+    background-color: var(--profit-color);
+}
+
+.equity-legend-color.loss {
+    background-color: var(--loss-color);
+}
+
+.equity-legend-color.neutral {
+    background-color: var(--neutral-color);
+}
+
+/* Responsive design adjustments */
+@media (max-width: 600px) {
+    .equity-container {
+        padding: 0.5rem;
+    }
+    .equity-heatmap {
+        gap: 1px;
+    }
+}
