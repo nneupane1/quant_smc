@@ -5,7 +5,7 @@ Lightweight bridge between the forward engine and any dashboard (Streamlit or UI
 Responsibilities:
  - track latest state and equity curve
  - push trades/events/reasoning to UI via registered callbacks
- - provide snapshots for polling-based dashboards
+ - provide snapshots for telemetry-fed or polling-fallback dashboards
 """
 
 from datetime import datetime

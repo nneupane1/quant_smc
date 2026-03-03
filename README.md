@@ -2,6 +2,14 @@
 
 Research-to-execution crypto trading stack with deterministic feature parity across backtest, forward test, live runtime, Streamlit research dashboards, and a new `Next.js + FastAPI + WebSocket` operator terminal.
 
+## Release Status
+
+Current tagged baseline: `v0.1.0`
+
+- release notes: [`CHANGELOG.md`](./CHANGELOG.md)
+- repair summary: [`quant_smc_pipeline_report.md`](./quant_smc_pipeline_report.md)
+- main branch includes the repaired telemetry-backed terminal stack
+
 ## What This Repo Now Contains
 
 - `12h` regime modeling with `HMM + HDBSCAN`
@@ -223,3 +231,13 @@ Current default posture is aligned with the repaired execution config:
 - This repo contains a lot of repaired legacy surfaces. The authoritative runtime paths are the repaired `backtest`, `forward_test`, `live`, `execution`, `features`, `label_generation`, and `ml` layers.
 - The live event plane is now `FastAPI + WebSocket` first, with artifact fallback still preserved where necessary.
 - Generated details are summarized in [`quant_smc_pipeline_report.md`](./quant_smc_pipeline_report.md).
+
+## Short Release Notes
+
+`v0.1.0` establishes the first repaired baseline for this repo:
+
+- end-to-end runtime loops repaired across research, forward, and live paths
+- backend telemetry plane added for shared console/UI state
+- operator terminal added in `frontend/`
+- signal-level reasoning tree exposed in the terminal
+- docs, install flow, and ignore rules aligned with the new architecture

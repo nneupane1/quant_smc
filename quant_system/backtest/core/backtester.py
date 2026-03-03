@@ -103,7 +103,7 @@ class Backtester:
         # Load models if registry provided
         models = {}
         if model_version:
-            LOG.info("[Backtester] model_version selection is not wired yet; using registry latest lookups.")
+            LOG.info("[Backtester] model_version override requested=%s; current path still resolves through registry latest lookups.", model_version)
 
         # Combined chronological index across assets
         timeline = self._merge_timelines(asset_frames)
