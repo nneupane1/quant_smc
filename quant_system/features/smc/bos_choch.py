@@ -114,7 +114,7 @@ class BOSCHOCHDetector:
                 "bos_down": bos_down,
                 "choch_up": choch_up,
                 "choch_down": choch_down,
-                "broken_level": broken
+                "broken_level": broken,
             }
 
         log("BOS/CHOCH detection complete.")
@@ -166,6 +166,16 @@ class BOSCHOCHDetector:
         res_df = pd.DataFrame.from_dict(res, orient="index")
         res_df.index.name = "timestamp"
         res_df = res_df.reset_index()
+        res_df["bos_flag"] = (res_df["bos_up"].fillna(False) | res_df["bos_down"].fillna(False)).astype(int)
+        res_df["choch_flag"] = (res_df["choch_up"].fillna(False) | res_df["choch_down"].fillna(False)).astype(int)
+
+        bias = pd.Series("NEUTRAL", index=res_df.index, dtype="object")
+        bias = bias.mask(res_df["bos_up"].fillna(False), "UP")
+        bias = bias.mask(res_df["bos_down"].fillna(False), "DOWN")
+        bias = bias.mask(res_df["choch_up"].fillna(False), "UP")
+        bias = bias.mask(res_df["choch_down"].fillna(False), "DOWN")
+        res_df["bias"] = bias
+        res_df["structure_bias"] = bias
 
         merged = frame.merge(res_df, on="timestamp", how="left")
         if "dt" in merged.columns:

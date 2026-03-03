@@ -4,7 +4,8 @@ Uses ModelRegistry artifacts (clf.joblib + optional cal.joblib).
 """
 
 import numpy as np
-from typing import Dict, Any, List, Tuple
+import pandas as pd
+from typing import Dict, Any, List, Tuple, Optional
 
 from quant_system.utils.logger import log
 from quant_system.ml.registry.model_registry import ModelRegistry
@@ -24,13 +25,26 @@ class ModelPredictor:
         self.registry = registry
         log("ModelPredictor initialized.")
 
-    def _predict_specialist(self, model_name: str, x: np.ndarray) -> float:
-        clf, cal = self.registry.load_latest(model_name)
+    @staticmethod
+    def _row_frame(row_like, feature_cols: List[str]):
+        if isinstance(row_like, (list, tuple, np.ndarray)):
+            return np.asarray(row_like, dtype=float).reshape(1, -1)
+        if not feature_cols:
+            numeric_vals = [v for _, v in dict(row_like).items() if isinstance(v, (int, float, np.number))]
+            return np.asarray(numeric_vals, dtype=float).reshape(1, -1)
+        row = row_like if isinstance(row_like, dict) else dict(row_like)
+        data = {col: [row.get(col, np.nan)] for col in feature_cols}
+        return pd.DataFrame(data)
+
+    def _predict_specialist(self, model_name: str, row_like) -> float:
+        clf, cal, cfg = self.registry.load_latest_bundle(model_name)
+        feature_cols = cfg.get("features", [])
+        X_in = self._row_frame(row_like, feature_cols) if feature_cols else self._row_frame(row_like, [])
         if isinstance(clf, dict) and "model" in clf:
             base = clf["model"]
-            p = base.predict_proba(x.reshape(1, -1))[0][1]
+            p = base.predict_proba(X_in)[0][1]
         else:
-            p = clf.predict_proba(x.reshape(1, -1))[0][1]
+            p = clf.predict_proba(X_in)[0][1]
         if cal:
             if hasattr(cal, "predict_proba"):
                 p = cal.predict_proba([[p]])[0][1]
@@ -38,23 +52,49 @@ class ModelPredictor:
                 p = cal.predict([p])[0]
         return float(p)
 
-    def _predict_hazard_curve(self, X: np.ndarray, model_name: str) -> Dict[int, float]:
+    def _predict_stack(self, model_name: str, specialist_probs: Dict[str, float]) -> Optional[float]:
+        clf, _cal, cfg = self.registry.load_latest_bundle(model_name)
+        stack_inputs = cfg.get("stack_inputs", list(specialist_probs.keys()))
+        if not stack_inputs:
+            return None
+        vec = np.array([float(specialist_probs.get(name, 0.0)) for name in stack_inputs], dtype=float).reshape(1, -1)
+        return float(clf.predict_proba(vec)[0][1])
+
+    def _predict_hazard_curve(self, row_like, model_name: str) -> Dict[int, float]:
         """
         Returns per-bin event probability.
         """
         models, cfg = self.registry.load_hazard_model(model_name)
         H = cfg.get("horizon_bars", 48)
         event_probs = {}
+        feature_cols = cfg.get("feature_cols", [])
+        X_in = self._row_frame(row_like, feature_cols) if feature_cols else self._row_frame(row_like, [])
 
         for b in range(1, H + 1):
             if b in models:
                 clf = models[b]
-                p = clf.predict_proba(X.reshape(1, -1))[0][1]
+                p = clf.predict_proba(X_in)[0][1]
                 event_probs[b] = float(p)
             else:
                 event_probs[b] = 0.0
 
         return event_probs
+
+    def _predict_quantiles(self, row_like, model_name: str = "quantile") -> Dict[str, float]:
+        models, _cal, cfg = self.registry.load_latest_bundle(model_name)
+        feature_cols = cfg.get("features", [])
+        X_in = self._row_frame(row_like, feature_cols) if feature_cols else self._row_frame(row_like, [])
+        quantiles = {}
+        if isinstance(models, dict):
+            for key, model in models.items():
+                try:
+                    raw = str(key).lower().replace("q_", "").replace("q", "")
+                    q_float = float(raw)
+                    q = f"q{int(round(q_float * 100)):02d}"
+                    quantiles[q] = float(model.predict(X_in)[0])
+                except Exception:
+                    continue
+        return quantiles
 
     def _hazard_score(self, curve: Dict[int, float]) -> float:
         """
@@ -70,46 +110,59 @@ class ModelPredictor:
             return 0.0
         return score / denom
 
-    def predict_single(self, x_row: List[float], specialist_list: List[str]) -> Dict[str, Any]:
+    def predict_single(self, x_row: Any, specialist_list: Optional[List[str]] = None) -> Dict[str, Any]:
         """
         Compute full prediction set for a single feature row.
         """
-        X = np.array(x_row, dtype=float)
         predictions = {}
+        specialist_list = specialist_list or []
 
         # Specialist models
-        specialist_probs = []
+        specialist_probs: Dict[str, float] = {}
         for model_name in specialist_list:
-            p = self._predict_specialist(model_name, X)
+            p = self._predict_specialist(model_name, x_row)
             predictions[f"prob_{model_name}"] = p
-            specialist_probs.append(p)
+            specialist_probs[model_name] = p
 
         # Meta-model
         try:
-            clf_meta, _ = self.registry.load_latest("meta_model")
-            specialist_vec = np.array(specialist_probs, dtype=float).reshape(1, -1)
-            p_meta = clf_meta.predict_proba(specialist_vec)[0][1]
-            predictions["prob_meta"] = float(p_meta)
-        except Exception as e:
+            if specialist_probs:
+                predictions["prob_meta"] = self._predict_stack("meta_model", specialist_probs)
+            else:
+                predictions["prob_meta"] = None
+        except Exception:
             predictions["prob_meta"] = None
 
         # Confluence model
         try:
-            clf_conf, _ = self.registry.load_latest("confluence_model")
-            specialist_vec = np.array(specialist_probs, dtype=float).reshape(1, -1)
-            p_conf = clf_conf.predict_proba(specialist_vec)[0][1]
-            predictions["prob_confluence"] = float(p_conf)
+            if specialist_probs:
+                predictions["prob_confluence"] = self._predict_stack("confluence_model", specialist_probs)
+            else:
+                predictions["prob_confluence"] = None
         except Exception:
             predictions["prob_confluence"] = None
 
         # Hazard
         try:
-            hazard_curve = self._predict_hazard_curve(X, "hazard")
+            hazard_curve = self._predict_hazard_curve(x_row, "hazard")
             predictions["hazard_curve"] = hazard_curve
             predictions["hazard_score"] = self._hazard_score(hazard_curve)
         except Exception:
             predictions["hazard_curve"] = {}
             predictions["hazard_score"] = None
+
+        # Quantiles
+        try:
+            quantiles = self._predict_quantiles(x_row, "quantile")
+            predictions["quantiles"] = quantiles
+            for key, value in quantiles.items():
+                predictions[key] = value
+            if quantiles:
+                q05 = float(quantiles.get("q05", quantiles.get("q0.05", 0.0)) or 0.0)
+                q10 = float(quantiles.get("q10", quantiles.get("q0.10", 0.0)) or 0.0)
+                predictions["cvar"] = abs(min((q05 + q10) / 2.0, 0.0))
+        except Exception:
+            predictions["quantiles"] = {}
 
         return predictions
 

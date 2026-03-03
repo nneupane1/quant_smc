@@ -1,193 +1,109 @@
-"""
-trade_log.py
+from __future__ import annotations
 
-TradeZella-style analytics page for:
- - Full trade-by-trade journal
- - Daily and monthly PnL tables
- - Win/Loss statistics
- - Equity curve chart
-"""
-
-import streamlit as st
-import pandas as pd
 import altair as alt
+import pandas as pd
+import streamlit as st
 
-from quant_system.backtest.trade_log import TradeLog
-from quant_system.forward_test.forward_dashboard_adapter import ForwardDashboardAdapter
-
-# Adapter (shared via session_state)
-if "dashboard_adapter" not in st.session_state:
-    st.session_state["dashboard_adapter"] = ForwardDashboardAdapter()
-adapter = st.session_state["dashboard_adapter"]
-
-st.set_page_config(page_title="Trade Log", layout="wide")
-
-# ---------------------------------------------------------
-# STYLES
-# ---------------------------------------------------------
-st.markdown(
-    """
-    <style>
-        .positive { color: #00FF9C; }
-        .negative { color: #FF4E4E; }
-        .neutral  { color: #E0E0E0; }
-        .panel {
-            padding: 18px;
-            border-radius: 12px;
-            background: #111417;
-            border: 1px solid #222;
-        }
-        .title {
-            font-size: 28px;
-            font-weight: 600;
-        }
-        .subtitle {
-            font-size: 18px;
-            opacity: 0.8;
-        }
-        .table-small {
-            font-size: 13px;
-        }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.markdown('<div class="title">Trade Log & Analytics</div>', unsafe_allow_html=True)
+from quant_system.dashboard.data_access import DashboardContext, normalize_trade_frame
+from quant_system.dashboard.ui import metric_grid, page_header, section_title
 
 
-# ---------------------------------------------------------
-# LOAD TRADES FROM BACKTEST + FORWARD (Unified View)
-# ---------------------------------------------------------
-def load_all_trades():
-    # Backtest trades (persisted)
-    try:
-        tl = TradeLog()
-        df_bt = tl.load_csv()
-    except Exception:
-        df_bt = pd.DataFrame()
-
-    # Forward trades (live)
-    snap = adapter.get_snapshot()
-    fwd_events = snap["events"]
-
+def _forward_closed_trades(context: DashboardContext) -> pd.DataFrame:
     rows = []
-    for ev in fwd_events:
-        if ev["event"] == "exit_trade":
-            p = ev["payload"]
-            rows.append({
-                "trade_id": ev["trade_id"],
-                "timestamp": ev["ts"],
-                "side": p.get("side"),
-                "entry": p.get("entry_price"),
-                "exit": p.get("exit_price"),
-                "pnl": p.get("pnl"),
-                "r_mult": p.get("r_mult"),
-            })
-
-    df_fwd = pd.DataFrame(rows)
-
-    df = pd.concat([df_bt, df_fwd], ignore_index=True)
-    if not df.empty:
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-    return df
-
-
-df = load_all_trades()
-
-if df.empty:
-    st.info("No trades available yet.")
-    st.stop()
-
-# ---------------------------------------------------------
-# METRICS BAR
-# ---------------------------------------------------------
-wins = df[df["pnl"] > 0]
-losses = df[df["pnl"] <= 0]
-
-win_rate = len(wins) / len(df)
-avg_r = df["r_mult"].mean()
-expectancy = df["pnl"].mean()
-
-col1, col2, col3, col4 = st.columns(4)
-
-col1.metric("Total Trades", f"{len(df)}")
-col2.metric("Win Rate", f"{win_rate*100:.2f}%")
-col3.metric("Avg R-Multiple", f"{avg_r:.2f}")
-col4.metric("Expectancy", f"${expectancy:.2f}")
+    for event in context.forward["events"]:
+        if event.get("event_type") not in {"exit", "exit_trade", "closed_trade"}:
+            continue
+        payload = event.get("payload", {}) or {}
+        rows.append(
+            {
+                "trade_id": event.get("trade_id"),
+                "asset": payload.get("asset"),
+                "side": payload.get("side"),
+                "entry_ts": payload.get("entry_ts") or payload.get("opened_at") or event.get("timestamp"),
+                "exit_ts": payload.get("exit_ts") or event.get("timestamp"),
+                "entry_price": payload.get("entry_price"),
+                "exit_price": payload.get("exit_price"),
+                "pnl": payload.get("pnl", 0.0),
+                "r": payload.get("r", payload.get("r_mult", 0.0)),
+                "tier": payload.get("tier"),
+                "conf": payload.get("conf"),
+                "evr": payload.get("evr"),
+                "reason": payload.get("reason", event.get("event_type")),
+                "leg": payload.get("leg"),
+            }
+        )
+    return normalize_trade_frame(pd.DataFrame(rows))
 
 
-# ---------------------------------------------------------
-# EQUITY CURVE
-# ---------------------------------------------------------
-df_sorted = df.sort_values("timestamp")
-df_sorted["equity"] = df_sorted["pnl"].cumsum() + 20_000
+def render_trade_log(theme_choice: str, model_version: str, *, context: DashboardContext) -> None:
+    backtest_trades = context.backtest["trades"]
+    forward_trades = _forward_closed_trades(context)
+    all_trades = normalize_trade_frame(pd.concat([backtest_trades, forward_trades], ignore_index=True))
 
-chart = (
-    alt.Chart(df_sorted)
-    .mark_line(color="#00FF9C")
-    .encode(
-        x="timestamp:T",
-        y="equity:Q"
+    page_header(
+        "Trade Log",
+        "Unified trade tape across persisted backtests and in-memory forward/live exits.",
+        kicker="Ledger",
     )
-    .properties(height=240)
-)
+    if all_trades.empty:
+        st.info("No closed trades available yet.")
+        return
 
-st.altair_chart(chart, use_container_width=True)
+    metric_grid(
+        [
+            {"label": "Trades", "value": f"{len(all_trades)}"},
+            {"label": "Win Rate", "value": f"{(all_trades['pnl'] > 0).mean() * 100:.2f}%"},
+            {"label": "Avg R", "value": f"{all_trades['r'].mean():.2f}"},
+            {"label": "Expectancy", "value": f"${all_trades['pnl'].mean():,.2f}"},
+        ]
+    )
 
+    equity_curve = all_trades.sort_values("entry_ts")[["entry_ts", "pnl"]].copy()
+    equity_curve["equity"] = 20_000 + equity_curve["pnl"].fillna(0.0).cumsum()
+    section_title("Equity Trace", "Unified ledger progression")
+    chart = (
+        alt.Chart(equity_curve)
+        .mark_line(color="#3ddc97", strokeWidth=2.2)
+        .encode(x="entry_ts:T", y="equity:Q", tooltip=["entry_ts:T", "equity:Q"])
+        .properties(height=260)
+    )
+    st.altair_chart(chart, use_container_width=True)
 
-# ---------------------------------------------------------
-# TRADE TABLE (highlight winners/losers)
-# ---------------------------------------------------------
-styled = df.style.apply(
-    lambda s: ["color: #00FF9C" if v > 0 
-               else "color: #FF4E4E" 
-               for v in s] if s.name == "pnl" else [""] * len(s),
-    axis=0,
-)
+    section_title("Trade Table", "Backtest and forward exits in one frame")
+    st.dataframe(
+        all_trades[
+            [
+                "trade_id",
+                "entry_ts",
+                "exit_ts",
+                "asset",
+                "side",
+                "tier",
+                "leg",
+                "r",
+                "pnl",
+                "reason",
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
 
-st.subheader("Trade List")
-st.dataframe(styled, use_container_width=True)
+    daily = all_trades.assign(date=all_trades["entry_ts"].dt.date).groupby("date").agg(
+        pnl=("pnl", "sum"),
+        trades=("trade_id", "count"),
+        avg_r=("r", "mean"),
+    ).reset_index()
+    monthly = all_trades.assign(month=all_trades["entry_ts"].dt.to_period("M").astype(str)).groupby("month").agg(
+        pnl=("pnl", "sum"),
+        trades=("trade_id", "count"),
+        avg_r=("r", "mean"),
+    ).reset_index()
 
-
-# ---------------------------------------------------------
-# DAILY STATS
-# ---------------------------------------------------------
-df["date"] = df["timestamp"].dt.date
-daily = df.groupby("date").agg(
-    pnl=("pnl", "sum"),
-    trades=("pnl", "count"),
-    win_rate=("pnl", lambda s: (s > 0).mean()),
-    avg_r=("r_mult", "mean"),
-).reset_index()
-
-st.subheader("Daily Performance")
-st.dataframe(daily, use_container_width=True)
-
-
-# ---------------------------------------------------------
-# MONTHLY STATS
-# ---------------------------------------------------------
-df["month"] = df["timestamp"].dt.to_period("M").astype(str)
-monthly = df.groupby("month").agg(
-    pnl=("pnl", "sum"),
-    trades=("pnl", "count"),
-    win_rate=("pnl", lambda s: (s > 0).mean()),
-    avg_r=("r_mult", "mean"),
-).reset_index()
-
-st.subheader("Monthly Performance")
-st.dataframe(monthly, use_container_width=True)
-
-
-# ---------------------------------------------------------
-# R-MULTIPLE DISTRIBUTION
-# ---------------------------------------------------------
-hist = (
-    alt.Chart(df)
-    .mark_bar(color="#5ABEFF")
-    .encode(x=alt.X("r_mult:Q", bin=True), y="count()")
-    .properties(height=200)
-)
-st.subheader("R-Multiple Distribution")
-st.altair_chart(hist, use_container_width=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        section_title("Daily", "Operator review cadence")
+        st.dataframe(daily, use_container_width=True, hide_index=True)
+    with col2:
+        section_title("Monthly", "Longer-horizon performance drift")
+        st.dataframe(monthly, use_container_width=True, hide_index=True)

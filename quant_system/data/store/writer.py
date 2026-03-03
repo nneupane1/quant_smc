@@ -32,6 +32,7 @@ class CSVWriter:
         self.path = path
         self.append = append
         self._mode = "a" if append else "w"
+        self._write_started = False
 
         log(f"CSVWriter initialized — path={self.path}, append={self.append}")
 
@@ -52,6 +53,10 @@ class CSVWriter:
             writer = csv.writer(f)
             writer.writerow(self.COLUMNS)
 
+        # After the explicit header pass, subsequent writes should append.
+        self._write_started = True
+        self.append = True
+        self._mode = "a"
         log("CSV header written.")
 
     # ------------------------------------------------------------
@@ -63,9 +68,14 @@ class CSVWriter:
 
         self._ensure_dir()
 
-        header_needed = not os.path.exists(self.path) or not self.append
+        header_needed = (
+            not os.path.exists(self.path)
+            or os.path.getsize(self.path) == 0
+            or (not self.append and not self._write_started)
+        )
+        mode = "a" if self.append or self._write_started else self._mode
 
-        with open(self.path, self._mode, newline="") as f:
+        with open(self.path, mode, newline="") as f:
             writer = csv.writer(f)
 
             if header_needed:
@@ -83,4 +93,5 @@ class CSVWriter:
                 ])
                 rows_written += 1
 
+        self._write_started = True
         log(f"Finished writing {rows_written:,} rows to {self.path}")

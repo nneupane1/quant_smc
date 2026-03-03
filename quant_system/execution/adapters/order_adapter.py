@@ -1,22 +1,16 @@
-"""
-OrderAdapter:
-    Unified execution interface for:
-        - Spot long trades
-        - Directional shorts (spot-margin)
-        - Perp hedge shorts
+"""Unified execution-cost adapter for simulated long, short, and hedge legs."""
 
-Handles:
-    - order simulation (backtest / forward)
-    - fees & slippage
-    - funding / borrow APR (for directional shorts)
-    - execution metadata for dashboards & logs
-"""
-
-import numpy as np
-import pandas as pd
-from typing import Dict, Any
+from typing import Any, Dict, Union
 
 from quant_system.utils.logger import log
+
+
+def _as_dict(config: Union[Dict[str, Any], Any]) -> Dict[str, Any]:
+    if hasattr(config, "load"):
+        return config.load()
+    if hasattr(config, "full"):
+        return config.full
+    return dict(config)
 
 
 class OrderAdapter:
@@ -24,21 +18,24 @@ class OrderAdapter:
     Simulates execution fills and exposes a unified interface for trading.
     """
 
-    def __init__(self, config: Dict[str, Any]):
-        ocfg = config["execution"]["order_adapter"]
+    def __init__(self, config: Union[Dict[str, Any], Any]):
+        cfg = _as_dict(config)
+        exec_cfg = cfg.get("execution", {})
+        ocfg = exec_cfg.get("order_adapter", {})
+        legacy_fees = exec_cfg.get("legacy_fees", {})
 
         # Fees (bps)
-        self.taker_fee_bps = float(ocfg["taker_fee_bps"])
-        self.maker_fee_bps = float(ocfg["maker_fee_bps"])
+        self.taker_fee_bps = float(ocfg.get("taker_fee_bps", legacy_fees.get("taker", 0.0) * 10_000))
+        self.maker_fee_bps = float(ocfg.get("maker_fee_bps", legacy_fees.get("maker", 0.0) * 10_000))
 
         # Slippage (bps)
-        self.slippage_bps = float(ocfg["slippage_bps"])
+        self.slippage_bps = float(ocfg.get("slippage_bps", legacy_fees.get("slippage_bps", 0.0)))
 
         # Borrow APR for directional shorts
-        self.borrow_apr = float(ocfg["borrow_apr"])  # annualized
+        self.borrow_apr = float(ocfg.get("borrow_apr", exec_cfg.get("shorting", {}).get("directional_short", {}).get("apr_cap", 0.0)))
 
         # Funding rate for perp hedge
-        self.funding_rate = float(ocfg["funding_rate"])  # 8h funding, converted in calcs
+        self.funding_rate = float(ocfg.get("funding_rate", 0.0))  # 8h funding, converted in calcs
 
         log("OrderAdapter initialized.")
 
@@ -136,6 +133,16 @@ class OrderAdapter:
             "funding_cost": 0.0,  # computed on exit
         }
 
+    def execute(self, side: str, px: float, qty: float, hedge: bool = False) -> Dict[str, Any]:
+        """
+        Compatibility entrypoint for callers that select the leg at runtime.
+        """
+        if hedge:
+            return self.execute_hedge_short(px, qty)
+        if side == "short":
+            return self.execute_short(px, qty)
+        return self.execute_long(px, qty)
+
     # ------------------------------------------------------------
     # Exit logic (common for long / short / hedge)
     # ------------------------------------------------------------
@@ -165,10 +172,13 @@ class OrderAdapter:
             pnl -= funding
             meta["funding_cost"] = funding
 
+        pnl -= meta["fee"]
+
         meta.update({
             "exit_price": meta["fill_price"],
             "pnl": pnl,
             "bars_held": bars_held,
+            "value": qty * meta["fill_price"],
         })
 
         log(

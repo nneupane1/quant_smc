@@ -1,22 +1,20 @@
 """
-Unsupervised regime trainer using Gaussian HMM on 6h/12h features.
+Legacy compatibility surface for regime HMM training.
 
-Saves:
-- model.joblib
-- meta.json (config + feature list)
+This module preserves the older `quant_system.models.regime.hmm_trainer`
+API used by CLI utilities, while delegating to the canonical implementation in
+`quant_system.ml.training.regime_hmm_trainer`.
 """
 
-from dataclasses import dataclass, asdict
-from pathlib import Path
-from typing import List, Optional, Dict, Any
-import json
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
-import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
-from hmmlearn.hmm import GaussianHMM
-import joblib
+
+from quant_system.ml.training.regime_hmm_trainer import (
+    RegimeHMMConfig as _CanonicalConfig,
+    RegimeHMMTrainer as _CanonicalTrainer,
+)
 
 
 @dataclass
@@ -33,53 +31,33 @@ class HMMConfig:
 class HMMTrainer:
     def __init__(self, cfg: HMMConfig, features: List[str]):
         self.cfg = cfg
-        self.features = features
-        self.pipeline: Optional[Pipeline] = None
+        self.features = list(features or [])
+        self._trainer = _CanonicalTrainer(
+            _CanonicalConfig(
+                n_states=cfg.n_states,
+                covariance_type=cfg.covariance_type,
+                seed=cfg.random_state,
+                feature_cols=self.features or None,
+            )
+        )
+        self.pipeline = None
+        self._report: Dict[str, Any] = {}
 
     def fit(self, df: pd.DataFrame) -> Dict[str, Any]:
-        if not self.features:
-            raise ValueError("No features specified for HMM training.")
-
-        X = df[self.features].astype(float).values
-
-        model = GaussianHMM(
-            n_components=self.cfg.n_states,
-            covariance_type=self.cfg.covariance_type,
-            min_covar=self.cfg.min_covar,
-            n_iter=self.cfg.n_iter,
-            tol=self.cfg.tol,
-            random_state=self.cfg.random_state,
-            verbose=self.cfg.verbose,
-        )
-
-        pipe = Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                ("hmm", model),
-            ]
-        )
-
-        pipe.fit(X)
-        self.pipeline = pipe
-
-        # quick state distribution
-        hidden_states = pipe.named_steps["hmm"].predict(pipe.named_steps["scaler"].transform(X))
-        state_counts = np.bincount(hidden_states, minlength=self.cfg.n_states).tolist()
-
-        return {
-            "n_states": self.cfg.n_states,
-            "state_counts": state_counts,
+        states = self._trainer.fit_transform(df)
+        counts = states["state"].value_counts().sort_index().to_dict() if "state" in states.columns else {}
+        self._report = {
+            "n_states": int(self.cfg.n_states),
+            "state_counts": {int(k): int(v) for k, v in counts.items()},
+            "rows": int(len(states)),
+            "features": list(self._trainer.features_),
         }
+        self.pipeline = self._trainer
+        return self._report
 
     def save(self, out_dir: str):
-        if self.pipeline is None:
-            raise RuntimeError("Call fit() before save().")
-        Path(out_dir).mkdir(parents=True, exist_ok=True)
-        joblib.dump(self.pipeline, Path(out_dir) / "model.joblib")
-        meta = {"cfg": asdict(self.cfg), "features": self.features}
-        with open(Path(out_dir) / "meta.json", "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2)
+        self._trainer.save(out_dir)
 
     @staticmethod
-    def load(model_dir: str) -> "Pipeline":
-        return joblib.load(Path(model_dir) / "model.joblib")
+    def load(model_dir: str) -> _CanonicalTrainer:
+        return _CanonicalTrainer.load(model_dir)

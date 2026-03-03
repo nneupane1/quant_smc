@@ -18,6 +18,7 @@ Outputs a dict indexed by timestamp with OB metadata per bar.
 """
 
 from typing import List, Dict, Optional
+import numpy as np
 import pandas as pd
 from quant_system.data.store.datamodel import Candle
 from quant_system.utils.logger import log
@@ -119,10 +120,12 @@ class OrderBlockDetector:
                 "demand_bottom": active_demand["bottom"] if active_demand else None,
                 "demand_quality": active_demand["quality"] if active_demand else None,
                 "demand_age": active_demand["age"] if active_demand else None,
+                "demand_touched": int(active_demand["touched"]) if active_demand else None,
                 "supply_top": active_supply["top"] if active_supply else None,
                 "supply_bottom": active_supply["bottom"] if active_supply else None,
                 "supply_quality": active_supply["quality"] if active_supply else None,
                 "supply_age": active_supply["age"] if active_supply else None,
+                "supply_touched": int(active_supply["touched"]) if active_supply else None,
             }
 
         log("Order block detection complete.")
@@ -175,6 +178,53 @@ class OrderBlockDetector:
         res_df = pd.DataFrame.from_dict(res, orient="index")
         res_df.index.name = "timestamp"
         res_df = res_df.reset_index()
+
+        demand_q = pd.to_numeric(res_df.get("demand_quality"), errors="coerce").fillna(-1.0)
+        supply_q = pd.to_numeric(res_df.get("supply_quality"), errors="coerce").fillna(-1.0)
+        use_demand = demand_q >= supply_q
+
+        res_df["zone_id"] = ""
+        res_df.loc[use_demand & res_df["demand_top"].notna(), "zone_id"] = "demand"
+        res_df.loc[~use_demand & res_df["supply_top"].notna(), "zone_id"] = "supply"
+
+        res_df["zone_hi"] = np.where(
+            use_demand,
+            pd.to_numeric(res_df.get("demand_top"), errors="coerce"),
+            pd.to_numeric(res_df.get("supply_top"), errors="coerce"),
+        )
+        res_df["zone_lo"] = np.where(
+            use_demand,
+            pd.to_numeric(res_df.get("demand_bottom"), errors="coerce"),
+            pd.to_numeric(res_df.get("supply_bottom"), errors="coerce"),
+        )
+        res_df["zone_high"] = res_df["zone_hi"]
+        res_df["zone_low"] = res_df["zone_lo"]
+        res_df["ob_id"] = res_df["zone_id"]
+
+        age = np.where(
+            use_demand,
+            pd.to_numeric(res_df.get("demand_age"), errors="coerce"),
+            pd.to_numeric(res_df.get("supply_age"), errors="coerce"),
+        )
+        quality = np.where(
+            use_demand,
+            demand_q,
+            supply_q,
+        )
+        touched = np.where(
+            use_demand,
+            pd.to_numeric(res_df.get("demand_touched"), errors="coerce").fillna(0.0),
+            pd.to_numeric(res_df.get("supply_touched"), errors="coerce").fillna(0.0),
+        )
+        age = pd.Series(age).replace([np.inf, -np.inf], np.nan)
+        quality = pd.Series(quality).replace([np.inf, -np.inf], np.nan)
+        touched = pd.Series(touched).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+        res_df["zone_recency"] = (1.0 / (1.0 + age.clip(lower=0))).fillna(0.0)
+        res_df["zone_displacement"] = quality.clip(lower=0.0).fillna(0.0)
+        res_df["zone_mitigation"] = (1.0 - touched.clip(lower=0.0, upper=1.0)).fillna(1.0)
+        res_df["zone_pd"] = 0.5
+        res_df["zone_ema_align"] = 0.5
 
         merged = frame.merge(res_df, on="timestamp", how="left")
         if "dt" in merged.columns:

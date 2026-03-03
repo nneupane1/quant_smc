@@ -26,8 +26,17 @@ class ConfigLoader:
     def __init__(self, conf_dir: str, env: str = None):
         self.conf_dir = conf_dir
         self.env = env or os.getenv("QS_ENV", "DEV").upper()
-        load_dotenv()
+        self._load_env_files()
         log(f"ConfigLoader initialized. env={self.env}")
+
+    def _load_env_files(self):
+        """
+        Load config-local secrets first, then fall back to the ambient .env.
+        """
+        secrets_path = os.path.join(self.conf_dir, "secrets.env")
+        if os.path.exists(secrets_path):
+            load_dotenv(secrets_path, override=False)
+        load_dotenv(override=False)
 
     def _load_yaml(self, path: str) -> Dict[str, Any]:
         if not os.path.exists(path):
@@ -158,6 +167,231 @@ class ConfigLoader:
         log("Injected .env variables into configuration.")
         return cfg2
 
+    def _normalize_assets(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        assets = cfg.get("assets")
+        if not isinstance(assets, dict):
+            assets = {}
+            cfg["assets"] = assets
+
+        if "default_asset" not in assets and "default_asset" in cfg:
+            assets["default_asset"] = cfg["default_asset"]
+        if "metadata" not in assets and isinstance(cfg.get("metadata"), dict):
+            assets["metadata"] = cfg["metadata"]
+
+        # Preserve legacy aliases while making the nested form canonical.
+        if "default_asset" not in cfg and "default_asset" in assets:
+            cfg["default_asset"] = assets["default_asset"]
+        if "metadata" not in cfg and isinstance(assets.get("metadata"), dict):
+            cfg["metadata"] = assets["metadata"]
+        return cfg
+
+    def _normalize_execution(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        exec_cfg = cfg.setdefault("execution", {})
+        conf_cfg = exec_cfg.setdefault("confluence", {})
+        trade_rate = exec_cfg.setdefault("trade_rate", {})
+        tiers = exec_cfg.setdefault("tiers", {})
+        hazard_cfg = exec_cfg.setdefault("hazard_trailing", {})
+        mpc_cfg = exec_cfg.setdefault("mpc", {})
+        stops_targets = exec_cfg.setdefault("stops_targets", {})
+        evr_cfg = exec_cfg.setdefault("evr", {})
+
+        if "session_weights" in cfg and "session_weights" not in conf_cfg:
+            conf_cfg["session_weights"] = cfg["session_weights"]
+        if "weights" in cfg and "legacy_component_weights" not in conf_cfg:
+            conf_cfg["legacy_component_weights"] = cfg["weights"]
+
+        thresholds = cfg.get("thresholds", {})
+        tr = thresholds.get("trade_rate", {})
+        if "target_daily_min" not in trade_rate and "target_min" in tr:
+            trade_rate["target_daily_min"] = tr["target_min"]
+        if "target_daily_max" not in trade_rate and "target_max" in tr:
+            trade_rate["target_daily_max"] = tr["target_max"]
+        if "precision_floor" not in trade_rate and "precision_floor" in thresholds:
+            trade_rate["precision_floor"] = thresholds["precision_floor"]
+
+        legacy_tiers = thresholds.get("tiers", {})
+        if "Aplus" not in tiers and "A_plus" in legacy_tiers:
+            aplus = legacy_tiers["A_plus"]
+            tiers["Aplus"] = {
+                "min_confluence": aplus.get("confluence"),
+                "min_evr": aplus.get("evr_min"),
+                "min_medianR": aplus.get("median_r"),
+                "max_hazard": aplus.get("hazard_max"),
+                "auto_execute": True,
+            }
+        if "A" not in tiers and "A" in legacy_tiers:
+            a = legacy_tiers["A"]
+            tiers["A"] = {
+                "min_confluence": a.get("confluence"),
+                "min_evr": a.get("evr_min"),
+                "min_medianR": a.get("median_r"),
+                "max_hazard": a.get("hazard_max"),
+                "auto_execute": False,
+            }
+
+        policy_thr = cfg.get("policy", {}).get("thresholds", {})
+        if policy_thr and "thresholds" not in hazard_cfg:
+            hazard_cfg["thresholds"] = policy_thr
+
+        legacy_mpc = cfg.get("mpc", {})
+        if legacy_mpc and "cvar_target" not in mpc_cfg and "cvar_cap" in legacy_mpc:
+            mpc_cfg["cvar_target"] = legacy_mpc["cvar_cap"]
+        if legacy_mpc and "risk_modes" not in mpc_cfg and "allowed_risk_modes" in legacy_mpc:
+            modes = legacy_mpc["allowed_risk_modes"]
+            if isinstance(modes, list) and len(modes) >= 3:
+                mpc_cfg["risk_modes"] = {"low": modes[0] / 100.0, "medium": modes[1] / 100.0, "high": modes[2] / 100.0}
+        if legacy_mpc and "lock_fraction_bounds" not in mpc_cfg and "lock_grid" in legacy_mpc:
+            grid = legacy_mpc["lock_grid"]
+            if isinstance(grid, list) and grid:
+                mpc_cfg["lock_fraction_bounds"] = [min(grid), max(grid)]
+        if legacy_mpc and "hedge_ratio_bounds" not in mpc_cfg and "hedge_ratio_grid" in legacy_mpc:
+            grid = legacy_mpc["hedge_ratio_grid"]
+            if isinstance(grid, list) and grid:
+                mpc_cfg["hedge_ratio_bounds"] = [min(grid), max(grid)]
+
+        legacy_stops = cfg.get("stops", {})
+        if "stop_atr_mult" not in stops_targets and "atr_multiplier" in legacy_stops:
+            stops_targets["stop_atr_mult"] = legacy_stops["atr_multiplier"]
+        legacy_targets = cfg.get("targets", {})
+        if "target_order" not in stops_targets and legacy_targets:
+            order = []
+            if legacy_targets.get("swing_levels"):
+                order.append("swing")
+            if legacy_targets.get("fvg_targets"):
+                order.append("fvg")
+            if legacy_targets.get("liquidity_levels"):
+                order.append("liquidity")
+            if order:
+                stops_targets["target_order"] = order
+        legacy_evr = cfg.get("evr", {})
+        cost_bps = legacy_evr.get("cost_bps", {})
+        if cost_bps:
+            evr_cfg.setdefault("fee_bps", {"taker": cost_bps.get("taker", 4), "maker": cost_bps.get("maker", 2)})
+            evr_cfg.setdefault(
+                "slippage_bps",
+                {
+                    "market": cost_bps.get("slippage_market_bps", 3),
+                    "limit_hit": cost_bps.get("slippage_limit_bps", 1.5),
+                },
+            )
+
+        if isinstance(cfg.get("risk"), dict):
+            exec_cfg.setdefault("legacy_risk", cfg["risk"])
+        if isinstance(cfg.get("fees"), dict):
+            exec_cfg.setdefault("legacy_fees", cfg["fees"])
+        if isinstance(cfg.get("spot"), dict) or isinstance(cfg.get("perp"), dict):
+            exec_cfg.setdefault("legacy_routing", {})
+            if isinstance(cfg.get("spot"), dict):
+                exec_cfg["legacy_routing"]["spot"] = cfg["spot"]
+            if isinstance(cfg.get("perp"), dict):
+                exec_cfg["legacy_routing"]["perp"] = cfg["perp"]
+        return cfg
+
+    def _normalize_features(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        features = cfg.setdefault("features", {})
+
+        if isinstance(cfg.get("ema"), dict):
+            features.setdefault("ema", {})
+            features["ema"] = self._merge(features["ema"], cfg["ema"])
+
+        legacy_regimes = cfg.get("regimes", {})
+        if legacy_regimes:
+            features.setdefault("regime", {})
+            hdb = legacy_regimes.get("hdbscan", {})
+            hmm = legacy_regimes.get("hmm", {})
+            if "hdbscan_min_cluster_size" not in features["regime"] and "min_cluster_size" in hdb:
+                features["regime"]["hdbscan_min_cluster_size"] = hdb["min_cluster_size"]
+            if "hdbscan_min_samples" not in features["regime"] and "min_samples" in hdb:
+                features["regime"]["hdbscan_min_samples"] = hdb["min_samples"]
+            if "hmm_states" not in features["regime"] and "n_states" in hmm:
+                features["regime"]["hmm_states"] = hmm["n_states"]
+            if "hmm_covariance" not in features["regime"] and "covariance_type" in hmm:
+                features["regime"]["hmm_covariance"] = hmm["covariance_type"]
+            features.setdefault("regime_legacy", legacy_regimes)
+
+        smc = features.setdefault("smc", {})
+        if isinstance(cfg.get("swings"), dict):
+            smc.setdefault("swings", cfg["swings"])
+        if isinstance(cfg.get("bos"), dict):
+            smc.setdefault("bos", cfg["bos"])
+        if isinstance(cfg.get("choch"), dict):
+            smc.setdefault("choch", cfg["choch"])
+        if isinstance(cfg.get("fvg"), dict):
+            smc.setdefault("fvg", cfg["fvg"])
+        if isinstance(cfg.get("sweeps"), dict) and "sweep" not in smc:
+            smc["sweep"] = cfg["sweeps"]
+        if isinstance(cfg.get("order_blocks"), dict) and "zones" not in smc:
+            smc["zones"] = cfg["order_blocks"]
+        if isinstance(cfg.get("context"), dict) and "context_legacy" not in smc:
+            smc["context_legacy"] = cfg["context"]
+
+        paths = cfg.setdefault("paths", {})
+        if "model_registry" not in paths and cfg.get("models", {}).get("registry_path"):
+            paths["model_registry"] = cfg["models"]["registry_path"]
+
+        tcfg = cfg.setdefault("timeframes", {})
+        derived = tcfg.get("derived", [])
+        if derived:
+            names = {item.get("name") for item in derived if isinstance(item, dict)}
+            if "6h" not in names and "5h" in names:
+                for item in derived:
+                    if isinstance(item, dict) and item.get("name") == "5h":
+                        item["name"] = "6h"
+                        item["multiple"] = 360
+            if "12h" not in names and "10h" in names:
+                for item in derived:
+                    if isinstance(item, dict) and item.get("name") == "10h":
+                        item["name"] = "12h"
+                        item["multiple"] = 720
+        return cfg
+
+    def _normalize_models(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        models = cfg.setdefault("models", {})
+        alias_pairs = {
+            "liquidity_flow": "liq_flow",
+            "bos_continuation": "bos_cont",
+            "micro_momentum": "momo",
+            "meta": "meta_model",
+        }
+        for old_name, new_name in alias_pairs.items():
+            if new_name not in models and old_name in models:
+                models[new_name] = deepcopy(models[old_name])
+            if old_name not in models and new_name in models:
+                models[old_name] = deepcopy(models[new_name])
+        return cfg
+
+    def _validate(self, cfg: Dict[str, Any]):
+        required_sections = ["execution", "features", "labels", "models", "assets"]
+        missing = [key for key in required_sections if key not in cfg]
+        if missing:
+            raise KeyError(f"Missing required config sections: {missing}")
+
+        assets = cfg.get("assets", {})
+        if "default_asset" not in assets:
+            raise KeyError("assets.default_asset is required in merged config.")
+        if "metadata" not in assets or not isinstance(assets["metadata"], dict):
+            raise KeyError("assets.metadata is required in merged config.")
+
+        exec_cfg = cfg.get("execution", {})
+        required_exec = ["capital", "confluence", "gates", "tiers", "hazard_trailing", "profit_ladder", "mpc", "trade_rate"]
+        missing_exec = [key for key in required_exec if key not in exec_cfg]
+        if missing_exec:
+            raise KeyError(f"Missing execution config keys: {missing_exec}")
+
+        tf = cfg.get("timeframes", {})
+        canonical = {tf.get("execution"), tf.get("flow"), tf.get("structure"), tf.get("regime")}
+        if {"15m", "1h", "6h", "12h"} - canonical:
+            raise KeyError("Canonical timeframe mapping must include 15m/1h/6h/12h.")
+
+    def _normalize(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        cfg = deepcopy(cfg)
+        cfg = self._normalize_assets(cfg)
+        cfg = self._normalize_execution(cfg)
+        cfg = self._normalize_features(cfg)
+        cfg = self._normalize_models(cfg)
+        self._validate(cfg)
+        return cfg
+
     def load(self) -> Dict[str, Any]:
         """
         Full resolved config.
@@ -176,6 +410,7 @@ class ConfigLoader:
         cfg = self._merge(cfg, self._load_regime_overrides())
         cfg = self._merge(cfg, self._load_session_overrides())
         cfg = self._inject_env_vars(cfg)
+        cfg = self._normalize(cfg)
 
         log("Final unified config loaded.")
         return cfg

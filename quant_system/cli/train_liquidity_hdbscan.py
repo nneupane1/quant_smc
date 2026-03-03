@@ -10,18 +10,14 @@ Example:
 """
 
 import argparse
-from pathlib import Path
 import json
+from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 
-from quant_system.ml.regime.hdbscan_trainer import (
-    HDBSCANConfig,
-    LiquidityClusterTrainer,
-)
 
-
-def _parse_feature_cols(raw: str | None):
+def _parse_feature_cols(raw: Optional[str]):
     if not raw:
         return None
     return [c.strip() for c in raw.split(",") if c.strip()]
@@ -50,29 +46,34 @@ def main():
         help="Comma-separated feature columns to use (optional). If omitted, trainer defaults are used.",
     )
     args = ap.parse_args()
+    try:
+        from quant_system.ml.regime.hdbscan_trainer import HDBSCANConfig, LiquidityClusterTrainer
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise SystemExit(f"hdbscan trainer unavailable: {exc}") from exc
 
     # Load data
     df = pd.read_csv(args.input, parse_dates=["dt"]).sort_values("dt").reset_index(drop=True)
 
     cfg = HDBSCANConfig(
-        tf=args.tf,
+        timeframe=args.tf,
         feature_cols=_parse_feature_cols(args.feature_cols),
         min_cluster_size=args.min_cluster_size,
         min_samples=args.min_samples,
-        epsilon=args.epsilon,
+        cluster_selection_epsilon=args.epsilon or 0.0,
         cluster_selection_method=args.cluster_selection_method,
         allow_single_cluster=args.allow_single_cluster,
     )
 
     trainer = LiquidityClusterTrainer(cfg)
-    states = trainer.fit(df, tf=args.tf)
+    states = trainer.fit(df)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     trainer.save(out_dir, states)
 
+    meta = getattr(trainer, "meta_", {})
     summary = {
-        "n_clusters": int(trainer.n_clusters_),
-        "noise_rate": float(trainer.noise_rate_),
+        "n_clusters": int(meta.get("n_clusters", 0)),
+        "noise_rate": float(meta.get("noise_rate", 0.0)),
         "tf": args.tf,
         "out": str(out_dir),
     }

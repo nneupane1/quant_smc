@@ -56,6 +56,36 @@ class RegimeHMMTrainer:
         self.model: Optional[GaussianHMM] = None
         self.features_: List[str] = []
 
+    def _init_hmm_params(self, X: np.ndarray):
+        n_states = int(self.cfg.n_states)
+        n_features = X.shape[1]
+        idx = np.linspace(0, len(X) - 1, n_states, dtype=int)
+        means = X[idx].copy()
+
+        cov = np.cov(X, rowvar=False)
+        if np.ndim(cov) == 0:
+            cov = np.array([[float(cov)]], dtype=float)
+        cov = np.asarray(cov, dtype=float)
+        cov = np.nan_to_num(cov, nan=1e-6, posinf=1e-6, neginf=1e-6)
+        cov = cov + np.eye(n_features) * 1e-6
+        diag = np.clip(np.diag(cov), 1e-6, None)
+
+        startprob = np.full(n_states, 1.0 / n_states, dtype=float)
+        transmat = np.full((n_states, n_states), 1.0 / n_states, dtype=float)
+
+        if self.cfg.covariance_type == "full":
+            covars = np.repeat(cov[None, :, :], n_states, axis=0)
+        elif self.cfg.covariance_type == "diag":
+            covars = np.repeat(diag[None, :], n_states, axis=0)
+        elif self.cfg.covariance_type == "spherical":
+            covars = np.repeat(np.array([float(diag.mean())], dtype=float), n_states)
+        elif self.cfg.covariance_type == "tied":
+            covars = cov
+        else:
+            covars = np.repeat(diag[None, :], n_states, axis=0)
+
+        return startprob, transmat, means, covars
+
     # ------------------------------------------------------------------ #
     def _build_features(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
@@ -84,8 +114,9 @@ class RegimeHMMTrainer:
 
             feat_df = frame[["logret", "range_pct", "realized_vol", "dollar_vol"]]
 
-        feat_df = feat_df.dropna().reset_index(drop=True)
+        feat_df = feat_df.dropna()
         dt_aligned = frame.loc[feat_df.index, ["dt"]].reset_index(drop=True)
+        feat_df = feat_df.reset_index(drop=True)
         return feat_df, dt_aligned
 
     # ------------------------------------------------------------------ #
@@ -104,8 +135,14 @@ class RegimeHMMTrainer:
             covariance_type=self.cfg.covariance_type,
             random_state=self.cfg.seed,
             n_iter=200,
+            init_params="",
             verbose=False,
         )
+        startprob, transmat, means, covars = self._init_hmm_params(X)
+        self.model.startprob_ = startprob
+        self.model.transmat_ = transmat
+        self.model.means_ = means
+        self.model.covars_ = covars
         self.model.fit(X)
         return self
 

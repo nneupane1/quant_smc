@@ -16,8 +16,6 @@ from typing import List, Optional
 
 import pandas as pd
 
-from quant_system.models.regime.hmm_trainer import HMMConfig, HMMTrainer
-
 
 def _parse_features(arg: Optional[str]) -> List[str]:
     if not arg:
@@ -40,6 +38,10 @@ def main():
         help="Output directory to store model.joblib and meta.json",
     )
     args = ap.parse_args()
+    try:
+        from quant_system.models.regime.hmm_trainer import HMMConfig, HMMTrainer
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise SystemExit(f"hmm trainer unavailable: {exc}") from exc
 
     df = pd.read_csv(args.input, parse_dates=["dt"], low_memory=False)
     feat_list = _parse_features(args.features)
@@ -60,8 +62,8 @@ def main():
         if not feat_list:
             raise ValueError("No features specified and no default regime columns found in the CSV.")
 
-    cfg = HMMConfig(n_states=args.n_states, features=feat_list)
-    trainer = HMMTrainer(cfg)
+    cfg = HMMConfig(n_states=args.n_states)
+    trainer = HMMTrainer(cfg, feat_list)
     report = trainer.fit(df)
 
     out_dir = Path(args.out)

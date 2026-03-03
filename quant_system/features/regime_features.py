@@ -18,8 +18,15 @@ import pandas as pd
 import numpy as np
 from typing import Dict, Any
 
-import hdbscan
-from hmmlearn.hmm import GaussianHMM
+try:
+    import hdbscan
+except Exception:  # pragma: no cover - optional dependency
+    hdbscan = None  # type: ignore
+
+try:
+    from hmmlearn.hmm import GaussianHMM
+except Exception:  # pragma: no cover - optional dependency
+    GaussianHMM = None  # type: ignore
 
 from quant_system.utils.logger import get_logger, log
 from quant_system.features.rolling_windows import RollingWindows
@@ -210,6 +217,33 @@ class RegimeFeatureBlock:
             )
             return base
 
+        if hdbscan is None or GaussianHMM is None:
+            LOG.warning("Regime block: hdbscan/hmmlearn unavailable; returning deterministic regime defaults.")
+            fallback = pd.DataFrame(index=feat.index)
+            trend_proxy = feat["trend_persist"].clip(lower=0.0, upper=1.0)
+            expansion_proxy = feat["vol_pct"].clip(lower=0.0, upper=1.0) * (1.0 - trend_proxy)
+            collapse_proxy = feat["compression_12h"].lt(-0.05).astype(float) * 0.5 + feat["toxicity_12h"].clip(lower=0.0).fillna(0.0) * 0.1
+            range_proxy = 1.0 + feat["compression_12h"].clip(upper=0.0).abs()
+            total = trend_proxy + expansion_proxy + collapse_proxy + range_proxy
+            fallback["p_regime_trend"] = (trend_proxy / total).fillna(0.25)
+            fallback["p_regime_expansion"] = (expansion_proxy / total).fillna(0.25)
+            fallback["p_regime_collapse"] = (collapse_proxy / total).fillna(0.25)
+            fallback["p_regime_range"] = (range_proxy / total).fillna(0.25)
+            fallback["regime_state"] = (
+                fallback[["p_regime_trend", "p_regime_range", "p_regime_expansion", "p_regime_collapse"]]
+                .idxmax(axis=1)
+                .str.replace("p_regime_", "", regex=False)
+            )
+            return fallback.reindex(reg_df.index).ffill().fillna(
+                {
+                    "p_regime_trend": 0.25,
+                    "p_regime_range": 0.25,
+                    "p_regime_expansion": 0.25,
+                    "p_regime_collapse": 0.25,
+                    "regime_state": "unknown",
+                }
+            )
+
         # HDBSCAN clustering
         clusterer = hdbscan.HDBSCAN(
             min_cluster_size=self.min_cluster_size,
@@ -294,12 +328,15 @@ class RegimeFeatureBlock:
         prob_df = self._run_regime_models(reg_features)
 
         merged = reg_features.join(prob_df, how="left")
-        # Ensure we don't duplicate dt; drop if present, then restore from index
-        merged = merged.drop(columns=["dt"], errors="ignore")
-        # dt already exists; reset_index with drop to avoid duplicate-column error
-        merged = merged.reset_index(drop=True)
+        state_map = {"trend": 1, "range": 0, "expansion": 2, "collapse": -1, "unknown": 0}
+        merged["regime_state_id"] = merged["regime_state"].map(state_map).fillna(0).astype(int)
+        if "dt" not in merged.columns:
+            merged["dt"] = pd.to_datetime(merged.index, utc=True)
+        merged["timestamp"] = (
+            pd.to_datetime(merged["dt"], utc=True).astype("int64") // 10**9
+        ).astype("int64")
         LOG.info("RegimeFeatureBlock applied.")
-        return merged
+        return merged.reset_index(drop=True)
 
 
 # Backward-compatible alias expected by callers

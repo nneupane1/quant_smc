@@ -80,7 +80,8 @@ class MPCRiskManager:
             return 0.0
         q05 = quantiles.get("q05", quantiles.get("q0.05", 0.0))
         q10 = quantiles.get("q10", quantiles.get("q0.10", 0.0))
-        return float((q05 + q10) / 2)
+        tail_mean = float((q05 + q10) / 2)
+        return abs(min(tail_mean, 0.0))
 
     def decide(
         self,
@@ -103,7 +104,7 @@ class MPCRiskManager:
         if cvar > self.cvar_target:
             risk = min(risk, float(self.risk_modes.get("low", risk)))
             hedge = max(hedge, self.hedge_bounds[1])
-            lock = max(lock, self.lock_bounds[0])
+            lock = max(lock, self.lock_bounds[1])
 
         return {
             "lock_pct": lock,

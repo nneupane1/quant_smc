@@ -25,16 +25,31 @@ class GateEvaluator:
         # Sensible defaults if not provided
         self.ocean_cfg = self.gates.get(
             "ocean_12h",
-            {"trend_prob_min": 0.45, "tox_max": 0.35},
+            self.gates.get(
+                "regime_12h",
+                {"trend_prob_min": 0.45, "tox_max": 0.35},
+            ),
         )
+        if self.ocean_cfg is None:
+            self.ocean_cfg = {
+                "trend_prob_min": 0.45,
+                "tox_max": 0.35,
+            }
         self.waves_cfg = self.gates.get(
             "waves_6h",
-            {"zone_score_min": 0.60},
+            self.gates.get(
+                "structure_6h",
+                {"zone_score_min": 0.60},
+            ),
         )
+        if self.waves_cfg is None:
+            self.waves_cfg = {"zone_score_min": 0.60}
         self.flow_cfg = self.gates.get(
             "flow_1h",
-            {"body_min": 0.60, "vol_z_min": 0.80, "freshness_bars": 4},
+            {"trend_prob_min": 0.45, "tox_max": 0.35},
         )
+        if "trend_prob_min" in self.flow_cfg:
+            self.flow_cfg = {"displacement_body_pct_min": 0.60, "volume_z_min": 0.80, "freshness_bars": 4}
 
     @staticmethod
     def _get(row: pd.Series, keys, default=None):
@@ -44,8 +59,8 @@ class GateEvaluator:
         return default
 
     def _ocean_ok(self, row: pd.Series, side: str, reasons: list) -> bool:
-        trend_up = self._get(row, ["p_trend_up_12h", "p_trend_up"], 0.0)
-        trend_down = self._get(row, ["p_trend_down_12h", "p_trend_down"], 0.0)
+        trend_up = self._get(row, ["p_trend_up_12h", "p_trend_up", "p_regime_trend"], 0.0)
+        trend_down = self._get(row, ["p_trend_down_12h", "p_trend_down", "p_regime_collapse"], 0.0)
         tox = self._get(row, ["toxicity_12h", "tox_12h"], 0.0)
 
         if side == "long":
@@ -64,7 +79,7 @@ class GateEvaluator:
         return True
 
     def _waves_ok(self, row: pd.Series, side: str, reasons: list) -> bool:
-        bias = self._get(row, ["structure_bias_6h", "bias_6h", "structure_bias"])
+        bias = self._get(row, ["structural_bias_6h", "structure_bias_6h", "bias_6h", "structure_bias"])
         zone_score = self._get(row, ["zone_score_6h", "zone_score"], None)
 
         # Allow if we lack the feature
@@ -88,24 +103,36 @@ class GateEvaluator:
     def _flow_ok(self, row: pd.Series, reasons: list) -> bool:
         flow_flag = self._get(row, ["flow_ok_1h", "flow_ok"], None)
         if flow_flag is not None:
+            if not bool(flow_flag):
+                reasons.append("flow_flag_false")
             return bool(flow_flag)
 
         body = self._get(row, ["displacement_body_pct_1h", "flow_body_pct_1h"], None)
         vol_z = self._get(row, ["volume_z_1h", "flow_vol_z_1h"], None)
         age = self._get(row, ["flow_age_bars_1h", "flow_age_bars"], None)
+        flow_prob = self._get(row, ["p_flow_1h", "prob_flow_1h"], None)
+        ml_prob_min = self.flow_cfg.get("ml_prob_min", None)
 
         # If we can't compute, allow but note
         if body is None or vol_z is None or age is None:
+            if flow_prob is not None and ml_prob_min is not None and flow_prob < ml_prob_min:
+                reasons.append("flow_ml_low")
+                return False
             return True
 
-        if body < self.flow_cfg["body_min"]:
+        body_min = self.flow_cfg.get("displacement_body_pct_min", self.flow_cfg.get("body_min", 0.60))
+        vol_z_min = self.flow_cfg.get("volume_z_min", self.flow_cfg.get("vol_z_min", 0.80))
+        if body < body_min:
             reasons.append("flow_body_low")
             return False
-        if vol_z < self.flow_cfg["vol_z_min"]:
+        if vol_z < vol_z_min:
             reasons.append("flow_vol_low")
             return False
         if age > self.flow_cfg["freshness_bars"]:
             reasons.append("flow_stale")
+            return False
+        if flow_prob is not None and ml_prob_min is not None and flow_prob < ml_prob_min:
+            reasons.append("flow_ml_low")
             return False
 
         return True
@@ -123,4 +150,5 @@ class GateEvaluator:
             "passed": passed,
             "reasons": reasons,
             "checks": {"ocean_12h": ocean, "waves_6h": waves, "flow_1h": flow},
+            "allow": passed,
         }

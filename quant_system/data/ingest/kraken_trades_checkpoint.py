@@ -22,6 +22,7 @@ import json
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -29,13 +30,22 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
+from quant_system.config.config_loader import ConfigLoader
+
 KRAKEN_REST = "https://api.kraken.com"
 
 
 # --------------------------- Utilities --------------------------- #
 def to_unix(ts_str: str) -> float:
-    """Parse ISO-like string to unix seconds (UTC)."""
-    dt = datetime.fromisoformat(ts_str.replace("Z", "")).astimezone(timezone.utc)
+    """Parse ISO-like string to unix seconds (UTC) without local-time drift."""
+    s = ts_str.strip()
+    if s.endswith("Z"):
+        dt = datetime.fromisoformat(s[:-1]).replace(tzinfo=timezone.utc)
+    elif "T" in s and ("+" in s[10:] or "-" in s[10:]):
+        dt = datetime.fromisoformat(s)
+        dt = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = datetime.fromisoformat(s + "T00:00:00").replace(tzinfo=timezone.utc) if "T" not in s else datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
     return dt.timestamp()
 
 
@@ -138,11 +148,11 @@ class MinuteAggregator:
         if trades.empty:
             return pd.DataFrame(columns=["o", "h", "l", "c", "v", "first_ts", "last_ts"])
         t = trades.set_index("ts")
-        opens = t["price"].resample("1T").first()
-        highs = t["price"].resample("1T").max()
-        lows = t["price"].resample("1T").min()
-        closes = t["price"].resample("1T").last()
-        vols = t["volume"].resample("1T").sum()
+        opens = t["price"].resample("1min").first()
+        highs = t["price"].resample("1min").max()
+        lows = t["price"].resample("1min").min()
+        closes = t["price"].resample("1min").last()
+        vols = t["volume"].resample("1min").sum()
         first_ts = t.index.to_series().resample("1min").min()
         last_ts = t.index.to_series().resample("1min").max()
         out = pd.DataFrame(
@@ -163,7 +173,9 @@ class MinuteAggregator:
         df = pd.read_csv(self.cache_csv, parse_dates=["ts", "first_ts", "last_ts"])
         if df.empty:
             return pd.DataFrame(columns=["o", "h", "l", "c", "v"])
-        df = df[(df["ts"] >= pd.to_datetime(start_iso)) & (df["ts"] <= pd.to_datetime(end_iso))]
+        start_dt = pd.to_datetime(start_iso, utc=True)
+        end_dt = pd.to_datetime(end_iso, utc=True)
+        df = df[(df["ts"] >= start_dt) & (df["ts"] <= end_dt)]
         df = df.set_index("ts")
         if df.empty:
             return pd.DataFrame(columns=["o", "h", "l", "c", "v"])
@@ -209,6 +221,41 @@ class Resampler:
         out = pd.DataFrame({"o": o, "h": h, "l": l, "c": c, "v": v}).dropna()
         out.index.name = "ts"
         return out
+
+
+@lru_cache(maxsize=32)
+def _canonical_asset_name(pair: str) -> str:
+    cfg = ConfigLoader("quant_system/config").load_yaml("assets.yaml")
+    for asset, meta in cfg.get("metadata", {}).items():
+        if asset == pair or meta.get("kraken_pair") == pair:
+            return asset
+    return pair
+
+
+def _finalize_ohlcv_frame(df: pd.DataFrame, last_source_ts: pd.Timestamp, include_gap: bool = False) -> pd.DataFrame:
+    if df.empty:
+        cols = ["dt", "timestamp", "open", "high", "low", "close", "volume"]
+        if include_gap:
+            cols.append("gap_filled")
+        return pd.DataFrame(columns=cols)
+
+    out = df.copy()
+    if last_source_ts < out.index[-1]:
+        out = out.iloc[:-1]
+    if out.empty:
+        cols = ["dt", "timestamp", "open", "high", "low", "close", "volume"]
+        if include_gap:
+            cols.append("gap_filled")
+        return pd.DataFrame(columns=cols)
+
+    out = out.reset_index()
+    out["dt"] = out["ts"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    out["timestamp"] = out["ts"].astype("int64") // 10**9
+    out = out.rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
+    cols = ["dt", "timestamp", "open", "high", "low", "close", "volume"]
+    if include_gap and "gap_filled" in out.columns:
+        cols.append("gap_filled")
+    return out[cols]
 
 
 # --------------------------- Orchestrator --------------------------- #
@@ -311,30 +358,23 @@ class KrakenDownloader:
             print("[finalize] no data to write.")
             return
 
+        asset = _canonical_asset_name(self.pair)
+        last_one_min_ts = one_min.index[-1]
+
         # write 1m
-        one_min_out = self.out_dir / f"{self.pair}_1m.csv"
-        one_min_reset = one_min.reset_index()
-        one_min_reset["Timestamp"] = one_min_reset["ts"].dt.strftime("%Y-%m-%d %H:%M")
-        one_min_reset = one_min_reset.rename(
-            columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume", "gap_filled": "GapFilled"}
-        )
-        one_min_reset = one_min_reset[["Timestamp", "Open", "High", "Low", "Close", "Volume", "GapFilled"]]
+        one_min_out = self.out_dir / f"{asset}_1m.csv"
+        one_min_reset = _finalize_ohlcv_frame(one_min, last_one_min_ts, include_gap=True)
         one_min_reset.to_csv(one_min_out, index=False, float_format="%.8f")
         print(f"[write] {one_min_out} rows={len(one_min_reset):,}")
 
         # roll-ups
-        tfs = {"15m": "15T", "1h": "1H", "6h": "6H", "12h": "12H"}
+        tfs = {"15m": "15min", "1h": "1h", "6h": "6h", "12h": "12h"}
         for name, rule in tfs.items():
             bars = Resampler.rollup_from_1m(one_min, rule)
-            out = self.out_dir / f"{self.pair}_{name}.csv"
-            bars = bars.reset_index()
-            bars["Timestamp"] = bars["ts"].dt.strftime("%Y-%m-%d %H:%M")
-            bars = bars.rename(
-                columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"}
-            )
-            bars = bars[["Timestamp", "Open", "High", "Low", "Close", "Volume"]]
-            bars.to_csv(out, index=False, float_format="%.8f")
-            print(f"[write] {out} rows={len(bars):,}")
+            out_path = self.out_dir / f"{asset}_{name}.csv"
+            final_bars = _finalize_ohlcv_frame(bars, last_one_min_ts)
+            final_bars.to_csv(out_path, index=False, float_format="%.8f")
+            print(f"[write] {out_path} rows={len(final_bars):,}")
 
 
 # --------------------------- CLI --------------------------- #

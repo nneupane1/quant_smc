@@ -1,182 +1,56 @@
-import streamlit as st
+from __future__ import annotations
+
+import altair as alt
 import pandas as pd
-import numpy as np
-import json
-from quant_system.backtest.replay_controller import ReplayController
-from quant_system.utils.logger import get_logger
-from streamlit.components.v1 import html
+import streamlit as st
 
-LOG = get_logger("replay_timeline")
-
-# --------------------------------------------------------------
-# PAGE CONFIG
-# --------------------------------------------------------------
-st.set_page_config(
-    page_title="Replay Timeline",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-st.title("Replay Timeline Navigator")
+from quant_system.dashboard.data_access import DashboardContext
+from quant_system.dashboard.ui import page_header, section_title
 
 
-# --------------------------------------------------------------
-# Load cached replay controller
-# --------------------------------------------------------------
-if "controller" not in st.session_state:
-    st.warning("Backtest not loaded. Go to Replay Mode first.")
-    st.stop()
+def render_replay_timeline(theme_choice: str, model_version: str, *, context: DashboardContext) -> None:
+    candles = context.backtest["candles"].copy()
+    execution_log = context.backtest["execution_log"].copy()
+    if candles.empty:
+        st.info("Replay timeline requires saved candles in the active backtest directory.")
+        return
 
-controller: ReplayController = st.session_state["controller"]
-df = controller.df
-exec_log = controller.exec
+    ts_col = "timestamp" if "timestamp" in candles.columns else "dt"
+    candles["timestamp"] = pd.to_datetime(candles[ts_col], errors="coerce")
+    metric = st.selectbox(
+        "Heatmap Metric",
+        [col for col in ["confluence", "conf", "evr", "hazard", "close"] if col in candles.columns] or ["close"],
+        index=0,
+    )
+    interval = st.selectbox("Interval", ["15min", "1H", "4H", "1D"], index=2)
 
-
-# --------------------------------------------------------------
-# Build timeline data
-# --------------------------------------------------------------
-df["t"] = df["timestamp"].astype("int64") // 10**9
-
-# Compute summary metrics per candle (these were computed in replay_controller)
-def safe_extract(meta_col):
-    return df[meta_col] if meta_col in df.columns else np.zeros(len(df))
-
-# For timeline heatmap visualization
-if "conf" not in df.columns:
-    df["conf"] = np.nan
-if "evr" not in df.columns:
-    df["evr"] = np.nan
-if "hazard" not in df.columns:
-    df["hazard"] = np.nan
-
-
-# --------------------------------------------------------------
-# Sidebar: Zoom + Filters
-# --------------------------------------------------------------
-with st.sidebar:
-    st.header("Timeline Options")
-
-    zoom = st.select_slider(
-        "Zoom Level",
-        options=["15m", "1h", "4h", "1d", "1w"],
-        value="4h"
+    page_header(
+        "Replay Timeline",
+        "Timeline heatmap for quickly locating high-confluence or high-risk zones before drilling into replay.",
+        kicker="Navigator",
     )
 
-    metric = st.selectbox("Heatmap Metric", ["conf", "evr", "hazard"])
+    grouped = candles.set_index("timestamp")[[metric]].resample(interval).mean().dropna().reset_index()
+    if grouped.empty:
+        st.info("No timeline data available for the selected metric.")
+        return
 
-    st.markdown("---")
-    st.write("Trade Markers:")
-    show_entries = st.checkbox("Entries", True)
-    show_exits = st.checkbox("Exits", True)
-    show_stops = st.checkbox("Stops", True)
-
-
-# --------------------------------------------------------------
-# Resampling for zoom levels
-# --------------------------------------------------------------
-rule_map = {
-    "15m": "15T",
-    "1h": "1H",
-    "4h": "4H",
-    "1d": "1D",
-    "1w": "1W"
-}
-
-rule = rule_map[zoom]
-
-zdf = df.resample(rule, on="timestamp").agg({
-    "conf": "mean",
-    "evr": "mean",
-    "hazard": "mean",
-    "open": "first",
-    "close": "last",
-})
-
-zdf = zdf.dropna(subset=["open", "close"]).reset_index()
-zdf["t"] = zdf["timestamp"].astype("int64") // 10**9
-
-metric_vals = zdf[metric].fillna(0).values
-norm = (metric_vals - metric_vals.min()) / (metric_vals.ptp() + 1e-6)
-
-# Color mapping for heatmap
-colors = [
-    f"rgba({int(255*n)}, {int(50)}, {int(255*(1-n))}, 0.75)"
-    for n in norm
-]
-
-
-# --------------------------------------------------------------
-# Build timeline HTML panel (D3-free, simple, flickerless)
-# --------------------------------------------------------------
-
-def make_timeline_html():
-    bars = []
-    for i, row in zdf.iterrows():
-        timestamp = int(row["t"])
-        color = colors[i]
-        title = f"{row['timestamp']} | {metric.upper()}={row[metric]:.3f}"
-
-        bars.append(f"""
-            <div class="bar" 
-                 style="background:{color}" 
-                 title="{title}" 
-                 onclick="ReplayWidget.send('jump', {{timestamp:{timestamp}}})">
-            </div>
-        """)
-
-    html_str = f"""
-    <style>
-        .timeline {{
-            width: 100%;
-            height: 60px;
-            display:flex;
-            flex-direction:row;
-            border:1px solid #333;
-            background:#111;
-            overflow:hidden;
-        }}
-        .bar {{
-            flex:1;
-            cursor:pointer;
-            transition:opacity 0.2s ease;
-        }}
-        .bar:hover {{
-            opacity:0.7;
-        }}
-    </style>
-
-    <div class="timeline">
-        {''.join(bars)}
-    </div>
-    """
-    return html_str
-
-
-# Render timeline
-st.subheader("Timeline Heatmap")
-st.markdown(make_timeline_html(), unsafe_allow_html=True)
-
-
-# --------------------------------------------------------------
-# TRADE TABLE (click row to jump to replay)
-# --------------------------------------------------------------
-st.markdown("---")
-st.subheader("Trades")
-
-if len(exec_log) == 0:
-    st.info("No trades in this backtest.")
-else:
-    # Clickable rows
-    exec_log = exec_log.copy()
-    exec_log["jump"] = exec_log["candle_idx"].apply(
-        lambda i: f"<a href='#' onclick=\"ReplayWidget.send('jump', {{timestamp:{int(df.loc[i,'t'])}}})\">Go</a>"
+    section_title("Timeline Heatmap", "Resampled metric intensity")
+    chart = (
+        alt.Chart(grouped)
+        .mark_bar()
+        .encode(
+            x="timestamp:T",
+            y=alt.value(40),
+            color=alt.Color(f"{metric}:Q", scale=alt.Scale(scheme="turbo")),
+            tooltip=["timestamp:T", f"{metric}:Q"],
+        )
+        .properties(height=120)
     )
-    st.write(
-        exec_log.to_html(escape=False, index=False),
-        unsafe_allow_html=True
-    )
+    st.altair_chart(chart, use_container_width=True)
 
-
-# --------------------------------------------------------------
-# END OF FILE
-# --------------------------------------------------------------
+    section_title("Trade Events", "Replay anchor points")
+    if execution_log.empty:
+        st.info("No execution log found.")
+    else:
+        st.dataframe(execution_log.tail(200), use_container_width=True, hide_index=True)

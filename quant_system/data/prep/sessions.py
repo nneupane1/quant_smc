@@ -1,12 +1,9 @@
-"""
-Session classifier for each timestamp.
-Computes London, NY, overlap, and off-hours regions with session weights.
-"""
+"""Session classifier for each timestamp with flexible timestamp sourcing."""
 
-import pandas as pd
-from typing import Dict, Any
 from datetime import time
 from zoneinfo import ZoneInfo
+
+import pandas as pd
 
 from quant_system.config.config_manager import ConfigManager
 from quant_system.utils.logger import get_logger
@@ -52,7 +49,7 @@ class SessionClassifier:
     def classify_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Add session columns + session weight to dataframe.
-        Assumes df.index is timezone-aware UTC timestamps.
+        Accepts either a timezone-aware datetime index or `dt` / `timestamp` columns.
         """
 
         if df.empty:
@@ -60,8 +57,27 @@ class SessionClassifier:
 
         LOG.info("Classifying sessions for dataset...")
 
-        # Convert index timestamps to local session timezone
-        local_times = df.index.tz_convert(self.tz)
+        base_df = df.copy()
+        if isinstance(base_df.index, pd.DatetimeIndex):
+            idx = base_df.index
+        elif "dt" in base_df.columns:
+            idx = pd.DatetimeIndex(pd.to_datetime(base_df["dt"], utc=True))
+        elif "timestamp" in base_df.columns:
+            ts_series = base_df["timestamp"]
+            if pd.api.types.is_numeric_dtype(ts_series):
+                numeric_ts = pd.to_numeric(ts_series, errors="coerce")
+                unit = "ms" if numeric_ts.dropna().gt(10**11).any() else "s"
+                idx = pd.DatetimeIndex(pd.to_datetime(numeric_ts, unit=unit, utc=True))
+            else:
+                idx = pd.DatetimeIndex(pd.to_datetime(ts_series, utc=True, errors="coerce"))
+        else:
+            raise ValueError("SessionClassifier requires a DatetimeIndex or `dt` / `timestamp` columns.")
+
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+
+        # Convert index timestamps to local session timezone.
+        local_times = idx.tz_convert(self.tz)
         local_tod = local_times.time
 
         london = []
@@ -90,12 +106,11 @@ class SessionClassifier:
             offhours.append(int(not (in_lon or in_ny)))
             weights.append(w)
 
-        df = df.copy()
-        df["session_london"] = london
-        df["session_ny"] = ny
-        df["session_overlap"] = overlap
-        df["session_offhours"] = offhours
-        df["session_weight"] = weights
+        base_df["session_london"] = london
+        base_df["session_ny"] = ny
+        base_df["session_overlap"] = overlap
+        base_df["session_offhours"] = offhours
+        base_df["session_weight"] = weights
 
         LOG.info("Session classification complete.")
-        return df
+        return base_df

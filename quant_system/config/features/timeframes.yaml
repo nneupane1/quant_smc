@@ -9,11 +9,11 @@ timeframes:
     - name: "1h"
       multiple: 60
 
-    - name: "5h"
-      multiple: 300
+    - name: "6h"
+      multiple: 360
 
-    - name: "10h"
-      multiple: 600
+    - name: "12h"
+      multiple: 720
 
 resample:
   volume_aggregation: "sum"

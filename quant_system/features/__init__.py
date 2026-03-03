@@ -1,30 +1,36 @@
 """
-Feature Engineering Module
---------------------------
+Feature engineering package.
 
-Provides:
-- Timeframe-aware resampling utilities
-- Full SMC (Smart Money Concepts) feature extractors
-- EMA, volatility, liquidity, regime features
-- FeatureStore for incremental storage and retrieval
-- Preprocessing utilities (scaling, winsorization, joins)
-
-All functions are deterministic, non-repainting, and aligned with
-the 15m → 1h → 6h → 12h multi-timeframe pipeline.
+Use lazy exports so optional feature stacks such as regime/HDBSCAN are only
+imported when requested explicitly.
 """
 
-from .resampler import TFResampler
-from .ema_features import EMAFeatureBuilder
-from .liquidity_features import LiquidityFeatureBuilder
-from .volatility_features import VolatilityFeatureBuilder
-from .regime_features import RegimeFeatureBuilder
-from .feature_store import FeatureStore
-from .preprocessing import FeaturePreprocessor
+from importlib import import_module
+from typing import Any
 
-# SMC submodules
-from .smc.swings import SwingHighLowDetector
-from .smc.bos_choch import BOSCHOCHDetector
-from .smc.fvg import FVGDetector
-from .smc.sweep import LiquiditySweepDetector
-from .smc.zones import OrderBlockDetector
-from .smc.structure_context import StructureContextBuilder
+
+_EXPORTS = {
+    "TFResampler": "quant_system.features.resampler",
+    "EMAFeatureBuilder": "quant_system.features.ema_features",
+    "LiquidityFeatureBuilder": "quant_system.features.liquidity_features",
+    "VolatilityFeatureBuilder": "quant_system.features.volatility_features",
+    "RegimeFeatureBuilder": "quant_system.features.regime_features",
+    "FeatureStore": "quant_system.features.feature_store",
+    "FeaturePreprocessor": "quant_system.features.preprocessing",
+    "SwingHighLowDetector": "quant_system.features.smc.swings",
+    "BOSCHOCHDetector": "quant_system.features.smc.bos_choch",
+    "FVGDetector": "quant_system.features.smc.fvg",
+    "LiquiditySweepDetector": "quant_system.features.smc.sweep",
+    "OrderBlockDetector": "quant_system.features.smc.zones",
+    "StructureContextBuilder": "quant_system.features.smc.structure_context",
+}
+
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name: str) -> Any:
+    module_name = _EXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = import_module(module_name)
+    return getattr(module, name)

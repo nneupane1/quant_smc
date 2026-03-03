@@ -4,9 +4,8 @@ Scaling, winsorization, NaN handling, walk-forward splits.
 Config-driven and used by training + forward-test pipelines.
 """
 
-import numpy as np
 import pandas as pd
-from typing import Tuple, List, Optional, Dict
+from typing import List, Optional, Tuple
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 
 from quant_system.config.config_manager import ConfigManager
@@ -51,7 +50,7 @@ class Preprocessor:
         if self.interpolate_missing:
             df = df.interpolate(limit=self.ffill_limit)
 
-        df = df.fillna(method="ffill", limit=self.ffill_limit)
+        df = df.ffill(limit=self.ffill_limit)
 
         if self.drop_incomplete:
             before = len(df)
@@ -66,10 +65,14 @@ class Preprocessor:
     # Winsorization
     # --------------------------------------------------------------
     def _winsorize(self, df: pd.DataFrame) -> pd.DataFrame:
-        lower = df.quantile(1 - self.clip_pct)
-        upper = df.quantile(self.clip_pct)
-        df = df.clip(lower=lower, upper=upper, axis=1)
-        return df
+        out = df.copy()
+        numeric_cols = out.select_dtypes(include=["number", "bool"]).columns
+        if len(numeric_cols) == 0:
+            return out
+        lower = out[numeric_cols].quantile(1 - self.clip_pct)
+        upper = out[numeric_cols].quantile(self.clip_pct)
+        out[numeric_cols] = out[numeric_cols].clip(lower=lower, upper=upper, axis=1)
+        return out
 
     # --------------------------------------------------------------
     # Scaling (fit-transform for train; transform only for test)
@@ -80,12 +83,16 @@ class Preprocessor:
         df = self._clean_nans(df)
         df = self._winsorize(df)
 
-        cols = df.columns
-        arr = self.scaler.fit_transform(df.values)
-        df = pd.DataFrame(arr, index=df.index, columns=cols)
+        numeric_cols = df.select_dtypes(include=["number", "bool"]).columns.tolist()
+        if not numeric_cols:
+            return df
+
+        out = df.copy()
+        arr = self.scaler.fit_transform(out[numeric_cols].values)
+        out.loc[:, numeric_cols] = arr
 
         LOG.info("Preprocessing: fit-transform complete")
-        return df
+        return out
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
         LOG.info("Preprocessing: transform start")
@@ -93,12 +100,16 @@ class Preprocessor:
         df = self._clean_nans(df)
         df = self._winsorize(df)
 
-        cols = df.columns
-        arr = self.scaler.transform(df.values)
-        df = pd.DataFrame(arr, index=df.index, columns=cols)
+        numeric_cols = df.select_dtypes(include=["number", "bool"]).columns.tolist()
+        if not numeric_cols:
+            return df
+
+        out = df.copy()
+        arr = self.scaler.transform(out[numeric_cols].values)
+        out.loc[:, numeric_cols] = arr
 
         LOG.info("Preprocessing: transform complete")
-        return df
+        return out
 
     # --------------------------------------------------------------
     # Walk-forward split

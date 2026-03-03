@@ -141,6 +141,12 @@ class LiquiditySweepDetector:
         res_df = pd.DataFrame.from_dict(res, orient="index")
         res_df.index.name = "timestamp"
         res_df = res_df.reset_index()
+        res_df["sweep_flag"] = (
+            res_df["sweep_high"].fillna(False) | res_df["sweep_low"].fillna(False)
+        ).astype(int)
+        res_df["sweep_dir"] = 0
+        res_df.loc[res_df["sweep_high"].fillna(False), "sweep_dir"] = -1
+        res_df.loc[res_df["sweep_low"].fillna(False), "sweep_dir"] = 1
 
         merged = frame.merge(res_df, on="timestamp", how="left")
         if "dt" in merged.columns:

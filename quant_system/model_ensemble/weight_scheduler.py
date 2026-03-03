@@ -25,9 +25,10 @@ class WeightScheduler:
             or {}
         )
         self.smooth = self.config.get("smoothing", 0.1)
+        self._last_weights = {}
 
     # --------------------------------------------------------------
-    def compute_weights(self, regime_probs: dict):
+    def compute_weights(self, regime_probs: dict, model_names=None):
         """
         Blend:
          • static weights
@@ -35,7 +36,12 @@ class WeightScheduler:
          • normalization + smoothing
         """
 
+        model_names = list(model_names or [])
         w = dict(self.static)
+        if not w and model_names:
+            w = {name: 1.0 / len(model_names) for name in model_names}
+        for name in model_names:
+            w.setdefault(name, 0.0)
 
         # Add regime-conditioned adjustments
         # Example in config:
@@ -57,12 +63,18 @@ class WeightScheduler:
         total = sum(w.values())
         if total > 0:
             w = {k: v / total for k, v in w.items()}
+        elif model_names:
+            w = {name: 1.0 / len(model_names) for name in model_names}
 
         # Smooth weights (EMA smoothing)
         smoothed = {}
         for k, v in w.items():
-            prev = self.static.get(k, v)
+            prev = self._last_weights.get(k, self.static.get(k, v))
             smoothed[k] = prev * self.smooth + v * (1 - self.smooth)
+        total = sum(smoothed.values())
+        if total > 0:
+            smoothed = {k: v / total for k, v in smoothed.items()}
+        self._last_weights = dict(smoothed)
 
         return smoothed
 

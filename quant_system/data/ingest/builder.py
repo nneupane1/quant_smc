@@ -117,7 +117,7 @@ class TimeframeBuilder:
         writer.write_candles([candle])
 
     # ------------------------------------------------------------
-    def build(self, chunk_size: int = 200000) -> None:
+    def build(self, chunk_size: int = 200000, include_final_partial: bool = False) -> None:
         """
         Main resample procedure:
         - Streams CSV in chunks
@@ -153,11 +153,13 @@ class TimeframeBuilder:
                 total_rows += len(chunk)
                 log(f"Processed final rows, total={total_rows:,}.")
 
-        # Write remaining open bars
-        log("Writing remaining bars at end of file.")
-        for tf, bar in bars.items():
-            if bar is not None:
-                self._write_bar(writers[tf], bar)
+        if include_final_partial:
+            log("Writing remaining bars at end of file.")
+            for tf, bar in bars.items():
+                if bar is not None:
+                    self._write_bar(writers[tf], bar)
+        else:
+            log("Skipping remaining open bars at EOF to avoid partial HTF candles.")
 
         dt = time.time() - t0
         log(f"Timeframe build completed in {dt:.2f} seconds.")

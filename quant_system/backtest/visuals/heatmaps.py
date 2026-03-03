@@ -1,12 +1,36 @@
-import streamlit as st
+from typing import Optional
+
 import pandas as pd
-import altair as alt
 
 
-def _heatmap(df: pd.DataFrame, x_col: str, y_col: str, value_col: str, title: str):
+def _optional_streamlit():
+    try:
+        import streamlit as st
+
+        return st
+    except Exception:
+        return None
+
+
+def _optional_altair():
+    try:
+        import altair as alt
+
+        return alt
+    except Exception:
+        return None
+
+
+def _heatmap(df: pd.DataFrame, x_col: str, y_col: str, value_col: str, title: str, render: bool = True):
     if df.empty:
-        st.write("No data available.")
-        return
+        return df
+    if not render:
+        return df
+
+    st = _optional_streamlit()
+    alt = _optional_altair()
+    if st is None or alt is None:
+        return df
 
     chart = (
         alt.Chart(df)
@@ -20,30 +44,31 @@ def _heatmap(df: pd.DataFrame, x_col: str, y_col: str, value_col: str, title: st
     )
     st.subheader(title)
     st.altair_chart(chart, use_container_width=True)
+    return chart
 
 
-def session_heatmap(df: pd.DataFrame):
+def session_heatmap(df: pd.DataFrame, render: bool = True):
     df = df.copy()
-    if "session" not in df.columns:
-        return
+    if "session" not in df.columns or "entry_ts" not in df.columns:
+        return pd.DataFrame()
     df["date"] = pd.to_datetime(df["entry_ts"]).dt.date
     agg = df.groupby(["session", "date"])["pnl"].sum().reset_index()
-    _heatmap(agg, "date", "session", "pnl", "Session PnL Heatmap")
+    return _heatmap(agg, "date", "session", "pnl", "Session PnL Heatmap", render=render)
 
 
-def regime_heatmap(df: pd.DataFrame):
-    if "regime" not in df.columns:
-        return
+def regime_heatmap(df: pd.DataFrame, render: bool = True):
+    if "regime" not in df.columns or "entry_ts" not in df.columns:
+        return pd.DataFrame()
     df = df.copy()
     df["date"] = pd.to_datetime(df["entry_ts"]).dt.date
     agg = df.groupby(["regime", "date"])["pnl"].sum().reset_index()
-    _heatmap(agg, "date", "regime", "pnl", "Regime PnL Heatmap")
+    return _heatmap(agg, "date", "regime", "pnl", "Regime PnL Heatmap", render=render)
 
 
-def tier_heatmap(df: pd.DataFrame):
-    if "tier" not in df.columns:
-        return
+def tier_heatmap(df: pd.DataFrame, render: bool = True):
+    if "tier" not in df.columns or "entry_ts" not in df.columns:
+        return pd.DataFrame()
     df = df.copy()
     df["date"] = pd.to_datetime(df["entry_ts"]).dt.date
     agg = df.groupby(["tier", "date"])["pnl"].sum().reset_index()
-    _heatmap(agg, "date", "tier", "pnl", "Tier PnL Heatmap")
+    return _heatmap(agg, "date", "tier", "pnl", "Tier PnL Heatmap", render=render)

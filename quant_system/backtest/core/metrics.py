@@ -13,7 +13,10 @@ LOG = get_logger("backtest_metrics")
 
 class BacktestMetrics:
     def __init__(self, trades: pd.DataFrame, starting_equity: Optional[float] = None):
-        self.df = trades.sort_values("entry_ts") if trades is not None else pd.DataFrame()
+        if trades is None or trades.empty or "entry_ts" not in trades.columns:
+            self.df = pd.DataFrame()
+        else:
+            self.df = trades.sort_values("entry_ts")
         self.start_equity = starting_equity
         if self.df.empty:
             LOG.warning("BacktestMetrics: no trades provided.")

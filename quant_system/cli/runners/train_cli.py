@@ -1,36 +1,93 @@
 """
-CLI wrapper for training orchestration.
-
-Note: The full training pipeline needs data/feature/label wiring before activation.
+CLI entrypoint for feature -> label -> model training.
 """
 
 import argparse
-import os
+from pathlib import Path
 
+import pandas as pd
+
+from quant_system.cli.common import (
+    default_asset,
+    default_conf_dir,
+    load_or_build_features,
+    load_or_build_labels,
+    load_registry,
+    resolve_conf_dir,
+    save_json,
+)
 from quant_system.config.config_loader import ConfigLoader
+from quant_system.ml.training.model_trainer import ModelTrainer
 from quant_system.utils.logger import get_logger
 
 LOG = get_logger("train_cli")
 
 
-def resolve_conf_dir(path: str) -> str:
-    if os.path.isdir(path):
-        return path
-    return os.path.dirname(path)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train models from a TF directory or prepared feature/label CSVs.")
+    parser.add_argument("--config-dir", default=default_conf_dir(__file__))
+    parser.add_argument("--asset", default=None, help="Asset symbol, e.g. XBTUSD")
+    parser.add_argument("--tf-dir", default=None, help="Directory containing {ASSET}_{15m,1h,6h,12h}.csv.")
+    parser.add_argument("--features", default=None, help="Prepared features CSV.")
+    parser.add_argument("--labels", default=None, help="Prepared labels CSV or full feature+label CSV.")
+    parser.add_argument("--features-out", default=None, help="Optional output CSV for built features.")
+    parser.add_argument("--labels-out", default=None, help="Optional output CSV for generated labels.")
+    parser.add_argument("--model-registry", default=None, help="Model registry output directory.")
+    parser.add_argument("--merged-out", default="artifacts/train/latest/training_frame.csv", help="Persist merged training frame.")
+    return parser.parse_args()
+
+
+def _merge_training_frame(features_df: pd.DataFrame, labels_df: pd.DataFrame) -> pd.DataFrame:
+    if labels_df is features_df:
+        return labels_df
+    if "dt" in features_df.columns and "dt" in labels_df.columns:
+        drop_cols = [c for c in labels_df.columns if c in features_df.columns and c != "dt"]
+        return features_df.merge(labels_df.drop(columns=drop_cols), on="dt", how="inner")
+    return labels_df
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train all models (skeleton)")
-    parser.add_argument("--config-dir", default=os.path.join(os.path.dirname(__file__), "..", "config"))
-
-    args = parser.parse_args()
-
+    args = parse_args()
     conf_dir = resolve_conf_dir(args.config_dir)
-    LOG.info(f"Loading configuration from {conf_dir} ...")
+    LOG.info("Loading configuration from %s ...", conf_dir)
     loader = ConfigLoader(conf_dir)
-    loader.load()  # validate
+    cfg = loader.load()
+    asset = default_asset(cfg, args.asset)
 
-    LOG.info("Training pipeline not wired in CLI yet. Implement data/feature/label/training orchestration before use.")
+    features_df = load_or_build_features(
+        loader,
+        asset=asset,
+        features_csv=args.features,
+        tf_dir=args.tf_dir,
+        features_out=args.features_out,
+    )
+    labels_df = load_or_build_labels(
+        loader,
+        features_df=features_df,
+        labels_csv=args.labels,
+        labels_out=args.labels_out,
+    )
+    train_df = _merge_training_frame(features_df, labels_df)
+
+    merged_out = Path(args.merged_out)
+    merged_out.parent.mkdir(parents=True, exist_ok=True)
+    train_df.to_csv(merged_out, index=False)
+
+    registry = load_registry(cfg, args.model_registry)
+    trainer = ModelTrainer(loader, registry)
+    version = trainer.train_asset(train_df, asset)
+
+    manifest = {
+        "asset": asset,
+        "version": version,
+        "rows": int(len(train_df)),
+        "features_out": args.features_out,
+        "labels_out": args.labels_out,
+        "merged_out": str(merged_out),
+        "registry_dir": registry.base_dir,
+    }
+    save_json(merged_out.parent / "train_manifest.json", manifest)
+    LOG.info("Training complete for %s version=%s", asset, version)
 
 
 if __name__ == "__main__":

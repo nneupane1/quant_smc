@@ -9,6 +9,7 @@ Multi-timeframe SMC structural context:
 Called during feature construction for 15m rows.
 """
 
+import numpy as np
 import pandas as pd
 from typing import Dict, Any
 
@@ -26,6 +27,7 @@ class StructureContext:
 
         self.discount_th = smc_cfg["premium_discount"]["discount_threshold"]
         self.premium_th = smc_cfg["premium_discount"]["premium_threshold"]
+        self.external_range_lookback = int(smc_cfg["premium_discount"].get("external_range_lookback", 150))
         self.range_ratio_th = smc_cfg["compression"]["range_ratio_threshold"]
         self.vol_drop_th = smc_cfg["compression"]["volatility_drop_pct"]
         self.zone_weights = smc_cfg["zones"]["score_weights"]
@@ -47,11 +49,18 @@ class StructureContext:
             bos_down = bool(row.get("bos_down", 0))
             choch_up = bool(row.get("choch_up", 0))
             choch_down = bool(row.get("choch_down", 0))
+            legacy_bias = row.get("bias", row.get("structure_bias"))
+            demand_q = row.get("demand_quality", None)
+            supply_q = row.get("supply_quality", None)
 
             if bos_up and not choch_down:
                 bias.append("UP")
             elif bos_down and not choch_up:
                 bias.append("DOWN")
+            elif isinstance(legacy_bias, str) and legacy_bias:
+                bias.append(legacy_bias.upper())
+            elif demand_q is not None and supply_q is not None:
+                bias.append("UP" if float(demand_q) >= float(supply_q) else "DOWN")
             else:
                 bias.append("NEUTRAL")
 
@@ -65,9 +74,18 @@ class StructureContext:
         Computes PD context: DISCOUNT / PREMIUM / MID.
         """
         pd_vals = []
+        lookback = max(3, min(self.external_range_lookback, max(len(df_6h), 3)))
+        rolling_high = df_6h["high"].rolling(lookback, min_periods=5).max()
+        rolling_low = df_6h["low"].rolling(lookback, min_periods=5).min()
         for i in range(len(df_6h)):
             row = df_6h.iloc[i]
             pdv = row.get("pd_value", None)
+            if pdv is None:
+                ext_hi = rolling_high.iloc[i]
+                ext_lo = rolling_low.iloc[i]
+                rng = ext_hi - ext_lo
+                if pd.notna(rng) and rng > 0:
+                    pdv = (row.get("close", np.nan) - ext_lo) / rng
 
             if pdv is None:
                 pd_vals.append("MID")
@@ -90,10 +108,13 @@ class StructureContext:
         Compression regime: range_ratio small and volatility drop.
         """
         vals = []
+        range_pct = ((df_6h["high"] - df_6h["low"]) / df_6h["close"].replace(0, pd.NA)).astype(float)
+        range_roll = range_pct.rolling(20, min_periods=5).mean()
+        vol_drop_series = ((range_roll.shift(5) - range_roll) / range_roll.shift(5).replace(0, pd.NA)).fillna(0.0)
         for i in range(len(df_6h)):
             row = df_6h.iloc[i]
-            range_ratio = row.get("range_ratio", None)
-            vol_drop = row.get("vol_drop", None)
+            range_ratio = row.get("range_ratio", row.get("range_pct", range_pct.iloc[i] if len(range_pct) > i else None))
+            vol_drop = row.get("vol_drop", vol_drop_series.iloc[i] if len(vol_drop_series) > i else None)
 
             if range_ratio is None or vol_drop is None:
                 vals.append(0)
@@ -118,17 +139,31 @@ class StructureContext:
             row = df_6h.iloc[i]
 
             rec = row.get("zone_recency", 0)
-            disp = row.get("zone_displacement", 0)
-            mit = row.get("zone_mitigation", 0)
+            disp = row.get("zone_displacement", row.get("demand_quality", row.get("supply_quality", 0)))
+            mit = row.get("zone_mitigation", 1 - max(float(row.get("demand_touched", 0) or 0), float(row.get("supply_touched", 0) or 0)))
             pd_score = row.get("zone_pd", 0)
             ema = row.get("zone_ema_align", 0)
 
+            if not rec:
+                zone_age = row.get("demand_age", row.get("supply_age"))
+                if zone_age is not None:
+                    rec = 1.0 / (1.0 + max(float(zone_age), 0.0))
+            if not pd_score:
+                pdv = row.get("pd_value")
+                if pdv is not None and pd.notna(pdv):
+                    if pdv <= self.discount_th:
+                        pd_score = 1.0
+                    elif pdv >= self.premium_th:
+                        pd_score = 0.0
+                    else:
+                        pd_score = 0.5
+
             score = (
-                rec * w["recency"]
-                + disp * w["displacement"]
-                + mit * w["mitigation"]
-                + pd_score * w["premium_discount"]
-                + ema * w["ema_alignment"]
+                float(rec) * w["recency"]
+                + float(disp) * w["displacement"]
+                + float(mit) * w["mitigation"]
+                + float(pd_score) * w["premium_discount"]
+                + float(ema) * w["ema_alignment"]
             )
             scores.append(score)
 
@@ -170,6 +205,8 @@ class StructureContext:
         score = self.compute_zone_score(df_6h)
 
         df_6h_ctx = pd.concat([bias, pdv, comp, score], axis=1)
+        df_6h_ctx["bias_6h"] = df_6h_ctx["structural_bias_6h"]
+        df_6h_ctx["structure_bias_6h"] = df_6h_ctx["structural_bias_6h"]
         out = self.project_to_15m(df_15m, df_6h_ctx)
 
         log("StructureContext: context features added to 15m frame.")

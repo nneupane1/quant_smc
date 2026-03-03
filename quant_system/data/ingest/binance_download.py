@@ -6,10 +6,11 @@ Example:
         --pair BTC/USDT \\
         --start 1609459200 \\
         --end 1609545600 \\
-        --output data/raw/BTCUSDT_1m_binance.csv
+        --output data/raw_1m/BTCUSDT_1m_binance.csv
 """
 
 import argparse
+import os
 import pandas as pd
 from quant_system.data.ingest.binance_client import BinanceClient
 
@@ -21,7 +22,7 @@ def main():
     parser.add_argument("--end", type=int, required=True, help="End timestamp (seconds UTC)")
     parser.add_argument(
         "--output",
-        default="data/raw/BTCUSDT_1m_binance.csv",
+        default=None,
         help="Output CSV path",
     )
     parser.add_argument("--sleep", type=float, default=0.2, help="Sleep between batches (seconds)")
@@ -34,9 +35,15 @@ def main():
         print("No data returned; check timestamps or pair.")
         return
 
+    output_path = args.output or os.path.join(
+        "data/raw_1m",
+        f"{args.pair.replace('/', '')}_1m_binance.csv",
+    )
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
     df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df.to_csv(args.output, index=False)
-    print(f"Wrote {len(df):,} rows to {args.output}")
+    df.to_csv(output_path, index=False)
+    print(f"Wrote {len(df):,} rows to {output_path}")
 
 
 if __name__ == "__main__":

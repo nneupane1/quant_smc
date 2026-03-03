@@ -2,15 +2,15 @@ swings:
   fractal:
     "15m": { left: 2, right: 2 }
     "1h":  { left: 3, right: 3 }
-    "5h":  { left: 3, right: 3 }
-    "10h": { left: 4, right: 4 }
+    "6h":  { left: 3, right: 3 }
+    "12h": { left: 4, right: 4 }
 
 bos:
   atr_buffer_multiplier:
     "15m": 0.2
     "1h":  0.3
-    "5h":  0.4
-    "10h": 0.5
+    "6h":  0.4
+    "12h": 0.5
   close_over_structure: true
 
 choch:

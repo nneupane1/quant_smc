@@ -47,6 +47,21 @@ labels:
 
 
   # =======================================================
+  # 1h Flow Readiness Label
+  # Success if the current 1h impulse context supports >=1.5R follow-through
+  # over the next 4-12 15m bars before a 1.0R invalidation.
+  # =======================================================
+  flow_1h:
+    min_horizon: 4
+    max_horizon: 12
+    min_R: 1.5
+    stop_R: 1.0
+    min_displacement_body_pct: 0.60
+    min_volume_z: 0.80
+    max_flow_age_bars: 4
+
+
+  # =======================================================
   # EOP — Expected Opportunity Probability
   # Success if an A+ setup appears within 96 bars
   # =======================================================

@@ -1,72 +1,256 @@
 """
-train_orchestrator.py
-Walk-forward training orchestration:
- 1) Load feature/label frames per asset
- 2) Optional preprocessing (scaling handled inside ModelTrainer calibration/HPO pipeline)
- 3) Run ModelTrainer per asset (uses Optuna + TSCV)
- 4) Persist metrics and governance decisions
+Top-level training orchestrator.
+
+Canonical flow:
+ - build or load 15m feature frame from timeframe CSVs
+ - generate or load labels
+ - merge into one training frame
+ - train the configured specialist/meta/confluence/hazard/quantile suite
+ - persist a training manifest
 """
 
-import time
+from __future__ import annotations
+
+import argparse
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Dict, Mapping, Optional
 
 import pandas as pd
 
+from quant_system.cli.common import (
+    default_asset,
+    default_conf_dir,
+    load_or_build_features,
+    load_or_build_labels,
+    load_registry,
+    resolve_conf_dir,
+    save_json,
+)
 from quant_system.config.config_loader import ConfigLoader
 from quant_system.ml.registry.model_registry import ModelRegistry
 from quant_system.ml.training.model_trainer import ModelTrainer
-from quant_system.ml.predict.model_predictor import ModelPredictor
-from quant_system.model_ensemble.model_governor import ModelGovernor
 from quant_system.utils.logger import get_logger
 
 LOG = get_logger("train_orchestrator")
 
 
+def _merge_training_frame(features_df: pd.DataFrame, labels_df: pd.DataFrame) -> pd.DataFrame:
+    if labels_df is features_df:
+        return labels_df.copy()
+    if "dt" in features_df.columns and "dt" in labels_df.columns:
+        drop_cols = [c for c in labels_df.columns if c in features_df.columns and c != "dt"]
+        merged = features_df.merge(labels_df.drop(columns=drop_cols), on="dt", how="inner")
+    else:
+        merged = labels_df.copy()
+    return merged.reset_index(drop=True)
+
+
 class TrainOrchestrator:
-    def __init__(self, conf_dir: str = "quant_system/config"):
-        self.cfg_loader = ConfigLoader(conf_dir)
-        cfg = self.cfg_loader.load()
+    def __init__(
+        self,
+        conf_dir: str = "quant_system/config",
+        *,
+        model_registry: Optional[str] = None,
+        artifact_root: str = "artifacts/train/latest",
+    ):
+        self.conf_dir = resolve_conf_dir(conf_dir)
+        self.cfg_loader = ConfigLoader(self.conf_dir)
+        self.cfg = self.cfg_loader.load()
+        self.registry = load_registry(self.cfg, model_registry)
+        self.trainer = ModelTrainer(self.cfg_loader, self.registry)
+        self.artifact_root = Path(artifact_root)
+        self.artifact_root.mkdir(parents=True, exist_ok=True)
 
-        models_root = cfg.get("paths", {}).get("model_registry", "artifacts/models")
-        self.registry = ModelRegistry(models_root)
-        self.governor = ModelGovernor(self.registry, cfg.get("models", {}).get("governance", {}))
+    def build_training_frame(
+        self,
+        *,
+        asset: str,
+        tf_dir: Optional[str] = None,
+        features_csv: Optional[str] = None,
+        labels_csv: Optional[str] = None,
+        features_out: Optional[str] = None,
+        labels_out: Optional[str] = None,
+        merged_out: Optional[str] = None,
+    ) -> pd.DataFrame:
+        features_df = load_or_build_features(
+            self.cfg_loader,
+            asset=asset,
+            features_csv=features_csv,
+            tf_dir=tf_dir,
+            features_out=features_out,
+        )
+        labels_df = load_or_build_labels(
+            self.cfg_loader,
+            features_df=features_df,
+            labels_csv=labels_csv,
+            labels_out=labels_out,
+        )
+        train_df = _merge_training_frame(features_df, labels_df)
 
-        self.assets_cfg = cfg.get("assets", {})
-        self.output_dir = Path(models_root)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        if merged_out:
+            out_path = Path(merged_out)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            train_df.to_csv(out_path, index=False)
+        return train_df
 
-    def run(self, asset_frames: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
-        """
-        asset_frames: {asset: feature+label dataframe} where df contains:
-          - feature columns
-          - label_liq_flow, label_bos_cont, label_momo, label_eop, label_edp
-          - hazard_event, hazard_time, close
-        Returns version IDs per asset.
-        """
-        trainer = ModelTrainer(self.cfg_loader, self.registry)
-        versions = {}
+    def run_asset(
+        self,
+        *,
+        asset: str,
+        tf_dir: Optional[str] = None,
+        features_csv: Optional[str] = None,
+        labels_csv: Optional[str] = None,
+        features_out: Optional[str] = None,
+        labels_out: Optional[str] = None,
+        merged_out: Optional[str] = None,
+        manifest_out: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        merged_out = merged_out or str(self.artifact_root / asset / "training_frame.csv")
+        manifest_out = manifest_out or str(self.artifact_root / asset / "train_manifest.json")
 
-        for asset, df in asset_frames.items():
-            LOG.info(f"[Orchestrator] Training asset={asset}, rows={len(df)}")
-            version = trainer.train_asset(df, asset)
-            versions[asset] = version
+        LOG.info("[TrainOrchestrator] Building training frame for asset=%s", asset)
+        train_df = self.build_training_frame(
+            asset=asset,
+            tf_dir=tf_dir,
+            features_csv=features_csv,
+            labels_csv=labels_csv,
+            features_out=features_out,
+            labels_out=labels_out,
+            merged_out=merged_out,
+        )
 
-        # Governance placeholder: approve if versions exist
-        for asset, ver in versions.items():
-            self.governor.submit(
-                model_id=f"{asset}_{ver}",
-                metrics={"pr_auc": 0.0, "brier": 1.0},  # replace with real evals
-                risk={"max_dd": 0.0, "cvar95": 0.0},
-                calib={"ece": 1.0},
+        LOG.info("[TrainOrchestrator] Training model suite for asset=%s rows=%s", asset, len(train_df))
+        version = self.trainer.train_asset(train_df, asset)
+        metrics = self._collect_metrics(asset, version)
+
+        manifest = {
+            "asset": asset,
+            "version": version,
+            "rows": int(len(train_df)),
+            "registry_dir": self.registry.base_dir,
+            "tf_dir": tf_dir,
+            "features_csv": features_csv,
+            "labels_csv": labels_csv,
+            "features_out": features_out,
+            "labels_out": labels_out,
+            "merged_out": str(merged_out),
+            "metrics": metrics,
+            "governance": self._governance_status(metrics),
+        }
+        save_json(manifest_out, manifest)
+        return manifest
+
+    def run(self, asset_frames: Mapping[str, Any]) -> Dict[str, Any]:
+        results: Dict[str, Any] = {}
+        for asset, payload in asset_frames.items():
+            if isinstance(payload, pd.DataFrame):
+                merged_out = self.artifact_root / asset / "training_frame.csv"
+                merged_out.parent.mkdir(parents=True, exist_ok=True)
+                payload.to_csv(merged_out, index=False)
+                version = self.trainer.train_asset(payload, asset)
+                metrics = self._collect_metrics(asset, version)
+                manifest = {
+                    "asset": asset,
+                    "version": version,
+                    "rows": int(len(payload)),
+                    "registry_dir": self.registry.base_dir,
+                    "merged_out": str(merged_out),
+                    "metrics": metrics,
+                    "governance": self._governance_status(metrics),
+                }
+                save_json(self.artifact_root / asset / "train_manifest.json", manifest)
+                results[asset] = manifest
+                continue
+
+            if not isinstance(payload, Mapping):
+                raise TypeError("TrainOrchestrator.run(...) expects asset payloads as DataFrames or mapping configs.")
+
+            results[asset] = self.run_asset(
+                asset=asset,
+                tf_dir=payload.get("tf_dir"),
+                features_csv=payload.get("features_csv"),
+                labels_csv=payload.get("labels_csv"),
+                features_out=payload.get("features_out"),
+                labels_out=payload.get("labels_out"),
+                merged_out=payload.get("merged_out"),
+                manifest_out=payload.get("manifest_out"),
             )
+        return results
 
-        return versions
+    def _collect_metrics(self, asset: str, version: str) -> Dict[str, Any]:
+        model_names = ["liq_flow", "bos_cont", "flow_1h", "momo", "eop", "edp"]
+        by_model: Dict[str, Any] = {}
+        cv_scores = []
+        for name in model_names:
+            metrics_path = Path(self.registry.base_dir) / f"{asset}_{name}" / version / "metrics.json"
+            if not metrics_path.exists():
+                continue
+            try:
+                metrics = pd.read_json(metrics_path, typ="series").to_dict()
+            except Exception:
+                import json
+
+                metrics = json.loads(metrics_path.read_text())
+            by_model[name] = metrics
+            cv = metrics.get("cv_score")
+            if isinstance(cv, (int, float)):
+                cv_scores.append(float(cv))
+
+        summary = {
+            "avg_cv_score": float(sum(cv_scores) / len(cv_scores)) if cv_scores else None,
+            "specialists_with_metrics": sorted(by_model.keys()),
+        }
+        return {"summary": summary, "by_model": by_model}
+
+    @staticmethod
+    def _governance_status(metrics: Dict[str, Any]) -> Dict[str, Any]:
+        available = metrics.get("summary", {}).get("specialists_with_metrics", [])
+        return {
+            "submitted": False,
+            "reason": (
+                "Trainer currently persists specialist CV metrics but not the full "
+                "risk/calibration governance payload required for automatic promotion."
+            ),
+            "available_metrics": available,
+        }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Top-level training orchestration entrypoint.")
+    parser.add_argument("--config-dir", default=default_conf_dir(__file__))
+    parser.add_argument("--asset", default=None, help="Asset symbol, e.g. XBTUSD")
+    parser.add_argument("--tf-dir", default=None, help="Directory containing {ASSET}_{15m,1h,6h,12h}.csv")
+    parser.add_argument("--features", default=None, help="Prepared features CSV")
+    parser.add_argument("--labels", default=None, help="Prepared labels CSV or merged feature+label CSV")
+    parser.add_argument("--features-out", default=None, help="Optional built features output")
+    parser.add_argument("--labels-out", default=None, help="Optional generated labels output")
+    parser.add_argument("--merged-out", default="artifacts/train/latest/training_frame.csv", help="Merged training frame output")
+    parser.add_argument("--manifest-out", default="artifacts/train/latest/train_manifest.json", help="Training manifest output")
+    parser.add_argument("--model-registry", default=None, help="Override model registry directory")
+    parser.add_argument("--artifact-root", default="artifacts/train/latest", help="Default artifact root for orchestrator outputs")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    orchestrator = TrainOrchestrator(
+        conf_dir=args.config_dir,
+        model_registry=args.model_registry,
+        artifact_root=args.artifact_root,
+    )
+    asset = default_asset(orchestrator.cfg, args.asset)
+    manifest = orchestrator.run_asset(
+        asset=asset,
+        tf_dir=args.tf_dir,
+        features_csv=args.features,
+        labels_csv=args.labels,
+        features_out=args.features_out,
+        labels_out=args.labels_out,
+        merged_out=args.merged_out,
+        manifest_out=args.manifest_out,
+    )
+    LOG.info("[TrainOrchestrator] Complete asset=%s version=%s", manifest["asset"], manifest["version"])
 
 
 if __name__ == "__main__":
-    LOG.info("TrainOrchestrator entrypoint expects prebuilt feature/label frames.")
-    # Example usage (pseudocode):
-    # frames = {"BTCUSD": pd.read_csv("features_labels_btc.csv")}
-    # orchestrator = TrainOrchestrator()
-    # orchestrator.run(frames)
+    main()

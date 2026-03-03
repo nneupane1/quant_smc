@@ -8,7 +8,7 @@ ModelGovernor:
 import time
 import json
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 from quant_system.utils.logger import get_logger
 
@@ -21,6 +21,21 @@ class ModelGovernor:
         self.config = config or {}
         self.log_path = Path(self.config.get("governance_log", "governance_log.json"))
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.slot = self.config.get("deployment_slot", "production")
+        self.defaults = {
+            "min_requirements": {
+                "pr_auc": 0.0,
+                "brier": 1.0,
+                "ece": 1.0,
+                "max_dd": 1e9,
+                "cvar95": 1e9,
+            },
+            "shadow_requirements": {
+                "min_evr_delta": -999.0,
+                "max_dd_delta": 999.0,
+                "min_precision": 0.0,
+            },
+        }
 
     # ------------------------------------------------------------------
     def submit(self, model_id: str, metrics: dict, risk: dict, calib: dict):
@@ -48,7 +63,7 @@ class ModelGovernor:
         """
         Evaluate submission using config thresholds.
         """
-        cfg = self.config.get("min_requirements", {})
+        cfg = {**self.defaults["min_requirements"], **self.config.get("min_requirements", {})}
         pass_metrics = (
             metrics.get("pr_auc", 0.0) >= cfg.get("pr_auc", 0.0)
             and metrics.get("brier", 1.0) <= cfg.get("brier", 1.0)
@@ -68,7 +83,16 @@ class ModelGovernor:
             f"metrics={pass_metrics}, calib={pass_calib}, risk={pass_risk}"
         )
 
-        return ok
+        decision = {
+            "approved": bool(ok),
+            "checks": {
+                "metrics": pass_metrics,
+                "calibration": pass_calib,
+                "risk": pass_risk,
+            },
+        }
+        self._append_log("evaluation", {"timestamp": time.time(), "model_id": model_id, **decision})
+        return decision
 
     # ------------------------------------------------------------------
     def approve_shadow(self, model_id):
@@ -94,8 +118,8 @@ class ModelGovernor:
 
     # ------------------------------------------------------------------
     def _shadow_decision(self, stats: dict):
-        cfg = self.config.get("shadow_requirements", {})
-        return (
+        cfg = {**self.defaults["shadow_requirements"], **self.config.get("shadow_requirements", {})}
+        return bool(
             stats.get("evr_delta", -999) >= cfg.get("min_evr_delta", -999)
             and stats.get("dd_delta", 999) <= cfg.get("max_dd_delta", 999)
             and stats.get("precision", 0.0) >= cfg.get("min_precision", 0.0)
@@ -105,24 +129,35 @@ class ModelGovernor:
     def promote(self, model_id):
         """Promote model to production."""
         LOG.info(f"[Gov] PROMOTING model {model_id} → PRODUCTION")
+        active = None
         if hasattr(self.registry, "set_active_model"):
-            self.registry.set_active_model(model_id)
-        self._append_log("promotion", {"timestamp": time.time(), "model_id": model_id})
+            active = self.registry.set_active_model(model_id, slot=self.slot)
+        self._append_log("promotion", {"timestamp": time.time(), "model_id": model_id, "slot": self.slot, "active": active})
+        return active
 
     # ------------------------------------------------------------------
     def rollback(self, to_model_id):
         """Rollback to a previous production model."""
         LOG.warning(f"[Gov] ROLLBACK → {to_model_id}")
+        active = None
         if hasattr(self.registry, "set_active_model"):
-            self.registry.set_active_model(to_model_id)
-        self._append_log("rollback", {"timestamp": time.time(), "model_id": to_model_id})
+            active = self.registry.set_active_model(to_model_id, slot=self.slot)
+        self._append_log("rollback", {"timestamp": time.time(), "model_id": to_model_id, "slot": self.slot, "active": active})
+        return active
+
+    # ------------------------------------------------------------------
+    def history(self) -> List[Dict[str, Any]]:
+        if not self.log_path.exists():
+            return []
+        try:
+            payload = json.loads(self.log_path.read_text())
+            return payload if isinstance(payload, list) else []
+        except Exception:
+            return []
 
     # ------------------------------------------------------------------
     def _append_log(self, event, entry):
         log_entry = {"event": event, **entry}
-        if self.log_path.exists():
-            prev = json.loads(self.log_path.read_text())
-        else:
-            prev = []
+        prev = self.history()
         prev.append(log_entry)
         self.log_path.write_text(json.dumps(prev, indent=2))

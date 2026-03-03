@@ -1,5 +1,10 @@
 execution:
   starting_equity: 20000
+  capital:
+    base_ticket_usd: 20000
+    compound_ticket: true
+    use_mpc: false
+    min_free_capital_usd: 1000
 
   # =======================================================
   # Confluence Model / Score Configuration
@@ -7,6 +12,7 @@ execution:
   confluence:
     weight_specialist: 1.0
     weight_meta: 0.5
+    weight_flow: 0.75
     weight_rsv: 0.5
     weight_smc: 0.5
     weight_session: 1.0
@@ -84,6 +90,28 @@ execution:
     ema_stretch_z: 2.5
     freshness_decay_bars: 32
     segment_thresholds: {}
+    runner_moonshot:
+      enabled: true
+      confluence_min: 0.75
+      bos_cont_min: 0.60
+      eop_edge_min: 0.00
+      median_r_min: 6.0
+      hazard_discount: 0.08
+      tighten_bonus: 0.03
+      partial_bonus: 0.05
+      exit_bonus: 0.08
+
+  profit_ladder:
+    enabled: true
+    breakeven_after_r: 2.0
+    breakeven_buffer_r: 0.0
+    core_take_r: 2.0
+    strong_core_take_r: 3.0
+    runner_target_min_r: 6.0
+    runner_target_max_r: 10.0
+    strong_conf_min: 0.75
+    strong_bos_cont_min: 0.60
+    strong_median_r_min: 6.0
 
   # =======================================================
   # MPC: CVaR-Constrained Risk Manager
@@ -142,6 +170,7 @@ execution:
       displacement_body_pct_min: 0.60
       volume_z_min: 0.80
       freshness_bars: 4        # 4×15m
+      ml_prob_min: 0.55
 
     execution_15m:
       allow_if_bias_aligned: true
@@ -149,6 +178,60 @@ execution:
       enforce_evr_threshold: true
       enforce_hazard_threshold: true
 
+  cooling:
+    min_bars: 4
+    max_bars: 20
+    conf_boost: 0.15
+    evr_boost: 0.30
+    hazard_cut: -0.10
+    moon_conf_add: 0.10
+    moon_evr_min: 1.80
+    moon_medR_min: 6.0
+    moon_hazard_max: 0.25
+    twoR_conf_add: 0.05
+    twoR_evr_min: 1.20
+    twoR_medR_min: 2.0
+    twoR_hazard_max: 0.40
+
+  cooling_dd_trigger: 0.08
+  cooling_minutes: 60
+
+  compound_cooling:
+    enabled: true
+    require_signals: 2
+    min_profit_to_lock_usd: 50
+    edp_gap_min: 0.00
+    hazard_trigger: 0.40
+    bar_minutes: 15
+    allow_moonshot_during_cooling: false
+    allow_twoR_during_cooling: false
+
+  runner_split:
+    core_frac: 0.70
+
+  exposure_tracker:
+    borrow_limit: 20000
+    max_gross_exposure_mult: 1.0
+
+  position_sizer:
+    toxicity_scale: 0.0
+    ema_stretch_scale: 0.0
+    min_qty: 0.0
+    max_leverage: 1.0
+
+  simulator:
+    maker_fee: 0.0002
+    taker_fee: 0.0004
+    slippage_limit: 0.00015
+    slippage_market: 0.0003
+    path_mode: "nearest_extreme_first"
+
+  order_adapter:
+    taker_fee_bps: 4
+    maker_fee_bps: 2
+    slippage_bps: 3
+    borrow_apr: 0.15
+    funding_rate: 0.0
 
 
 live_trading:
@@ -164,39 +247,3 @@ live_trading:
     pair: "XXBTZUSD"
     max_retry: 5
     retry_sleep: 1.0
-
-
-
-
-  cooling:
-    min_bars: 4
-    max_bars: 20
-
-    conf_boost: 0.15
-    evr_boost: 0.30
-    hazard_cut: -0.10
-
-  moon_conf_add: 0.10
-  moon_evr_min: 1.80
-  moon_medR_min: 6.0
-  moon_hazard_max: 0.25
-
-  twoR_conf_add: 0.05
-    twoR_evr_min: 1.20
-    twoR_medR_min: 2.0
-    twoR_hazard_max: 0.40
-
-    # equity-based cooling
-    cooling_dd_trigger: 0.08
-    cooling_minutes: 60
-
-    # runner/core split for compounding logic
-    runner_split:
-      core_frac: 0.70
-    # regime/session hazard overrides (optional)
-    hazard_trailing_segment:
-      trend:
-        london:
-          exit: 0.60
-        ny:
-          exit: 0.60

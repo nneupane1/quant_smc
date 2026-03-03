@@ -1,35 +1,38 @@
+from __future__ import annotations
+
 import pandas as pd
+
+from quant_system.data.prep.sessions import SessionClassifier as CanonicalSessionClassifier
 
 
 class SessionClassifier:
     """
-    Simple session classifier placeholder.
+    Backward-compatible session wrapper that exposes both the canonical session
+    columns and the older aliases expected by some feature/runtime code.
     """
 
-    def __init__(self):
-        # Define session windows if needed
-        self.sessions = {
-            "asia": (0, 8),
-            "london": (8, 16),
-            "ny": (13, 21),
-        }
+    def __init__(self, conf_dir: str = "quant_system/config"):
+        self.impl = CanonicalSessionClassifier(conf_dir)
 
     def classify(self, ts) -> str:
-        hour = pd.to_datetime(ts).hour if ts is not None else 0
-        for name, (start, end) in self.sessions.items():
-            if start <= hour < end:
-                return name
-        return "other"
+        sample = pd.DataFrame({"dt": [pd.to_datetime(ts, utc=True)]})
+        out = self.apply(sample)
+        return str(out["session"].iloc[0])
 
     def apply(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Adds a 'session' column based on timestamp/dt.
-        """
-        df = df.copy()
-        if "dt" in df.columns:
-            df["session"] = df["dt"].apply(self.classify)
-        elif "timestamp" in df.columns:
-            df["session"] = pd.to_datetime(df["timestamp"], unit="s").apply(self.classify)
-        else:
-            df["session"] = "other"
-        return df
+        out = self.impl.classify_dataframe(df.copy())
+        out["is_ldn"] = out["session_london"]
+        out["is_ny"] = out["session_ny"]
+        out["session_off_hours"] = out.get("session_offhours", 0)
+
+        if "session" not in out.columns:
+            session = pd.Series("off_hours", index=out.index, dtype="object")
+            session = session.mask(out["session_london"].astype(bool), "london")
+            session = session.mask(out["session_ny"].astype(bool), "ny")
+            session = session.mask(out["session_overlap"].astype(bool), "overlap")
+            out["session"] = session
+        out["session_name"] = out["session"]
+        return out
+
+    def classify_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        return self.apply(df)

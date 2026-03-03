@@ -27,10 +27,10 @@ from sklearn.preprocessing import RobustScaler
 
 try:
     import hdbscan
-except ImportError as exc:  # pragma: no cover
-    raise SystemExit(
-        "hdbscan is required. Please install with `pip install hdbscan`."
-    ) from exc
+    _HAS_HDBSCAN = True
+except ImportError:
+    hdbscan = None  # type: ignore
+    _HAS_HDBSCAN = False
 
 
 def _parse_features_arg(arg: Optional[str]) -> Optional[List[str]]:
@@ -101,6 +101,8 @@ def main():
     ap.add_argument("--metric", default="euclidean", help="Distance metric (default: euclidean).")
     ap.add_argument("--pca-components", type=int, default=None, help="Optional PCA components before clustering.")
     args = ap.parse_args()
+    if not _HAS_HDBSCAN:
+        raise SystemExit("hdbscan is required. Please install with `pip install hdbscan`.")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

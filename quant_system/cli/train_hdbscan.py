@@ -9,16 +9,10 @@ Usage (PowerShell example):
 """
 
 import argparse
-import json
 from pathlib import Path
 from typing import List, Optional
 
 import pandas as pd
-
-from quant_system.models.liquidity.hdbscan_trainer import (
-    HDBSCANConfig,
-    HDBSCANTrainer,
-)
 
 
 def _parse_features(val: Optional[str]) -> Optional[List[str]]:
@@ -53,6 +47,10 @@ def main():
         help="Persist labels.csv alongside the model.",
     )
     args = ap.parse_args()
+    try:
+        from quant_system.models.liquidity.hdbscan_trainer import HDBSCANConfig, HDBSCANTrainer
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise SystemExit(f"hdbscan trainer unavailable: {exc}") from exc
 
     df = pd.read_csv(args.input, parse_dates=["dt"]) if Path(args.input).exists() else pd.read_csv(args.input)
 

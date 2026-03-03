@@ -1,12 +1,7 @@
 """
-Liquidity microstructure clustering models (HDBSCAN).
+Liquidity clustering package exports.
 """
 
-from .hdbscan_model import LiquidityClusterModel
-from .hdbscan_trainer import LiquidityHDBSCANTrainer, LiquidityHDBSCANConfig
+from .hdbscan_trainer import HDBSCANConfig, HDBSCANTrainer
 
-__all__ = [
-    "LiquidityClusterModel",
-    "LiquidityHDBSCANTrainer",
-    "LiquidityHDBSCANConfig",
-]
+__all__ = ["HDBSCANConfig", "HDBSCANTrainer"]

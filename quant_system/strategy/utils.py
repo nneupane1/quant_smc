@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Iterable, Optional, Tuple
 
 
 def tokens_for_risk(equity: float, risk_pct: float, entry: float, stop: float, side: str) -> float:
@@ -32,3 +32,37 @@ def throttle_by_absorption(absorption: float, lo: float, hi: float) -> float:
         return 0.5
     t = (absorption - lo) / (hi - lo + 1e-9)
     return 1.0 - 0.5 * t
+
+
+def first_number(row: dict, keys: Iterable[str], default: float = 0.0) -> float:
+    for key in keys:
+        value = row.get(key)
+        try:
+            number = float(value)
+        except Exception:
+            continue
+        if number == number:
+            return number
+    return float(default)
+
+
+def first_text(row: dict, keys: Iterable[str], default: str = "") -> str:
+    for key in keys:
+        value = row.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return default
+
+
+def boolish(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return float(value) != 0.0
+    text = str(value).strip().lower()
+    return text in {"1", "true", "yes", "y", "pass", "passed"}

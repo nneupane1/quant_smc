@@ -1,15 +1,15 @@
-"""
-tf_builder.py
-Aggregates 1m → 15m → 1h → 6h → 12h using [start,end) close logic.
-Emits a TF bar only when the window is closed.
-"""
+"""Closed-bar 1m to higher-timeframe aggregation."""
+
+from __future__ import annotations
+
+from datetime import timedelta
+from typing import Dict, Optional
 
 import pandas as pd
-from datetime import timedelta
 
 
 class TFBuilder:
-    """Time-based multi-TF aggregator for live 1m streams."""
+    """Aggregate closed 1m candles into closed 15m/1h/6h/12h bars."""
 
     TF_MAP = {
         "15m": 15,
@@ -19,62 +19,62 @@ class TFBuilder:
     }
 
     def __init__(self):
-        # Per TF: {"start": datetime, "rows": []}
-        self.buffers = {tf: {"start": None, "rows": []} for tf in self.TF_MAP}
+        self.buffers = {tf: {"start": None, "end": None, "rows": []} for tf in self.TF_MAP}
 
-    def _finalize(self, tf: str):
-        buf = self.buffers[tf]
-        rows = buf["rows"]
+    @staticmethod
+    def _bucket_bounds(dt, mins: int):
+        dt = pd.to_datetime(dt)
+        open_ts = dt - pd.Timedelta(minutes=1)
+        start = open_ts.floor(f"{mins}min")
+        end = start + pd.Timedelta(minutes=mins)
+        return start, end
+
+    @staticmethod
+    def _finalize(rows) -> Optional[Dict[str, object]]:
         if not rows:
             return None
         df = pd.DataFrame(rows)
-        close_dt = df["dt"].iloc[-1]
-        tf_bar = {
+        close_dt = pd.to_datetime(df["dt"].iloc[-1])
+        out = {
             "dt": close_dt,
             "timestamp": int(pd.Timestamp(close_dt).timestamp()),
-            "open": df["open"].iloc[0],
-            "high": df["high"].max(),
-            "low": df["low"].min(),
-            "close": df["close"].iloc[-1],
-            "volume": df["volume"].sum(),
+            "open": float(df["open"].iloc[0]),
+            "high": float(df["high"].max()),
+            "low": float(df["low"].min()),
+            "close": float(df["close"].iloc[-1]),
+            "volume": float(df["volume"].sum()),
         }
-        asset = df["asset"].iloc[0] if "asset" in df.columns else None
-        if asset is not None:
-            tf_bar["asset"] = asset
-        # reset
-        self.buffers[tf] = {"start": None, "rows": []}
-        return tf_bar
+        if "asset" in df.columns:
+            out["asset"] = df["asset"].iloc[-1]
+        return out
 
     def push_1m(self, candle: dict):
-        """
-        Route 1m candle into buffers & emit closed TF bars.
-        Candle must include "dt" (datetime-like) and may include "asset".
-        """
-        emit = {}
+        """Push one closed 1m candle and return newly closed higher-timeframe bars."""
+        emits = {}
         dt = pd.to_datetime(candle["dt"])
 
         for tf, mins in self.TF_MAP.items():
+            start, end = self._bucket_bounds(dt, mins)
             buf = self.buffers[tf]
-            dur = timedelta(minutes=mins)
 
-            # Initialize bucket
             if buf["start"] is None:
-                buf["start"] = dt.floor(f"{mins}min")
+                buf["start"], buf["end"] = start, end
 
-            # If the incoming bar belongs to a new bucket, finalize previous buckets
-            while dt >= buf["start"] + dur:
-                tf_bar = self._finalize(tf)
-                if tf_bar:
-                    emit[tf] = tf_bar
-                buf["start"] += dur
+            if start != buf["start"]:
+                prev = self._finalize(buf["rows"])
+                if prev:
+                    emits[tf] = prev
+                buf["rows"] = []
+                buf["start"], buf["end"] = start, end
 
-            buf["rows"].append(candle)
+            buf["rows"].append(dict(candle))
 
-            # Close bucket exactly at end boundary (dt is the close of the bucket)
-            if dt >= buf["start"] + dur - timedelta(minutes=1):
-                tf_bar = self._finalize(tf)
-                if tf_bar:
-                    emit[tf] = tf_bar
-                    buf["start"] = dt.floor(f"{mins}min") + dur
+            if dt >= buf["end"]:
+                closed = self._finalize(buf["rows"])
+                if closed:
+                    emits[tf] = closed
+                buf["rows"] = []
+                buf["start"] = buf["end"]
+                buf["end"] = buf["start"] + timedelta(minutes=mins)
 
-        return emit
+        return emits

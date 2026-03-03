@@ -1,6 +1,7 @@
 import time
 import logging
 import random
+from functools import wraps
 from typing import Callable, Iterable, Optional, Any, Type
 
 from requests.adapters import HTTPAdapter
@@ -44,6 +45,7 @@ def retry(
     """
     Retry wrapper for callables with configurable backoff.
     """
+    @wraps(func)
     def wrapper(*args, **kwargs) -> Any:
         attempt = 0
         while True:
@@ -75,7 +77,8 @@ class RetrySession:
             total=retries,
             backoff_factor=backoff_factor,
             status_forcelist=status_forcelist,
-            allowed_methods=frozenset(["GET", "POST"])
+            allowed_methods=frozenset(["GET", "POST"]),
+            raise_on_status=False,
         )
         adapter = HTTPAdapter(max_retries=retry_cfg)
         self.session.mount("http://", adapter)

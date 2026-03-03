@@ -1,15 +1,21 @@
-"""
-replay_timeline.py
-Provides an index → datetime mapping for the dashboard's slider widget.
-"""
+"""Replay timeline helpers."""
+
+from __future__ import annotations
+
+import pandas as pd
+
 
 class ReplayTimeline:
-    """Maps replay indices to timestamps."""
+    """Union timeline across all replay assets."""
 
     def __init__(self, replay_states: dict):
-        # Assume all assets share same 15m timeline
-        any_asset = next(iter(replay_states))
-        self.timeline = replay_states[any_asset].frames["15m"]["dt"].tolist()
+        stamps = []
+        for state in replay_states.values():
+            df = state.frames.get("15m", pd.DataFrame())
+            if df.empty:
+                continue
+            stamps.extend(pd.to_datetime(df["dt"], errors="coerce").dropna().tolist())
+        self.timeline = sorted(set(stamps))
         self.length = len(self.timeline)
 
     def dt_at(self, idx: int):

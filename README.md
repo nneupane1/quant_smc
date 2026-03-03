@@ -1,132 +1,225 @@
-# QuantFund AI - Institutional-Grade Quant Trading Platform
-Riding the institutional liquidity wave
+# Quant SMC
 
-QuantFund AI (founded by Nischal) is a full-stack quantitative research and trading platform that unifies data engineering, feature/label generation, ML model lifecycle, risk-aware execution, and rich monitoring dashboards. This repository houses the research-to-production pipeline for systematic digital asset trading.
+Research-to-execution crypto trading stack with deterministic feature parity across backtest, forward test, live runtime, Streamlit research dashboards, and a new `Next.js + FastAPI + WebSocket` operator terminal.
 
-## Why It Matters
-- **Research to production, seamlessly:** Same code paths for backtests, forward tests, and live trading to minimize sim/live drift.
-- **Feature-rich microstructure intelligence:** Smart Money Concepts, liquidity signals, volatility regimes, confluence metrics, and hazard detection.
-- **Risk-first execution:** Position sizing, exposure controls, EVR/MPCRisk, and execution adapters designed for real venues (e.g., Kraken).
-- **Operational visibility:** Replayable timelines, dashboards for live/forward/backtest, equity and orderflow panels, and alerting.
+## What This Repo Now Contains
 
-## Architecture Overview
-- **Data Layer (`data/`):** Ingestion (Kraken client + retry), resampling, session handling, builders, and persistence.
-- **Features (`features/`):** Microstructure features (swings, BOS/CHOCH, FVG, sweeps, zones), liquidity/volatility/regime features, preprocessing, and feature store.
-- **Labels (`label_generation/`):** Event-driven labels (BOS continuation, liquidity flow, micro-momentum, hazard, EOP/EDP).
-- **ML (`ml/`):** Feature/label loaders, trainers, predictors, optimizers, empirical calibration, registry, and versioning.
-- **Execution (`execution/`):** Confluence, EVR, tiering, hazard trailing, MPC risk, position sizing, exposure tracking, and order adapters.
-- **Backtest/Forward/Live (`backtest/`, `forward_test/`, `live/`):** Replay controllers, simulators, trade logs, metrics, and live orchestrators.
-- **Dashboard (`dashboard/`):** Streamlit/JS hybrid UI, TradingView widgets, replay tools, equity/portfolio visualizations, smart alerts, and overlays.
-- **CLI (`cli/`):** Entry points for training, backtesting, forward testing, and live trading orchestration.
+- `12h` regime modeling with `HMM + HDBSCAN`
+- `6h` structure context
+- `1h` flow ML
+- `15m` execution ML with specialist models, meta/confluence, hazard, and quantile forecasting
+- `20k` base-ticket compounding with cooling / vault-reset logic
+- profit ladder plus hazard-based trailing for core and runner legs
+- repaired backtest, forward, live, replay, dashboard, and CLI paths
+- real terminal frontend in [`frontend/`](./frontend) backed by `FastAPI + WebSockets`
 
-## Project Layout (high level)
-```
+## Modeling Contract
+
+This repo is wired around a fixed timeframe contract:
+
+- `12h`: regime assessment
+- `6h`: structure / context
+- `1h`: flow quality
+- `15m`: execution decision layer
+
+Main model usage:
+
+- `12h`: `HMM + HDBSCAN`
+- `1h` and `15m`: schema-driven tabular ML, primarily `XGBoost / LightGBM`
+- `6h`: deterministic structure context now, with room for later GBM context-quality modeling
+- `NARX`: not part of the main runtime path; reserved for later soft ranking / runner / moonshot support only
+
+## Runtime Architecture
+
+### Trading loop
+
+- data ingestion -> resampling -> feature graph
+- label generation -> model training / registry
+- gate -> confluence -> EVR -> tier -> sizing
+- entry -> profit ladder -> hazard trailing -> exit
+- compounding -> danger detection -> cooling / vault reset
+
+### UI and telemetry
+
+- `Streamlit` remains the research / audit shell in [`quant_system/dashboard/`](./quant_system/dashboard)
+- `Next.js` terminal lives in [`frontend/`](./frontend)
+- `FastAPI + WebSocket` backend lives in [`quant_system/telemetry/`](./quant_system/telemetry)
+- console/runtime and UI now share the same telemetry plane through [`forward_dashboard_adapter.py`](./quant_system/forward_test/forward_dashboard_adapter.py)
+
+## Project Layout
+
+```text
 quant_system/
-  cli/                 # CLI entrypoints
-  config/              # YAML configs + secrets template
-  data/                # Ingestion, retry, resampling, sessions, builders
-  features/            # Feature engineering + feature store
-  label_generation/    # Labeling logic
-  ml/                  # Model lifecycle (train/predict/optimize)
-  execution/           # Risk, sizing, adapters
-  backtest/            # Sim/replay/metrics/reporting
-  forward_test/        # Paper trading / forward mode
-  live/                # Live orchestrator + venue client
-  dashboard/           # UI components (Python + JS/CSS)
-  utils/               # Logging, time, rolling helpers, decorators
-  train_orchestrator.py
-  setup.py
+  backtest/          historical execution, replay, reports
+  cli/               train/backtest/forward/live/terminal entrypoints
+  config/            YAML config system
+  dashboard/         Streamlit research and audit dashboards
+  data/              ingestion, prep, storage
+  execution/         gating, confluence, EVR, risk, adapters
+  features/          SMC, liquidity, EMA, volatility, regime features
+  forward_test/      paper-forward runtime and dashboard bridge
+  label_generation/  canonical label builders
+  live/              live orchestration and execution loop
+  live_data/         streaming market data and replay
+  ml/                training, prediction, registry, regime tooling
+  model_ensemble/    optional ensemble governance
+  model_switcher/    optional model selection layer
+  models/            legacy wrappers + NARX module
+  replay_export/     standalone replay export
+  strategy/          pyramiding / trade management policy
+  telemetry/         FastAPI + WebSocket terminal backend
+frontend/            Next.js + Tailwind operator terminal
 ```
 
-## Quickstart
-1) **Environment**
+## Install
+
+### Python
+
 ```bash
-conda create -n quantfund_env python=3.11 -y
-conda activate quantfund_env
+conda create -n quant_smc python=3.11 -y
+conda activate quant_smc
 pip install -r requirements.txt
 ```
 
-2) **Secrets**
-- Copy `.env.example` to `.env` and set credentials:
-  - `KRAKEN_API_KEY`
-  - `KRAKEN_PRIVATE_KEY`
+### Frontend
 
-3) **Configs**
-- Review `quant_system/config/base.yaml` and related YAMLs for data paths, instruments, timeframes, regimes, risk, and storage.
-- Venue/API routing and execution parameters live in `config/execution.yaml` and `config/routing.yaml`.
-
-4) **Run Pipelines (examples)**
 ```bash
-# Train models with current configs
+cd frontend
+npm install
+```
+
+## Environment
+
+Create `.env` from [`.env.example`](./.env.example).
+
+Important vars:
+
+- `KRAKEN_API_KEY`
+- `KRAKEN_API_SECRET`
+- `QS_ENV=DEV`
+
+Frontend env template is in [`frontend/.env.example`](./frontend/.env.example):
+
+- `QUANT_TERMINAL_API_URL=http://127.0.0.1:8100/snapshot`
+- `NEXT_PUBLIC_TERMINAL_WS_URL=ws://127.0.0.1:8100/ws/terminal`
+
+## Main Commands
+
+### Train
+
+```bash
 python -m quant_system.cli.train_cli
+```
 
-# Backtest with configured strategy + execution simulator
+### Backtest
+
+```bash
 python -m quant_system.cli.backtest_cli
+```
 
-# Forward/paper test
+### Forward test
+
+```bash
 python -m quant_system.cli.forward_cli
+```
 
-# Go live (ensure keys/funding are set)
+### Live
+
+```bash
 python -m quant_system.cli.live_cli
 ```
 
-5) **Dashboard**
-- Launch Streamlit UI (example):
+### Terminal API
+
+```bash
+python -m quant_system.cli.terminal_api_cli
+```
+
+or via the console script:
+
+```bash
+quant-terminal-api
+```
+
+## Dashboards
+
+### Streamlit research shell
+
 ```bash
 streamlit run quant_system/dashboard/app.py
 ```
 
-## Configuration Model
-- **YAML-first:** Strategy, features, labels, risk, regimes, sessions, and overrides are YAML-driven under `quant_system/config/`.
-- **Overrides:** Use `regime_overrides*.yaml` and `session_overrides*.yaml` to specialize behavior by regime or session.
-- **Secrets:** Never commit `.env`; use `.env.example` as the template.
+When the telemetry backend is running, the Streamlit dashboards now prefer backend-fed context over local artifact reads.
 
-## Development Notes
-- **Style/Quality:** Prefer type hints, unit tests, and small, composable modules.
-- **Testing:** Add/extend tests per module (e.g., `tests/` or alongside modules) before modifying live/forward paths.
-- **Data Safety:** Guard live trading paths with dry-run flags and venue-specific rate limits; validate configs before firing orders.
-- **Logging/Observability:** Use the provided logger utils and dashboard alerting for runtime visibility.
+### Next.js operator terminal
 
-## Roadmap (suggested)
-- Strengthen sim/live parity with deterministic fixtures.
-- Expand feature/label coverage with richer microstructure signals.
-- Add automated hyperparameter sweeps and ensemble governance.
-- Enhance dashboards (real-time PnL attribution, execution quality KPIs).
+Start the backend:
 
-## Support
-Questions 
-or issues? Open a ticket, ping the team, or reach out to the QuantFund AI (Nischal) ops channel. Please include environment details, configs used, and relevant logs when reporting problems.
+```bash
+python -m quant_system.cli.forward_cli --terminal-server
+```
 
-## Detailed Pipeline Explanation
+Then start the frontend:
 
-This section summarises the full QuantFund AI Smart Money Concept pipeline end-to-end, from data ingestion to execution. For an expanded explanation, please refer to the file `quant_smc_pipeline_report.md`.
+```bash
+cd frontend
+npm run dev
+```
 
-### Data ingestion and resampling
-- Historical 1‑minute OHLCV data are downloaded from Kraken via a resilient client with exponential backoff.
-- A timeframe builder resamples 1‑min data into 15‑min, 1‑h, 6‑h and 12‑h bars with deterministic bar alignment.
-- Typed dataclasses ensure consistent field names; resampled bars and raw bars are persisted to disk for reproducibility.
+Open `http://127.0.0.1:3100`.
 
-### Feature engineering
-- Multi‑timeframe feature builders compute technical indicators (EMAs, ATR, volatility metrics) and liquidity/order‑flow features such as equal‑high/low density, sweeps, wick ratios and volume pressure.
-- SMC detectors extract structural context: swing highs/lows, break of structure (BOS) and change of character (CHOCH), fair‑value gaps (FVGs), liquidity sweeps and order blocks. These detectors provide anchors, zones and structure context used for confluence calculations.
-- Additional regime features (e.g., Gaussian HMM regimes) classify broad market conditions, while a feature store and resampler align multi‑TF features to 15‑min anchors.
+## Terminal Domains
 
-### Label generation
-- Specialist labels are derived from SMC events: BOS continuation, liquidity flow and micro‑momentum labels measure whether price reaches +3R or +1R targets before invalidation within defined horizons.
-- Risk labels capture expected opportunity (EOP) and expected drawdown probability (EDP), while a hazard model defines survival labels tracking time‑to‑failure when stop loss or CHOCH occurs.
+The terminal is organized into six operator domains:
 
-### Model training
-- The training pipeline uses time‑series cross‑validation and Optuna‑based hyperparameter tuning for LightGBM/XGBoost classifiers. Each specialist label, meta model and hazard bin has its own calibrated classifier.
-- A confluence engine combines specialist probabilities, meta probabilities, SMC strength and regime scores; an empirical calibrator ensures well‑behaved probability outputs.
-- The model registry versioning system persists trained models, calibrators and metrics.
+1. `Mission Control`
+2. `Insights`
+3. `Regime Briefings`
+4. `Signal Intelligence`
+5. `Risk Radar`
+6. `Research & Audit`
 
-### Execution and risk management
-- Gating and tiering logic apply multi‑step checks (Ocean/Waves/Flow) based on 12h, 6h and 1h contexts, plus hazard and EVR scores, to decide whether to trade.
-- A multi‑parameter confluence score informs the TieringEngine, which assigns trades to tiers (A+, A, B or skip) and drives order execution and sizing.
-- The MPC risk manager computes risk mode, lock fractions and hedge ratios using hazard/EDP/EOP probabilities and quantile forecasts; a position sizer scales position size based on risk mode and ATR.
-- Hazard trailing, exposure tracking and cooling engines manage open positions, apply trailing stops and enforce cooldowns after large wins.
+The Next terminal now includes:
 
-### Backtesting, forward testing and live trading
-- A deterministic intrabar execution simulator and backtester evaluate strategies on historical data, accounting for slippage, fees and borrow/funding costs.
-- Forward and live engines aggregate real‑time feeds to multi‑timeframe bars, evaluate SMC and ML signals, manage risk and execute orders via real or simulated adapters.
-- Dashboard components provide real‑time analytics and trade monitoring, while a CLI orchestrates data ingestion, feature generation, labeling, training and backtesting tasks.
+- hover-reactive navigation
+- Bloomberg/TradingView-inspired styling
+- WebSocket-fed live state
+- full alert reasoning tree for selected signals
+
+## Reasoning Payloads
+
+Forward/live alerts carry structured reasoning built in [`forward_reasoning_attach.py`](./quant_system/forward_test/forward_reasoning_attach.py), including:
+
+- `ml`
+- `smc`
+- `regime`
+- `flow`
+- `ema`
+- `confluence_breakdown`
+- `evr`
+- `hazard`
+- `final_decision`
+- `session`
+
+These are visible in:
+
+- Streamlit `Insights`
+- Streamlit `Forward Test`
+- Next terminal `Insights -> Alert Reasoning Tree`
+- Next terminal `Signal Intelligence -> Selected Signal Vector`
+
+## Capital and Risk Defaults
+
+Current default posture is aligned with the repaired execution config:
+
+- base ticket: `20,000 USD`
+- compounding: enabled
+- cooling / vault reset: enabled through compound-cooling policy
+- `MPC`: kept available but off by default
+- `NARX`: not wired as a guardrail
+
+## Notes
+
+- This repo contains a lot of repaired legacy surfaces. The authoritative runtime paths are the repaired `backtest`, `forward_test`, `live`, `execution`, `features`, `label_generation`, and `ml` layers.
+- The live event plane is now `FastAPI + WebSocket` first, with artifact fallback still preserved where necessary.
+- Generated details are summarized in [`quant_smc_pipeline_report.md`](./quant_smc_pipeline_report.md).

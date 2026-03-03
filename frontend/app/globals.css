@@ -1,0 +1,80 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  @apply bg-ink text-slate-100 antialiased;
+  background-image:
+    radial-gradient(circle at top left, rgba(82, 215, 255, 0.12), transparent 24%),
+    radial-gradient(circle at top right, rgba(246, 182, 60, 0.08), transparent 22%),
+    radial-gradient(circle at bottom left, rgba(42, 230, 184, 0.08), transparent 24%),
+    linear-gradient(180deg, #050c14 0%, #07111c 50%, #091625 100%);
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background-image: radial-gradient(rgba(255,255,255,0.045) 0.7px, transparent 0.7px);
+  background-size: 12px 12px;
+  opacity: 0.18;
+  mix-blend-mode: screen;
+}
+
+::selection {
+  background: rgba(82, 215, 255, 0.25);
+}
+
+@layer components {
+  .terminal-shell {
+    @apply relative min-h-screen overflow-hidden;
+    background-image:
+      radial-gradient(circle at 16% 16%, rgba(82, 215, 255, 0.06), transparent 20%),
+      radial-gradient(circle at 82% 18%, rgba(246, 182, 60, 0.05), transparent 18%),
+      linear-gradient(180deg, rgba(8, 16, 28, 0.92), rgba(5, 12, 20, 0.98));
+  }
+
+  .glass-panel {
+    @apply relative overflow-hidden rounded-[24px] border border-white/10 bg-white/[0.04] backdrop-blur-xl;
+    box-shadow: 0 16px 50px rgba(0, 0, 0, 0.35);
+  }
+
+  .glass-panel::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(135deg, rgba(82, 215, 255, 0.10), transparent 26%, transparent 74%, rgba(246, 182, 60, 0.08));
+    pointer-events: none;
+  }
+
+  .nav-chip {
+    @apply relative overflow-hidden rounded-2xl border border-white/10 bg-slate-950/40 px-4 py-3 text-left transition duration-300;
+  }
+
+  .nav-chip:hover {
+    @apply border-cyan/40 bg-slate-900/60 shadow-bloom;
+    transform: translateY(-1px);
+  }
+
+  .nav-chip-active {
+    @apply border-cyan/50 bg-cyan/10 shadow-bloom;
+  }
+
+  .metric-card {
+    @apply glass-panel p-5 transition duration-300 hover:-translate-y-1 hover:border-cyan/35 hover:shadow-bloom;
+  }
+
+  .section-kicker {
+    @apply text-[0.68rem] uppercase tracking-[0.34em] text-cyan/80;
+  }
+}

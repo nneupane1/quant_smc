@@ -1,44 +1,38 @@
-"""
-replay_stream.py
-Feeds sequential bars into ForwardEngine exactly like live.
-"""
+"""Replay streamer that advances assets on a synchronized union timeline."""
 
-from datetime import datetime
+from __future__ import annotations
+
+import pandas as pd
 
 
 class ReplayStream:
-    """Sequential bar emitter for multi-asset replay."""
+    """Sequential 15m bar emitter for replay."""
 
     def __init__(self, replay_states: dict, forward_engine, dashboard_adapter):
         self.states = replay_states
         self.forward = forward_engine
         self.dashboard = dashboard_adapter
 
-    def step(self):
-        """
-        For each asset:
-          - Emit next 15m close
-          - Emit corresponding 1h/6h/12h bars via dashboard
-          - Drive ForwardEngine.on_bar
-        """
+    def step_to(self, dt):
+        dt = pd.to_datetime(dt, errors="coerce")
+        emitted = []
         for asset, state in self.states.items():
-            if not state.has_next():
+            next_dt = state.peek_dt()
+            if next_dt is None or pd.to_datetime(next_dt, errors="coerce") != dt:
                 continue
 
             bar_15m = state.next_15m()
             bar_15m["asset"] = asset
-            dt = bar_15m["dt"]
-
-            # Update dashboard OHLC
             if self.dashboard:
                 self.dashboard.update_candles({asset: bar_15m})
 
-            # Push to ForwardEngine
             self.forward.on_bar(asset, bar_15m)
+            emitted.append((asset, bar_15m))
 
-            # Send higher-TF bars to dashboard if they share this dt
             for tf in ["1h", "6h", "12h"]:
                 tf_bar = state.get_tf_bar(tf, dt)
-                if tf_bar and self.dashboard:
+                if tf_bar and self.dashboard and hasattr(self.dashboard, "update_tf_bar"):
                     tf_bar["asset"] = asset
                     self.dashboard.update_tf_bar(asset, tf, tf_bar)
+
+        return emitted

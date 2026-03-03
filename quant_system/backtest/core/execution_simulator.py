@@ -73,7 +73,7 @@ class ExecutionSimulator:
         pnl = (exit_price - pos.entry_price) * pos.qty if pos.side == "long" else (pos.entry_price - exit_price) * pos.qty
         pnl -= fee
         LOG.info(f"Exit {pos.trade_id} reason={reason} exit={exit_price:.4f} pnl={pnl:.4f}")
-        return {"pnl": pnl, "exit_price": exit_price, "reason": reason}
+        return {"pnl": pnl, "exit_price": exit_price, "reason": reason, "value": pos.size_usd + pnl}
 
     # ------------------------------------------------------------------
     def mark_to_market(self, pos: Position, current_price: float) -> float:

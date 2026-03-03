@@ -1,32 +1,30 @@
-"""
-LiveOrchestrator
-----------------
-Real-time loop:
- - Streams 1m data (Kraken)
- - Aggregates to 15m bars
- - Runs model predictions
- - Confluence + EVR + Tiering
- - MPC risk + position sizing
- - Runner/core split + hazard trailing
-"""
+"""Live trading orchestrator aligned to the forward-test execution contract."""
+
+from __future__ import annotations
 
 import uuid
-import pandas as pd
-from typing import Dict, Any, Optional
 from datetime import datetime
+from typing import Any, Dict, Optional
+
+import pandas as pd
 
 from quant_system.config.config_loader import ConfigLoader
-from quant_system.ml.registry.model_registry import ModelRegistry
-from quant_system.ml.predict.model_predictor import ModelPredictor
 from quant_system.execution.gating.confluence import ConfluenceEngine
 from quant_system.execution.gating.evr import EVRCalculator
 from quant_system.execution.gating.gates import GateEvaluator
-from quant_system.execution.gating.tiering import TieringEngine
 from quant_system.execution.gating.hazard_trailing import HazardTrailingEngine
+from quant_system.execution.gating.profit_ladder import ProfitLadderManager
+from quant_system.execution.gating.tiering import TieringEngine
+from quant_system.execution.risk.capital_allocator import CapitalAllocator
+from quant_system.execution.risk.compound_cooling import CompoundCoolingPolicy
+from quant_system.execution.risk.exposure_tracker import ExposureTracker
 from quant_system.execution.risk.mpc_risk import MPCRiskManager
 from quant_system.execution.risk.position_sizer import PositionSizer
+from quant_system.forward_test.forward_reasoning_attach import ReasoningAttach
 from quant_system.live.kraken_live_client import KrakenLiveClient
-from quant_system.live.live_executor import LiveExecutor, LivePosition
+from quant_system.live.live_executor import LiveExecutor
+from quant_system.ml.predict.model_predictor import ModelPredictor
+from quant_system.ml.registry.model_registry import ModelRegistry
 from quant_system.utils.logger import get_logger
 
 LOG = get_logger("live_orchestrator")
@@ -40,31 +38,44 @@ class LiveOrchestrator:
         self.registry = registry
         self.dashboard = dashboard_adapter
 
-        self.confluence = ConfluenceEngine(self.cfg)
-        self.evr = EVRCalculator(self.cfg)
-        self.gates = GateEvaluator(self.cfg)
-        self.tiering = TieringEngine(self.cfg)
-        self.hazard = HazardTrailingEngine(self.cfg)
-        self.mpc = MPCRiskManager(self.cfg)
-        self.position_sizer = PositionSizer(self.cfg)
+        self.confluence = ConfluenceEngine(config_loader)
+        self.evr = EVRCalculator(config_loader)
+        self.gates = GateEvaluator(config_loader)
+        self.tiering = TieringEngine(config_loader)
+        self.hazard = HazardTrailingEngine(config_loader)
+        self.profit_ladder = ProfitLadderManager(config_loader)
+        self.mpc = MPCRiskManager(config_loader)
+        self.capital = CapitalAllocator(config_loader)
+        self.compound_cooling = CompoundCoolingPolicy(config_loader)
+        self.position_sizer = PositionSizer(config_loader)
+        self.exposure = ExposureTracker(self.cfg)
+        self.reason = ReasoningAttach()
 
         self.predictor = ModelPredictor(registry)
         self.models_loaded = False
 
-        self.feed = KrakenLiveClient(self.cfg_loader)
-        self.executor = LiveExecutor(config_loader)
+        self.feed = KrakenLiveClient(config_loader)
+        self.executor = LiveExecutor(config_loader, dashboard_adapter=dashboard_adapter)
 
         self.buffers = {"1m": []}
         self.bar_index = 0
+        self.cooling_until = None
+        self.current_drawdown = 0.0
+        self.max_drawdown_seen = 0.0
+        self._max_equity = float(self.exec_cfg.get("starting_equity", 0.0))
+        self.current_risk_mode = None
+        self.current_hedge_ratio = 0.0
+        self.closed_trades: Dict[str, Dict[str, Any]] = {}
+        self.last_prices: Dict[str, float] = {}
+        self.last_timestamp = None
 
         LOG.info("[LiveOrchestrator] Initialized.")
 
-    # ------------------------------------------------------------------
     def load_models(self):
-        # Predictor loads latest automatically via registry
         self.models_loaded = True
+        if self.dashboard:
+            self.dashboard.log_event("models_loaded", None, {"version": "latest"})
 
-    # ------------------------------------------------------------------
     def run(self):
         LOG.info("[LiveOrchestrator] Live loop started.")
         if not self.models_loaded:
@@ -74,182 +85,345 @@ class LiveOrchestrator:
             self.buffers["1m"].append(c1)
             if not self._ready_bar():
                 continue
-
             bar = self._agg_15m()
             if bar is None:
                 continue
+            self.on_bar(bar.get("asset", "BTCUSD"), bar)
 
-            self.bar_index += 1
-            asset = bar.get("asset", "BTCUSD")
-            row = pd.Series(bar)
+    def run_rows(self, asset: str, rows: pd.DataFrame):
+        if not self.models_loaded:
+            self.load_models()
+        ordered = rows.sort_values("dt").reset_index(drop=True)
+        for _, row in ordered.iterrows():
+            self.on_bar(asset, row.to_dict())
+        return self.state_snapshot()
 
-            # Hazard trailing on existing positions for this asset
-            self._apply_hazard(asset, row)
+    def on_bar(self, asset: str, row: Dict[str, Any]):
+        if not self.models_loaded:
+            self.load_models()
 
-            # Model inference + enrich
-            enriched = self._inject_model_probs(row)
+        dt = pd.to_datetime(row.get("dt"))
+        self.last_timestamp = dt
+        self.last_prices[asset] = float(row["close"])
+        self.bar_index += 1
 
-            # Confluence + EVR
-            conf_result = self._compute_confluence(enriched)
-            conf = conf_result.get("score", 0.0)
-            conf_pass = conf_result.get("passed", False)
-            enriched["confluence_score"] = conf
+        if self.dashboard:
+            self.dashboard.update_candles({asset: row})
 
-            side = enriched.get("side", "long")
-            # TF gates (12h→6h→1h)
-            gate = self.gates.evaluate(enriched, side)
-            if not gate["passed"]:
-                self._update_dashboard(enriched, conf, {"evr": None, "median_r": None})
+        series = pd.Series(row).copy()
+        series["dt"] = dt
+        series["asset"] = asset
+        enriched = self._inject_model_probs(series)
+
+        had_ladder_exit = self._apply_profit_ladder(asset, enriched, dt)
+        had_hazard_exit = self._apply_hazard(asset, enriched, dt)
+        self._refresh_equity(dt, enriched)
+        if had_ladder_exit or had_hazard_exit:
+            return
+
+        danger = self.compound_cooling.evaluate_danger(
+            dt=dt,
+            equity=self.executor.equity,
+            free_capital=self.executor.free_capital,
+            locked_profit=self.executor.locked_profit,
+            drawdown=self.current_drawdown,
+            row=enriched.to_dict(),
+            cooling_until=self.cooling_until,
+        )
+        if danger["lock_amount"] > 0:
+            lock_delta = min(danger["lock_amount"], self.executor.free_capital)
+            self.executor.locked_profit += lock_delta
+            self.executor.free_capital -= lock_delta
+        if danger["cooling_until"] is not None:
+            self.cooling_until = danger["cooling_until"]
+
+        gate = self.gates.evaluate(enriched, enriched.get("side", "long"))
+        if not gate["passed"]:
+            self._refresh_equity(dt, enriched)
+            return
+
+        conf_result = self.confluence.compute(self.models_loaded, enriched)
+        conf = conf_result.get("conf_score", conf_result.get("confluence_score", 0.0))
+        enriched["confluence_score"] = conf
+        enriched["conf_score"] = conf
+
+        side = enriched.get("side", "long")
+        evr_pack = self.evr.compute(self.models_loaded, enriched, side=side)
+        enriched["evr"] = evr_pack.get("evr")
+        enriched["median_r"] = evr_pack.get("median_r")
+        enriched["stop_price"] = evr_pack.get("stop_price", enriched["close"])
+
+        tier = self.tiering.classify(
+            row=enriched,
+            confluence_pass=bool(conf_result.get("passed", False)),
+            evr_result=evr_pack,
+            hazard_score=float(danger["metrics"]["hazard"] or 0.0),
+            bar_index=self.bar_index,
+        )
+        if self._moonshot_override(enriched, conf, evr_pack):
+            tier = {"tier": "A+", "execute": True, "reason": "moonshot_override"}
+
+        cooling_gate = self.compound_cooling.allow_entry(
+            now=dt,
+            cooling_until=self.cooling_until,
+            conf=conf,
+            evr=evr_pack,
+            hazard=danger["metrics"]["hazard"],
+        )
+        if not cooling_gate["allow"]:
+            self._refresh_equity(dt, enriched)
+            return
+
+        if tier.get("tier") == "skip" or not tier.get("execute", False):
+            self._refresh_equity(dt, enriched)
+            return
+
+        capital_out = self.capital.allocate(
+            equity=self.executor.equity,
+            free_capital=self.executor.free_capital,
+            locked_profit=self.executor.locked_profit,
+            row=enriched.to_dict(),
+            mpc_manager=self.mpc,
+        )
+        self.current_risk_mode = capital_out["risk_mode"]
+        self.current_hedge_ratio = capital_out["hedge_ratio"]
+
+        if capital_out["lock_fraction"] > 0:
+            lock_delta = (self.executor.equity - self.executor.locked_profit) * capital_out["lock_fraction"]
+            lock_delta = max(min(lock_delta, self.executor.free_capital), 0.0)
+            self.executor.locked_profit += lock_delta
+            self.executor.free_capital -= lock_delta
+
+        pos_usd = capital_out["ticket_usd"]
+        if pos_usd <= 0 or pos_usd > self.executor.free_capital:
+            self._refresh_equity(dt, enriched)
+            return
+
+        split = self.exec_cfg.get("runner_split", {})
+        core_frac = float(split.get("core_frac", 0.7))
+        runner_frac = 1.0 - core_frac
+        entry = float(enriched["close"])
+
+        def _meta(leg: str) -> Dict[str, Any]:
+            return {
+                "leg": leg,
+                "conf": conf,
+                "tier": tier.get("tier"),
+                "direction": side,
+                "median_r": evr_pack.get("median_r"),
+                "evr": evr_pack.get("evr"),
+                "p_bos_cont": enriched.get("p_bos_cont", enriched.get("prob_bos_cont", 0.0)),
+                "initial_stop": enriched["stop_price"],
+                "reason": tier.get("reason"),
+            }
+
+        pos_core = None
+        core_usd = pos_usd * core_frac
+        if core_usd > 0:
+            trade_id = f"{asset}-{uuid.uuid4().hex[:8]}-core"
+            pos_core = self.executor.open_position(trade_id, asset, core_usd, entry, _meta("core"), stop_price=enriched["stop_price"])
+            if pos_core:
+                self._register_exposure(pos_core)
+
+        pos_runner = None
+        runner_usd = pos_usd * runner_frac
+        if runner_usd > 0:
+            trade_id = f"{asset}-{uuid.uuid4().hex[:8]}-runner"
+            pos_runner = self.executor.open_position(trade_id, asset, runner_usd, entry, _meta("runner"), stop_price=enriched["stop_price"])
+            if pos_runner:
+                self._register_exposure(pos_runner)
+
+        reason = self.reason.build(asset, enriched.to_dict(), conf, evr_pack, tier.get("tier"), self.current_risk_mode, self.current_hedge_ratio)
+        reason["timestamp"] = dt
+        if self.dashboard and pos_core:
+            self.dashboard.log_event("entry", pos_core.trade_id, reason)
+            if pos_runner:
+                self.dashboard.log_event("entry", pos_runner.trade_id, {**reason, "leg": "runner"})
+
+        self._refresh_equity(dt, enriched)
+
+    def _apply_profit_ladder(self, asset: str, row: pd.Series, dt) -> bool:
+        to_close = []
+        for tid, pos in list(self.executor.positions.items()):
+            if pos.asset != asset:
                 continue
+            decision = self.profit_ladder.evaluate(pos, row)
+            if decision["new_stop"] is not None:
+                pos.stop_price = decision["new_stop"]
+            pos.r_mult = float(decision.get("r_now", pos.r_mult or 0.0))
+            pos.highest_r = max(float(getattr(pos, "highest_r", 0.0) or 0.0), pos.r_mult)
+            if decision["exit"]:
+                res = self.executor.exit_position_at(tid, decision["exit_price"], dt)
+                if res is not None:
+                    to_close.append((tid, pos, res, decision["reason"]))
 
-            evr_pack = self.evr.compute_evr(enriched, side)
-            hazard_score = enriched.get("hazard_score", enriched.get("hazard", 0.0))
+        for tid, pos, res, reason in to_close:
+            self._finalize_exit(tid, pos, res, reason, source="profit_ladder")
+        return bool(to_close)
 
-            # Tiering
-            tier = self.tiering.classify(
-                row=enriched,
-                confluence_pass=conf_pass,
-                evr_result={"evr": evr_pack.get("evr"), "median_r": evr_pack.get("median_r")},
-                hazard_score=hazard_score,
-                bar_index=self.bar_index,
-            )
-
-            if tier.get("tier") == "skip" or not tier.get("execute", False):
-                self._update_dashboard(enriched, conf, evr_pack)
-                continue
-
-            # MPC + sizing
-            mpc_out = self.mpc.decide(
-                equity=self.executor.equity,
-                free_capital=self.executor.free_capital,
-                locked_profit=self.executor.locked_profit,
-                row=enriched,
-            )
-
-            stop_price = evr_pack.get("stop_price", enriched["close"])
-            size_pack = self.position_sizer.size_position(
-                row=enriched,
-                equity=self.executor.equity - self.executor.locked_profit,
-                side=side,
-                stop_price=stop_price,
-                risk_mode=mpc_out["risk_mode"],
-                hedge_ratio=mpc_out["hedge_ratio"],
-            )
-
-            pos_usd = size_pack.get("value", 0.0)
-            if pos_usd <= 0 or pos_usd > self.executor.free_capital:
-                self._update_dashboard(enriched, conf, evr_pack)
-                continue
-
-            # Runner/core split
-            split = self.exec_cfg.get("runner_split", {})
-            core_frac = split.get("core_frac", 0.7)
-            runner_frac = 1.0 - core_frac
-            entry = enriched["close"]
-
-            core_usd = pos_usd * core_frac
-            if core_usd > 0:
-                trade_id = f"{asset}-{uuid.uuid4().hex[:8]}-core"
-                meta = {"leg": "core", "conf": conf, "tier": tier.get("tier"), "direction": side}
-                self.executor.open_position(trade_id, asset, core_usd, entry, meta, stop_price=stop_price)
-
-            if runner_frac > 0:
-                runner_usd = pos_usd * runner_frac
-                trade_id = f"{asset}-{uuid.uuid4().hex[:8]}-runner"
-                meta = {"leg": "runner", "conf": conf, "tier": tier.get("tier"), "direction": side}
-                self.executor.open_position(trade_id, asset, runner_usd, entry, meta, stop_price=stop_price)
-
-            self._update_dashboard(enriched, conf, evr_pack)
-
-    # ------------------------------------------------------------------
-    def _apply_hazard(self, asset: str, row: pd.Series):
+    def _apply_hazard(self, asset: str, row: pd.Series, dt) -> bool:
         to_close = []
         for tid, pos in list(self.executor.positions.items()):
             if pos.asset != asset:
                 continue
             hazard_val = row.get("hazard_score", row.get("hazard", 0.0))
+            trail_row = row.copy()
+            trail_row["confluence_score"] = pos.meta.get("conf", trail_row.get("confluence_score", 0.0))
+            trail_row["median_r"] = pos.meta.get("median_r", trail_row.get("median_r", 0.0))
             trail = self.hazard.evaluate(
-                row=row,
-                hazard=hazard_val,
+                row=trail_row,
+                hazard=float(hazard_val or 0.0),
                 side=pos.side,
                 bars_in_trade=pos.bars_in_trade,
                 current_stop=pos.stop_price or row["close"],
-                config=self.cfg,
+                config=self.cfg_loader,
                 leg=pos.meta.get("leg", "core"),
             )
             pos.bars_in_trade += 1
-            if trail["action"] == "exit":
-                self.executor.exit_position(tid, price=trail["new_stop"])
-                to_close.append(tid)
-            elif trail["action"] in ("partial", "tighten"):
+            if trail["action"] in ("partial", "tighten"):
                 pos.stop_price = trail["new_stop"]
+            if trail["action"] == "exit":
+                res = self.executor.exit_position_at(tid, trail["new_stop"], dt)
+                if res is not None:
+                    to_close.append((tid, pos, res, f"hazard_{trail['action']}"))
 
-        for tid in to_close:
-            self.executor.positions.pop(tid, None)
+        for tid, pos, res, reason in to_close:
+            self._finalize_exit(tid, pos, res, reason, source="hazard")
+        return bool(to_close)
 
-    # ------------------------------------------------------------------
-    def _compute_confluence(self, row: pd.Series) -> Dict[str, Any]:
-        out = self.confluence.evaluate(row)
-        score = out.get("confluence_score", out.get("score", 0.0))
-        allow = out.get("passed", out.get("allow", False))
-        return {"score": score, "passed": allow}
+    def _refresh_equity(self, now, row: Optional[pd.Series] = None):
+        if row is not None:
+            asset = row.get("asset")
+            if asset is not None:
+                self.last_prices[str(asset)] = float(row.get("close", self.last_prices.get(str(asset), 0.0)))
+        self.executor.refresh_equity(self.last_prices)
+        self._max_equity = max(self._max_equity, self.executor.equity)
+        dd = (self._max_equity - self.executor.equity) / max(self._max_equity, 1e-9)
+        self.current_drawdown = dd
+        self.max_drawdown_seen = max(self.max_drawdown_seen, dd)
+        if (not self.compound_cooling.enabled) and dd >= self.exec_cfg.get("cooling_dd_trigger", 1.0):
+            minutes = self.exec_cfg.get("cooling_minutes", 0)
+            self.cooling_until = now + pd.Timedelta(minutes=minutes)
+        self.exposure.snapshot(now, self.executor.equity)
+        self._update_dashboard(row if row is not None else pd.Series({"dt": now}), 0.0 if row is None else row.get("confluence_score", row.get("conf_score")), {"evr": None if row is None else row.get("evr")})
 
     def _ready_bar(self) -> bool:
         if len(self.buffers["1m"]) < 15:
             return False
-        last_ts = self.buffers["1m"][-1]["timestamp"]
-        return last_ts % 900 == 0
+        return self.buffers["1m"][-1]["timestamp"] % 900 == 0
 
     def _agg_15m(self) -> Optional[Dict[str, Any]]:
         rows = self.buffers["1m"][-15:]
         if len(rows) < 15:
             return None
-        o = rows[0]["open"]
-        h = max(r["high"] for r in rows)
-        l = min(r["low"] for r in rows)
-        c = rows[-1]["close"]
-        v = sum(r["volume"] for r in rows)
         return {
             "timestamp": rows[-1]["timestamp"],
             "dt": datetime.utcfromtimestamp(rows[-1]["timestamp"]),
-            "open": o,
-            "high": h,
-            "low": l,
-            "close": c,
-            "volume": v,
+            "open": rows[0]["open"],
+            "high": max(r["high"] for r in rows),
+            "low": min(r["low"] for r in rows),
+            "close": rows[-1]["close"],
+            "volume": sum(r["volume"] for r in rows),
             "asset": rows[-1].get("asset", "BTCUSD"),
         }
 
     def _inject_model_probs(self, row: pd.Series) -> pd.Series:
         enriched = row.copy()
         try:
-            feats = [v for _, v in row.items() if isinstance(v, (int, float))]
-            specialist_list = ["liq_flow", "bos_cont", "momo", "eop", "edp"]
-            preds = self.predictor.predict_single(feats, specialist_list)
+            specialist_list = ["liq_flow", "bos_cont", "flow_1h", "momo", "eop", "edp"]
+            preds = self.predictor.predict_single(row, specialist_list)
             for k, v in preds.items():
-                if isinstance(v, dict):
-                    for kk, vv in v.items():
-                        enriched[f"{k}_{kk}"] = vv
-                else:
-                    if k.startswith("prob_"):
-                        enriched[f"p_{k.replace('prob_', '')}"] = v
-                    else:
-                        enriched[k] = v
+                if k == "hazard_curve" and isinstance(v, dict):
+                    enriched[k] = v
+                    continue
+                enriched[k] = v
+                if k.startswith("prob_"):
+                    enriched[f"p_{k[5:]}"] = v
             if "hazard_score" in preds:
                 enriched["hazard"] = preds["hazard_score"]
-        except Exception as e:
-            LOG.warning(f"[LiveOrchestrator] predictor failed: {e}")
+        except Exception as exc:
+            LOG.warning("[LiveOrchestrator] predictor failed: %s", exc)
         return enriched
 
     def _update_dashboard(self, row: pd.Series, conf: float, evr: Dict[str, Any]):
         if not self.dashboard:
             return
-        self.dashboard.update_state({
-            "timestamp": row.get("dt"),
+        self.dashboard.update_state(
+            {
+                "timestamp": row.get("dt", self.last_timestamp),
+                "equity": self.executor.equity,
+                "free_capital": self.executor.free_capital,
+                "locked_profit": self.executor.locked_profit,
+                "confluence": conf,
+                "evr": evr.get("evr") if isinstance(evr, dict) else evr,
+                "hazard": row.get("hazard_score", row.get("hazard")),
+                "flow_1h": row.get("p_flow_1h", row.get("prob_flow_1h")),
+                "open_positions": len(self.executor.positions),
+                "open_trades": self.executor.positions,
+                "closed_trades": self.closed_trades,
+                "cooling_to": self.cooling_until.isoformat() if self.cooling_until is not None else None,
+                "max_drawdown": self.max_drawdown_seen,
+                "risk_mode": self.current_risk_mode,
+                "hedge_ratio": self.current_hedge_ratio,
+                "exposures": self.exposure.current_exposures(self.executor.equity),
+            }
+        )
+
+    def _register_exposure(self, pos) -> None:
+        if getattr(pos, "side", "long") == "short":
+            self.exposure.register_short(float(pos.notional_usd), asset=pos.asset)
+        else:
+            self.exposure.register_long(float(pos.notional_usd), asset=pos.asset)
+
+    def _release_exposure(self, pos) -> None:
+        if getattr(pos, "side", "long") == "short":
+            self.exposure.release(pos.asset, short_notional=float(pos.notional_usd))
+        else:
+            self.exposure.release(pos.asset, long_notional=float(pos.notional_usd))
+
+    def _finalize_exit(self, trade_id: str, pos, res: Dict[str, Any], reason: str, *, source: str) -> None:
+        self._release_exposure(pos)
+        payload = {
+            **res,
+            "trade_id": trade_id,
+            "asset": pos.asset,
+            "side": pos.side,
+            "leg": pos.meta.get("leg"),
+            "entry_price": pos.entry_price,
+            "entry_ts": pos.opened_at,
+            "stop_price": pos.stop_price,
+            "conf": pos.meta.get("conf"),
+            "evr": pos.meta.get("evr"),
+            "tier": pos.meta.get("tier"),
+            "reason": reason,
+            "source": source,
+            "timestamp": res.get("exit_ts"),
+        }
+        self.closed_trades[trade_id] = payload
+        if self.dashboard:
+            self.dashboard.log_event("exit", trade_id, payload)
+
+    def _moonshot_override(self, row: pd.Series, conf: float, evr: Dict[str, Any]) -> bool:
+        median_r = float(evr.get("median_r", evr.get("median_R", 0.0)) or 0.0)
+        p_bos_cont = float(row.get("p_bos_cont", row.get("prob_bos_cont", 0.0)) or 0.0)
+        if conf >= 0.92 and median_r >= 6.0:
+            return True
+        if evr.get("evr", 0.0) >= 3.0 and p_bos_cont >= 0.40:
+            return True
+        return False
+
+    def state_snapshot(self) -> Dict[str, Any]:
+        return {
+            "timestamp": self.last_timestamp,
+            "starting_capital": self.exec_cfg.get("starting_equity", 0.0),
             "equity": self.executor.equity,
             "free_capital": self.executor.free_capital,
-            "locked_profit": getattr(self.executor, "locked_profit", 0),
-            "confluence": conf,
-            "evr": evr.get("evr"),
-            "positions": len(self.executor.positions),
-        })
+            "locked_profit": self.executor.locked_profit,
+            "max_drawdown": self.max_drawdown_seen,
+            "risk_mode": self.current_risk_mode,
+            "hedge_ratio": self.current_hedge_ratio,
+            "cooling_to": self.cooling_until.isoformat() if self.cooling_until is not None else None,
+            "open_trades": self.executor.positions,
+            "closed_trades": self.closed_trades,
+            "exposures": self.exposure.current_exposures(self.executor.equity),
+        }

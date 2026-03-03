@@ -23,6 +23,7 @@ class LivePosition:
         trade_id: str,
         asset: str,
         side: str,
+        notional_usd: float,
         qty: float,
         entry_price: float,
         leverage: int,
@@ -32,14 +33,23 @@ class LivePosition:
         self.trade_id = trade_id
         self.asset = asset
         self.side = side              # long / short
+        self.notional_usd = notional_usd
         self.qty = qty
         self.entry_price = entry_price
         self.leverage = leverage
         self.meta = meta or {}
+        self.metadata = self.meta
         self.stop_price = stop_price
         self.open_time = datetime.utcnow()
+        self.opened_at = self.open_time
         self.bars_in_trade = 0
         self.hedge_leg = None         # assign perp hedge ID later
+        self.r_mult = 0.0
+        self.highest_r = 0.0
+
+    @property
+    def size_usd(self) -> float:
+        return self.notional_usd
 
 
 class LiveExecutor:
@@ -54,8 +64,10 @@ class LiveExecutor:
 
     def __init__(self, cfg: ConfigLoader, dashboard_adapter=None):
         self.cfg = cfg
-        self.exec_cfg = cfg.load_yaml("execution.yaml")
-        self.assets_cfg = cfg.load_yaml("assets.yaml")["assets"]["metadata"]
+        merged_cfg = cfg.load()
+        self.exec_cfg = merged_cfg.get("execution", {})
+        self.live_cfg = merged_cfg.get("live_trading", {})
+        self.assets_cfg = cfg.load_yaml("assets.yaml")["metadata"]
 
         self.kraken = KrakenLiveClient(cfg)
         self.dashboard = dashboard_adapter
@@ -66,8 +78,9 @@ class LiveExecutor:
         self.free_capital = self.equity
 
         # leverage mode
-        self.leverage_enabled = self.exec_cfg.get("enable_leverage", False)
-        self.max_lev = self.exec_cfg.get("max_leverage", 1)
+        lev_cfg = self.live_cfg.get("leverage", {})
+        self.leverage_enabled = bool(lev_cfg.get("enabled", False))
+        self.max_lev = int(lev_cfg.get("max", 1))
 
         LOG.info(f"[LiveExecutor] Initialized. Leverage enabled={self.leverage_enabled}, max={self.max_lev}")
 
@@ -110,6 +123,7 @@ class LiveExecutor:
             trade_id=trade_id,
             asset=asset,
             side=side,
+            notional_usd=usd_size,
             qty=qty,
             entry_price=price,
             leverage=lev,
@@ -122,16 +136,6 @@ class LiveExecutor:
         self.free_capital -= usd_size
         self.equity = self.locked_profit + self.free_capital
 
-        if self.dashboard:
-            self.dashboard.log_event("live_entry", trade_id, {
-                "asset": asset,
-                "qty": qty,
-                "side": side,
-                "leverage": lev,
-                "entry": price,
-                "leg": meta.get("leg"),
-            })
-
         return pos
 
     # ----------------------------------------------------------
@@ -141,11 +145,17 @@ class LiveExecutor:
         """
         Market exit the position.
         """
+        return self.exit_position_at(trade_id, price, datetime.utcnow())
+
+    def exit_position_at(self, trade_id: str, price: float, exit_ts: datetime):
+        """
+        Deterministic exit helper for live/paper parity.
+        """
 
         pos = self.positions.get(trade_id)
         if not pos:
             LOG.error(f"[LiveExecutor] exit: position {trade_id} not found")
-            return 0.0
+            return None
 
         side = "sell" if pos.side == "long" else "buy"
         LOG.info(f"[LiveExecutor] Exiting {pos.asset} [{trade_id}] qty={pos.qty} at price={price}")
@@ -153,15 +163,33 @@ class LiveExecutor:
         self._submit_order(pos.asset, side, pos.qty, price, pos.leverage)
 
         pnl = self._calculate_pnl(pos, price)
-        value = pos.qty * price
+        value = pos.notional_usd + pnl
         self.free_capital += value
         self.equity = self.locked_profit + self.free_capital
         del self.positions[trade_id]
-
-        if self.dashboard:
-            self.dashboard.log_event("live_exit", trade_id, {"pnl": pnl, "value": value})
-
-        return pnl
+        risk = abs(pos.entry_price - ((pos.meta.get("initial_stop") or pos.stop_price or pos.entry_price)))
+        r_mult = (pnl / (risk * pos.qty)) if risk > 0 and pos.qty > 0 else 0.0
+        return {
+            "trade_id": trade_id,
+            "asset": pos.asset,
+            "side": pos.side,
+            "leg": pos.meta.get("leg"),
+            "entry_price": pos.entry_price,
+            "exit_price": price,
+            "entry_ts": pos.opened_at,
+            "exit_ts": exit_ts,
+            "qty": pos.qty,
+            "size_usd": pos.notional_usd,
+            "value": value,
+            "pnl": pnl,
+            "r": r_mult,
+            "r_mult": r_mult,
+            "stop_price": pos.stop_price,
+            "conf": pos.meta.get("conf"),
+            "evr": pos.meta.get("evr"),
+            "tier": pos.meta.get("tier"),
+            "reason": pos.meta.get("reason"),
+        }
 
     # ----------------------------------------------------------
     # PERP HEDGE LEG
@@ -206,7 +234,19 @@ class LiveExecutor:
         pos = self.positions.get(trade_id)
         if not pos:
             return 0.0
-        return (price - pos.entry_price) * pos.qty * (1 if pos.side == "long" else -1)
+        return self.position_value(pos, price)
+
+    def position_value(self, pos: LivePosition, price: float) -> float:
+        return pos.notional_usd + self._calculate_pnl(pos, price)
+
+    def refresh_equity(self, prices: Optional[Dict[str, float]] = None):
+        prices = prices or {}
+        mtm_value = 0.0
+        for pos in self.positions.values():
+            px = float(prices.get(pos.asset, pos.entry_price))
+            mtm_value += self.position_value(pos, px)
+        self.equity = self.locked_profit + self.free_capital + mtm_value
+        return self.equity
 
     # ----------------------------------------------------------
     # SUBMIT ORDER (spot + margin mode)

@@ -1,86 +1,81 @@
 """
-dual_replay_engine.py
-Master controller for dual-model replay mode:
- • Shares ReplayState + ReplayTimeline with both models
- • Steps both ForwardEngines synchronously
- • Broadcasts to dual dashboards
+Synchronous dual replay driver for side-by-side model comparisons.
+
+This stays intentionally thin: it advances two forward/live-style engines with
+the same 15m bar sequence and exposes basic play/seek controls for the dashboard.
 """
 
+from __future__ import annotations
+
 import time
-from quant_system.replay.replay_stream import ReplayStream
-from quant_system.replay.replay_state import ReplayState
-from quant_system.replay.replay_timeline import ReplayTimeline
+from typing import Dict
+
+import pandas as pd
 
 
 class DualReplayEngine:
-
-    def __init__(self, data, forward_A, forward_B, dashboard_A, dashboard_B):
-        """
-        data: { asset: { '15m':df, '1h':df, '6h':df, '12h':df } }
-        forward_A: trained ForwardEngine using Model Version A
-        forward_B: trained ForwardEngine using Model Version B
-        dashboard_A: Streamlit dashboard adapter for Version A
-        dashboard_B: Streamlit dashboard adapter for Version B
-        """
-
-        self.states = {
-            asset: ReplayState(df["15m"], df["1h"], df["6h"], df["12h"])
-            for asset, df in data.items()
-        }
-
-        self.timeline = ReplayTimeline(self.states)
+    def __init__(self, data, forward_A, forward_B, dashboard_A=None, dashboard_B=None):
+        self.data = data
         self.forward_A = forward_A
         self.forward_B = forward_B
         self.dashboard_A = dashboard_A
         self.dashboard_B = dashboard_B
-
         self.speed = 0.5
         self.running = False
+        self.cursor = 0
+        self.timeline = self._build_timeline(data)
 
-    # ------------------------------------------------------------
+    @staticmethod
+    def _build_timeline(data: Dict[str, Dict[str, pd.DataFrame]]):
+        stamps = []
+        for frames in data.values():
+            df = frames.get("15m", pd.DataFrame())
+            if df.empty:
+                continue
+            ts_col = "dt" if "dt" in df.columns else "timestamp"
+            stamps.extend(pd.to_datetime(df[ts_col], errors="coerce").dropna().tolist())
+        return sorted(set(stamps))
+
+    def set_speed(self, seconds_per_bar: float):
+        self.speed = max(float(seconds_per_bar), 0.01)
+
     def start(self):
         self.running = True
-        while self.running:
+        while self.running and self.cursor < len(self.timeline):
             self.step()
             time.sleep(self.speed)
 
-    # ------------------------------------------------------------
-    def step(self):
-        stream_A = ReplayStream(self.states, self.forward_A, self.dashboard_A)
-        stream_B = ReplayStream(self.states, self.forward_B, self.dashboard_B)
-
-        stream_A.step()
-        stream_B.step()
-
-        any_left = any(st.has_next() for st in self.states.values())
-        if not any_left:
-            self.running = False
-
-    # ------------------------------------------------------------
     def stop(self):
         self.running = False
 
-    # ------------------------------------------------------------
-    def set_speed(self, s):
-        self.speed = max(0.01, float(s))
+    def seek(self, idx: int):
+        self.cursor = max(0, min(int(idx), max(len(self.timeline) - 1, 0)))
 
-    # ------------------------------------------------------------
-    def seek(self, idx):
-        """Jump timeline for both models."""
-        target_dt = self.timeline.dt_at(idx)
-        if not target_dt:
-            return
+    def step(self):
+        if self.cursor >= len(self.timeline):
+            self.running = False
+            return None
 
-        # reset cursor for all assets
-        for st in self.states.values():
-            frame = st.frames["15m"]
-            loc = frame.index[frame["dt"] == target_dt]
-            if len(loc) > 0:
-                st.cursor = loc[0]
+        ts = self.timeline[self.cursor]
+        for asset, frames in self.data.items():
+            df = frames.get("15m", pd.DataFrame())
+            if df.empty:
+                continue
+            ts_col = "dt" if "dt" in df.columns else "timestamp"
+            row = df.loc[pd.to_datetime(df[ts_col], errors="coerce") == ts]
+            if row.empty:
+                continue
+            bar = row.iloc[0].to_dict()
+            if hasattr(self.forward_A, "on_bar"):
+                self.forward_A.on_bar(asset, bar)
+            if hasattr(self.forward_B, "on_bar"):
+                self.forward_B.on_bar(asset, bar)
+            if self.dashboard_A and hasattr(self.dashboard_A, "update_candles"):
+                self.dashboard_A.update_candles({asset: bar})
+            if self.dashboard_B and hasattr(self.dashboard_B, "update_candles"):
+                self.dashboard_B.update_candles({asset: bar})
 
-        # Clear both engines before injecting replay steps
-        self.forward_A.reset()
-        self.forward_B.reset()
-
-        self.dashboard_A.clear()
-        self.dashboard_B.clear()
+        self.cursor += 1
+        if self.cursor >= len(self.timeline):
+            self.running = False
+        return ts

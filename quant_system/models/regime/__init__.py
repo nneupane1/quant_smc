@@ -1,24 +1,30 @@
 """
-Regime modeling package exports.
-
-Exposes the HMM and HDBSCAN trainers/configs for easy imports in CLIs.
+Regime-model package exports.
 """
 
-from quant_system.models.regime.hmm_trainer import HMMRegimeTrainer, HMMConfig
-
-# Optional: expose HDBSCAN components if needed elsewhere
 try:
-    from quant_system.models.regime.hdbscan_trainer import (
-        HDBSCANLiquidityTrainer,
-        HDBSCANConfig,
-    )
-except Exception:  # pragma: no cover - hdbscan may be optional dependency
-    HDBSCANLiquidityTrainer = None  # type: ignore
+    from .hmm_regime import HMMRegimeConfig, HMMRegimeTrainer
+except Exception:  # pragma: no cover - optional dependency
+    HMMRegimeConfig = None  # type: ignore
+    HMMRegimeTrainer = None  # type: ignore
+
+try:
+    from .hmm_trainer import HMMConfig, HMMTrainer
+except Exception:  # pragma: no cover - optional dependency
+    HMMConfig = None  # type: ignore
+    HMMTrainer = None  # type: ignore
+
+try:
+    from .hdbscan_trainer import HDBSCANConfig, HDBSCANTrainer
+except Exception:  # pragma: no cover - optional dependency
     HDBSCANConfig = None  # type: ignore
+    HDBSCANTrainer = None  # type: ignore
 
 __all__ = [
-    "HMMRegimeTrainer",
     "HMMConfig",
-    "HDBSCANLiquidityTrainer",
+    "HMMTrainer",
+    "HMMRegimeConfig",
+    "HMMRegimeTrainer",
     "HDBSCANConfig",
+    "HDBSCANTrainer",
 ]

@@ -1,30 +1,27 @@
 """
-Unsupervised liquidity/chop clustering using HDBSCAN.
+Legacy compatibility surface for liquidity HDBSCAN training.
 
-Typical usage:
-    python -m quant_system.cli.train_hdbscan --input data/features_xbtusd/XBTUSD_features.csv \
-        --out-dir models/liquidity_hdbscan_xbtusd_15m
-
-Outputs:
- - model.joblib          : fitted HDBSCAN model
- - meta.json             : config, features used, basic fit stats
- - labels.csv (optional) : dt, cluster_id, prob, outlier_score (for inspection)
+This keeps the CLI-facing `quant_system.models.liquidity.hdbscan_trainer`
+API intact while delegating to the canonical `ml.regime` implementation.
 """
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Dict, Any
-import json
-import joblib
-import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler
+from typing import Any, Dict, List, Optional
 
+import json
+import pandas as pd
+import joblib
 
 try:
-    import hdbscan
-except ImportError as e:  # pragma: no cover - handled by user install
-    raise ImportError("hdbscan is required. Please install via `pip install hdbscan`.") from e
+    import hdbscan  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    hdbscan = None
+
+from quant_system.ml.regime.hdbscan_trainer import (
+    HDBSCANConfig as _CanonicalConfig,
+    LiquidityClusterTrainer as _CanonicalTrainer,
+)
 
 
 @dataclass
@@ -34,132 +31,98 @@ class HDBSCANConfig:
     metric: str = "euclidean"
     cluster_selection_method: str = "eom"
     allow_single_cluster: bool = True
-    features: Optional[List[str]] = None  # if None, a sensible default list is used
+    features: Optional[List[str]] = None
     seed: int = 42
     emit_labels: bool = True
 
 
 class HDBSCANTrainer:
-    """
-    Fits HDBSCAN on liquidity/vol/dispersion features.
-    """
-
     def __init__(self, cfg: HDBSCANConfig):
         self.cfg = cfg
-        self.model: Optional[hdbscan.HDBSCAN] = None
+        self._trainer = _CanonicalTrainer(
+            _CanonicalConfig(
+                timeframe="15m",
+                feature_cols=cfg.features,
+                min_cluster_size=cfg.min_cluster_size,
+                min_samples=cfg.min_samples,
+                cluster_selection_method=cfg.cluster_selection_method,
+                metric=cfg.metric,
+                allow_single_cluster=cfg.allow_single_cluster,
+                seed=cfg.seed,
+            )
+        )
         self.features_: List[str] = []
         self.stats_: Dict[str, Any] = {}
-
-    def _select_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        if self.cfg.features:
-            cols = [c for c in self.cfg.features if c in df.columns]
-        else:
-            # Default liquidity/vol/dispersion set (only keep if present)
-            candidates = [
-                "volume",
-                "dollar_volume",
-                "atr",
-                "range_pct",
-                "realized_vol",
-                "vol_zscore",
-                "absorption_score",
-                "spread",  # if present
-                "tick_density",  # if present
-                "liquidity_density",  # if present
-            ]
-            cols = [c for c in candidates if c in df.columns]
-        if not cols:
-            raise ValueError("No valid feature columns found for HDBSCAN clustering.")
-        self.features_ = cols
-        return df[cols].astype(float)
+        self.labels_: Optional[pd.DataFrame] = None
+        self.model = None
+        self.scaler = None
 
     def fit(self, df: pd.DataFrame) -> Dict[str, Any]:
-        df = df.copy()
-        if "dt" in df.columns:
-            df["dt"] = pd.to_datetime(df["dt"])
-        X = self._select_features(df)
-
-        scaler = StandardScaler()
-        Xs = scaler.fit_transform(X)
-
-        model = hdbscan.HDBSCAN(
-            min_cluster_size=self.cfg.min_cluster_size,
-            min_samples=self.cfg.min_samples,
-            metric=self.cfg.metric,
-            cluster_selection_method=self.cfg.cluster_selection_method,
-            allow_single_cluster=self.cfg.allow_single_cluster,
-            prediction_data=True,
-            gen_min_span_tree=False,
-        )
-        labels = model.fit_predict(Xs)
-        probs = model.probabilities_
-        outlier = model.outlier_scores_
-
-        self.model = model
-        self.scaler = scaler
-
-        n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+        states = self._trainer.fit(df)
+        self.features_ = list(self._trainer.columns_)
+        self.labels_ = states.rename(columns={"is_outlier": "outlier_score"})
+        meta = self._trainer.meta_
         self.stats_ = {
-            "n_clusters": int(n_clusters),
-            "n_points": int(len(labels)),
-            "noise": int((labels == -1).sum()),
-            "labels_unique": sorted(list(map(int, np.unique(labels)))),
+            "n_clusters": int(meta.get("n_clusters", 0)),
+            "n_points": int(len(states)),
+            "noise": int(round(meta.get("noise_rate", 0.0) * len(states))),
+            "labels_unique": sorted(states["cluster_id"].astype(int).unique().tolist()),
         }
-
-        result = pd.DataFrame(
-            {
-                "dt": df["dt"] if "dt" in df.columns else np.arange(len(labels)),
-                "cluster_id": labels.astype(int),
-                "prob": probs.astype(float),
-                "outlier_score": outlier.astype(float),
-            }
-        )
-        self.labels_ = result
         return self.stats_
 
     def save(self, out_dir: str):
-        if self.model is None:
+        if self.labels_ is None:
             raise RuntimeError("Model not fit.")
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
-        # save model and scaler together
-        joblib.dump({"model": self.model, "scaler": self.scaler}, out / "model.joblib")
+        self._trainer.save(str(out), self.labels_.rename(columns={"outlier_score": "is_outlier"}))
+        self.model = self._trainer.model
+        self.scaler = self._trainer.scaler
         meta = {
-            "cfg": asdict(self.cfg),
+            "cfg": self.cfg.__dict__,
             "features": self.features_,
             "stats": self.stats_,
         }
         with open(out / "meta.json", "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2, default=str)
-        if self.cfg.emit_labels and hasattr(self, "labels_"):
+        if self.cfg.emit_labels and self.labels_ is not None:
             self.labels_.to_csv(out / "labels.csv", index=False)
 
     @staticmethod
-    def load(model_dir: str) -> "HDBSCANTrainer":
-        with open(Path(model_dir) / "meta.json", "r", encoding="utf-8") as f:
+    def load(model_dir: str):
+        meta_path = Path(model_dir) / "meta.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(f"Missing meta.json in {model_dir}")
+        with open(meta_path, "r", encoding="utf-8") as f:
             meta = json.load(f)
-        cfg = HDBSCANConfig(**meta["cfg"])
-        obj = HDBSCANTrainer(cfg)
-        bundle = joblib.load(Path(model_dir) / "model.joblib")
-        obj.model = bundle["model"]
-        obj.scaler = bundle["scaler"]
+        obj = HDBSCANTrainer(HDBSCANConfig(**meta.get("cfg", {})))
         obj.features_ = meta.get("features", [])
         obj.stats_ = meta.get("stats", {})
+        model_path = Path(model_dir) / "model.joblib"
+        scaler_path = Path(model_dir) / "scaler.joblib"
+        if model_path.exists():
+            obj.model = joblib.load(model_path)
+        if scaler_path.exists():
+            obj.scaler = joblib.load(scaler_path)
+        labels_path = Path(model_dir) / "labels.csv"
+        if labels_path.exists():
+            obj.labels_ = pd.read_csv(labels_path)
         return obj
 
     def predict(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Assign clusters to new data (approximate prediction).
-        """
-        if self.model is None:
+        if not self.features_:
             raise RuntimeError("Model not fit.")
-        X = self._select_features(df)
+        if self.model is None or self.scaler is None:
+            raise RuntimeError("Loaded wrapper does not have model/scaler artifacts available.")
+        if hdbscan is None:
+            raise ImportError("hdbscan is required for approximate prediction.")
+        feats = [c for c in self.features_ if c in df.columns]
+        if not feats:
+            raise ValueError("None of the trained feature columns are present in the dataframe.")
+        X = df[feats].astype(float).fillna(0.0)
         Xs = self.scaler.transform(X)
         labels, strengths = hdbscan.approximate_predict(self.model, Xs)
-        return pd.DataFrame(
-            {
-                "cluster_id": labels.astype(int),
-                "prob": strengths.astype(float),
-            },
-            index=df.index,
-        )
+        out = pd.DataFrame(index=df.index)
+        out["cluster_id"] = labels.astype(int)
+        out["prob"] = strengths.astype(float)
+        return out

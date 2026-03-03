@@ -32,10 +32,10 @@ from sklearn.preprocessing import StandardScaler
 
 try:
     import hdbscan
-except ImportError as e:
-    raise SystemExit(
-        "hdbscan is required for this trainer. Install with: pip install hdbscan"
-    ) from e
+    _HAS_HDBSCAN = True
+except ImportError:
+    hdbscan = None  # type: ignore
+    _HAS_HDBSCAN = False
 
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -81,7 +81,7 @@ def train_hdbscan(
     epsilon: float,
     metric: str,
     random_state: int,
-) -> hdbscan.HDBSCAN:
+):
     model = hdbscan.HDBSCAN(
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
@@ -120,6 +120,8 @@ def main():
     ap.add_argument("--random-state", type=int, default=42, help="random state for reproducibility")
     ap.add_argument("--save-labels", action="store_true", help="Save dt,label,probability CSV")
     args = ap.parse_args()
+    if not _HAS_HDBSCAN:
+        raise SystemExit("hdbscan is required for this trainer. Install with: pip install hdbscan")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

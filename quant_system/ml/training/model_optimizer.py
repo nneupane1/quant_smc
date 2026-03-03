@@ -3,12 +3,16 @@ Bayesian hyperparameter optimizer using Optuna for
 time-series ML models (LightGBM/XGBoost/Logistic).
 """
 
-import optuna
 import numpy as np
 from typing import Dict, Any, Tuple
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.linear_model import LogisticRegression
+
+try:
+    import optuna
+except Exception:  # pragma: no cover - optional dependency
+    optuna = None
 
 from quant_system.utils.logger import log
 
@@ -66,7 +70,7 @@ class ModelOptimizer:
         else:
             raise ValueError(f"Unsupported algorithm: {algo}")
 
-    def _param_space(self, trial: optuna.Trial) -> Dict[str, Any]:
+    def _param_space(self, trial: Any) -> Dict[str, Any]:
         """Define search space per algorithm."""
         algo = self.cfg["algorithm"].lower()
 
@@ -144,8 +148,11 @@ class ModelOptimizer:
         """
 
         log("Starting Bayesian HPO...")
+        if optuna is None:
+            log("Optuna unavailable. Falling back to empty/default parameter set.")
+            return {}
 
-        def objective(trial: optuna.Trial):
+        def objective(trial: Any):
             params = self._param_space(trial)
             model = self._build_model(params)
             score = self._timeseries_score(model, X, y)

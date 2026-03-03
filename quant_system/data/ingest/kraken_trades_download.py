@@ -6,8 +6,8 @@ Example:
     --pair XBTUSD ^
     --start 2013-01-01 ^
     --end 2026-01-01 ^
-    --trades-out data/raw/XBTUSD_trades.csv ^
-    --ohlcv-out data/raw/XBTUSD_1m_from_trades.csv
+    --trades-out data/raw_1m/XBTUSD_trades.csv ^
+    --ohlcv-out data/raw_1m/XBTUSD_1m_from_trades.csv
 """
 
 import argparse
@@ -35,14 +35,14 @@ def resample_1m(trades_csv: str, ohlcv_out: str, start_ts: int, end_ts: int):
     df = df.set_index("dt").sort_index()
 
     # Base resample
-    o = df["price"].resample("1T").first()
-    h = df["price"].resample("1T").max()
-    l = df["price"].resample("1T").min()
-    c = df["price"].resample("1T").last()
-    v = df["volume"].resample("1T").sum()
+    o = df["price"].resample("1min").first()
+    h = df["price"].resample("1min").max()
+    l = df["price"].resample("1min").min()
+    c = df["price"].resample("1min").last()
+    v = df["volume"].resample("1min").sum()
 
     # Build full minute index and fill gaps using previous close
-    full_idx = pd.date_range(o.index.min().floor("T"), o.index.max().floor("T"), freq="1T", tz="UTC")
+    full_idx = pd.date_range(o.index.min().floor("min"), o.index.max().floor("min"), freq="1min", tz="UTC")
     o = o.reindex(full_idx)
     h = h.reindex(full_idx)
     l = l.reindex(full_idx)
@@ -70,8 +70,8 @@ def main():
     ap.add_argument("--pair", default="XBTUSD", help="Kraken altname, e.g. XBTUSD, XBTUSDT")
     ap.add_argument("--start", required=True, help="Start date YYYY-MM-DD")
     ap.add_argument("--end", required=True, help="End date YYYY-MM-DD")
-    ap.add_argument("--trades-out", default="data/raw/kraken_trades.csv", help="Trades CSV output")
-    ap.add_argument("--ohlcv-out", default="data/raw/kraken_1m_from_trades.csv", help="Resampled OHLCV output")
+    ap.add_argument("--trades-out", default=None, help="Trades CSV output")
+    ap.add_argument("--ohlcv-out", default=None, help="Resampled OHLCV output")
     ap.add_argument("--append", action="store_true", help="Append to existing trades CSV")
     ap.add_argument("--sleep", type=float, default=1.0, help="Sleep between API calls")
     args = ap.parse_args()
@@ -90,16 +90,21 @@ def main():
         except Exception:
             pass
 
+    pair_label = args.pair.replace("/", "")
+    trades_out = args.trades_out or f"data/raw_1m/{pair_label}_trades.csv"
+    ohlcv_out = args.ohlcv_out or f"data/raw_1m/{pair_label}_1m_from_trades.csv"
+    os.makedirs(os.path.dirname(trades_out), exist_ok=True)
+
     dl = KrakenTradesDownloader(pair=args.pair)
     rows, last_ts = dl.download_to_csv(
-        output_csv=args.trades_out,
+        output_csv=trades_out,
         start_cursor=start_cursor,
         end_ts=end_ts,
         sleep=args.sleep,
         append=args.append,
     )
     print(f"Trades downloaded: {rows}, last_ts={last_ts}")
-    resample_1m(args.trades_out, args.ohlcv_out, start_ts=start_ts, end_ts=end_ts)
+    resample_1m(trades_out, ohlcv_out, start_ts=start_ts, end_ts=end_ts)
 
 
 if __name__ == "__main__":

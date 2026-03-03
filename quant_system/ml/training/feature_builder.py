@@ -7,13 +7,14 @@ Builds unified 15m-level feature frame:
  - EMA features (multi-TF)
  - liquidity features
  - volatility features
- - regime features (10h/6h/12h HMM/HDBSCAN outputs)
+ - regime features (6h/12h HMM/HDBSCAN outputs)
  - rolling-window z-scores
  - session weight
 Also emits an HTF SMC audit table (unpruned, unlagged) for dashboards.
 """
 
 import pandas as pd
+import numpy as np
 from typing import Dict, Optional, List
 import argparse
 import time
@@ -51,7 +52,7 @@ class FeatureBuilder:
 
     def __init__(self, config_loader: ConfigLoader):
         self.cfg = config_loader
-        self.features_cfg = self.cfg.load_yaml("features.yaml")
+        self.features_cfg = self.cfg.load_yaml("features.yaml").get("features", {})
         self.asset_cfg = self.cfg.load_yaml("assets.yaml")
         self.audit_table: Optional[pd.DataFrame] = None
 
@@ -69,7 +70,7 @@ class FeatureBuilder:
 
         # EMA / Liquidity / Vol / Regime
         self.ema_block = EMAFeatureBlock(config_loader)
-        self.liq_block = LiquidityFeatureBlock()
+        self.liq_block = LiquidityFeatureBlock(config_loader)
         self.vol_block = VolatilityFeatureBlock()
         self.reg_block = RegimeFeatureBlock(config_loader)
         # Absorption (iceberg proxy) block
@@ -193,8 +194,12 @@ class FeatureBuilder:
             df15 = pd.read_csv(paths["stage2"], parse_dates=["dt"])
             if paths.get("audit") and paths["audit"].exists():
                 self.audit_table = pd.read_csv(paths["audit"], parse_dates=["dt"])
-            LOG.info(f"[FeatureBuilder] Stage 2 cache hit -> {paths['stage2']}")
-        else:
+            if "displacement_body_pct_1h" in df15.columns and "flow_signal_1h" in df15.columns:
+                LOG.info(f"[FeatureBuilder] Stage 2 cache hit -> {paths['stage2']}")
+            else:
+                LOG.info("[FeatureBuilder] Stage 2 cache stale for 1h flow features; rebuilding.")
+                ckpt["last_stage"] = 1
+        if ckpt.get("last_stage", 0) < 2:
             t0 = time.perf_counter()
             LOG.info("[FeatureBuilder] Stage 2: HTF SMC + joins")
             htf_full = {
@@ -206,8 +211,9 @@ class FeatureBuilder:
             df1h_s = self._apply_smc_pruned(htf_full["1h"])
             df6h_s = self._apply_smc_pruned(htf_full["6h"])
             df12_s = self._apply_smc_pruned(htf_full["12h"])
-            df15 = self.context.apply(df15, df6h_s)
+            df15 = self.context.apply(df15, htf_full["6h"])
             df15 = self._join_tf(df15, df1h_s, "1h")
+            df15 = self._join_tf(df15, self._build_flow_1h(df1h), "1h")
             df15 = self._join_tf(df15, df6h_s, "6h")
             df15 = self._join_tf(df15, df12_s, "12h")
             if paths.get("stage2"):
@@ -220,8 +226,12 @@ class FeatureBuilder:
         # Stage 3: EMA/Liq/Vol/Absorption/Regime
         if ckpt.get("last_stage", 0) >= 3 and paths.get("stage3") and paths["stage3"].exists():
             df15 = pd.read_csv(paths["stage3"], parse_dates=["dt"])
-            LOG.info(f"[FeatureBuilder] Stage 3 cache hit -> {paths['stage3']}")
-        else:
+            if "flow_strength_1h" in df15.columns and "p_regime_trend" in df15.columns:
+                LOG.info(f"[FeatureBuilder] Stage 3 cache hit -> {paths['stage3']}")
+            else:
+                LOG.info("[FeatureBuilder] Stage 3 cache stale; rebuilding.")
+                ckpt["last_stage"] = 2
+        if ckpt.get("last_stage", 0) < 3:
             t0 = time.perf_counter()
             LOG.info("[FeatureBuilder] Stage 3: EMA/Liq/Vol/Absorption/Regime")
             df15 = self.ema_block.apply(df15, df1h, df6h, df12)
@@ -305,9 +315,10 @@ class FeatureBuilder:
         df12_s = self._apply_smc_pruned(htf_full["12h"])
 
         # Structural context from processed 6h frame
-        df15 = self.context.apply(df15, df6h_s)
+        df15 = self.context.apply(df15, htf_full["6h"])
 
         df15 = self._join_tf(df15, df1h_s, "1h")
+        df15 = self._join_tf(df15, self._build_flow_1h(df1h), "1h")
         df15 = self._join_tf(df15, df6h_s, "6h")
         df15 = self._join_tf(df15, df12_s, "12h")
 
@@ -390,13 +401,104 @@ class FeatureBuilder:
         Keep lean HTF fields for modeling to avoid bloat.
         """
         keep: List[str] = ["dt"]
-        for cand in ["bos_flag", "choch_flag", "bias", "sweep_flag", "fvg_mid", "zone_id"]:
+        for cand in [
+            "bos_flag",
+            "choch_flag",
+            "bias",
+            "structure_bias",
+            "sweep_flag",
+            "fvg_mid",
+            "fvg_mid_price",
+            "fvg_hi",
+            "fvg_lo",
+            "zone_id",
+            "zone_hi",
+            "zone_lo",
+            "zone_high",
+            "zone_low",
+            "demand_quality",
+            "supply_quality",
+            "demand_age",
+            "supply_age",
+        ]:
             if cand in df_tf.columns:
                 keep.append(cand)
-        for alt in ["fvg_mid_price", "ob_id", "structure_bias"]:
+        for alt in ["ob_id", "structural_bias_6h", "zone_recency", "zone_displacement", "zone_mitigation", "zone_pd", "zone_ema_align"]:
             if alt in df_tf.columns and alt not in keep:
                 keep.append(alt)
         return df_tf[keep].copy()
+
+    def _build_flow_1h(self, df_1h: pd.DataFrame) -> pd.DataFrame:
+        """
+        Derive 1h flow/impulse features from raw Kraken bars.
+        These are projected onto the 15m execution frame and used by both
+        gating and the dedicated 1h flow model.
+        """
+        if df_1h is None or df_1h.empty:
+            return pd.DataFrame(columns=["dt"])
+
+        out = df_1h[["dt"]].copy()
+        rng = (df_1h["high"] - df_1h["low"]).replace(0, np.nan)
+        body = (df_1h["close"] - df_1h["open"]).abs()
+        signed_body = df_1h["close"] - df_1h["open"]
+        ret = df_1h["close"].pct_change().fillna(0.0)
+        volume = df_1h["volume"].astype(float)
+        volume_mean = volume.rolling(48, min_periods=12).mean()
+        volume_std = volume.rolling(48, min_periods=12).std().replace(0, np.nan)
+        volume_z = ((volume - volume_mean) / volume_std).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        range_pct = ((df_1h["high"] - df_1h["low"]) / df_1h["close"].replace(0, np.nan)).fillna(0.0)
+        range_mean = range_pct.rolling(48, min_periods=12).mean()
+        range_std = range_pct.rolling(48, min_periods=12).std().replace(0, np.nan)
+        range_z = ((range_pct - range_mean) / range_std).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        close_loc = ((df_1h["close"] - df_1h["low"]) / rng).clip(0.0, 1.0).fillna(0.5)
+
+        disp_body_pct = (body / rng).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        direction = np.sign(signed_body).astype(int)
+
+        impulse_up = (
+            (direction > 0)
+            & (disp_body_pct >= 0.60)
+            & (volume_z >= 0.80)
+            & (close_loc >= 0.65)
+        )
+        impulse_down = (
+            (direction < 0)
+            & (disp_body_pct >= 0.60)
+            & (volume_z >= 0.80)
+            & (close_loc <= 0.35)
+        )
+
+        flow_signal = pd.Series(0, index=df_1h.index, dtype=int)
+        flow_signal = flow_signal.mask(impulse_up, 1)
+        flow_signal = flow_signal.mask(impulse_down, -1)
+
+        freshness = []
+        last_impulse_idx = None
+        for i, sig in enumerate(flow_signal.tolist()):
+            if sig != 0:
+                last_impulse_idx = i
+                freshness.append(0)
+            elif last_impulse_idx is None:
+                freshness.append(999)
+            else:
+                freshness.append(i - last_impulse_idx)
+
+        out["displacement_body_pct"] = disp_body_pct.fillna(0.0)
+        out["body_dir"] = direction
+        out["ret_1h"] = ret
+        out["close_loc"] = close_loc
+        out["range_pct"] = range_pct
+        out["range_z"] = range_z
+        out["volume_z"] = volume_z
+        out["flow_signal"] = flow_signal
+        out["flow_age_bars"] = freshness
+        out["flow_ok"] = ((flow_signal != 0) | (pd.Series(freshness, index=df_1h.index) <= 4)).astype(int)
+        out["flow_strength"] = (
+            0.55 * out["displacement_body_pct"].clip(0, 1)
+            + 0.25 * out["volume_z"].clip(-1, 3).div(3.0)
+            + 0.20 * out["range_z"].clip(-1, 3).div(3.0)
+        ).clip(0.0, 1.0)
+        return out
 
     def _build_audit_table(self, htf: Dict[str, pd.DataFrame], asset: str) -> pd.DataFrame:
         """
@@ -452,6 +554,12 @@ class FeatureBuilder:
             weight = weight.mask(df15["is_ldn"] == 1, 1.0)
         if "is_ny" in df15.columns:
             weight = weight.mask(df15["is_ny"] == 1, 1.0)
+        if "session_london" in df15.columns:
+            weight = weight.mask(df15["session_london"] == 1, 1.0)
+        if "session_ny" in df15.columns:
+            weight = weight.mask(df15["session_ny"] == 1, 1.0)
+        if "session_overlap" in df15.columns:
+            weight = weight.mask(df15["session_overlap"] == 1, 1.10)
         for col in ["session", "session_name"]:
             if col in df15.columns:
                 weight = weight.mask(df15[col].isin(["LDN", "NY", "london", "newyork", "NewYork"]), 1.0)

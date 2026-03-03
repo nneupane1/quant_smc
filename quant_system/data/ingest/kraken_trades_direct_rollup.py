@@ -17,12 +17,14 @@ import time
 import warnings
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Tuple, Dict
 
 import pandas as pd
 import requests
 from dotenv import load_dotenv
+from quant_system.config.config_loader import ConfigLoader
 
 # Silence pandas future warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -50,6 +52,15 @@ KRAKEN_REST = "https://api.kraken.com"
 
 
 # --------------------------- Utilities --------------------------- #
+@lru_cache(maxsize=32)
+def canonical_asset_name(pair: str) -> str:
+    cfg = ConfigLoader("quant_system/config").load_yaml("assets.yaml")
+    for asset, meta in cfg.get("metadata", {}).items():
+        if asset == pair or meta.get("kraken_pair") == pair:
+            return asset
+    return pair
+
+
 def to_unix(ts_str: str) -> float:
     """
     Parse date/time string as UTC by default to avoid local-time drift.
@@ -231,10 +242,10 @@ class DirectRollupWriter:
 
         # Ensure CSV headers exist (DollarVolume included)
         for name in ["15m", "1h", "6h", "12h"]:
-            p = self.out_dir / f"{self.cp.state.pair}_{name}.csv"
+            p = self.out_dir / f"{self._asset_name()}_{name}.csv"
             if not p.exists():
                 pd.DataFrame(
-                    columns=["Timestamp", "Open", "High", "Low", "Close", "Volume", "DollarVolume"]
+                    columns=["dt", "timestamp", "open", "high", "low", "close", "volume", "dollar_volume"]
                 ).to_csv(p, index=False)
                 self.row_totals[name] = 0
             else:
@@ -244,11 +255,14 @@ class DirectRollupWriter:
     def _append_csv(self, name: str, df: pd.DataFrame) -> int:
         if df.empty:
             return 0
-        out = self.out_dir / f"{self.cp.state.pair}_{name}.csv"
+        out = self.out_dir / f"{self._asset_name()}_{name}.csv"
         df.to_csv(out, mode="a", header=False, index=False, float_format="%.8f")
         added = len(df)
         self.row_totals[name] += added
         return added
+
+    def _asset_name(self) -> str:
+        return canonical_asset_name(self.cp.state.pair)
 
     def _load_buffer(self, tf: str):
         s = self.cp.state
@@ -364,7 +378,7 @@ class DirectRollupWriter:
             )
 
         if bars.empty:
-            return pd.DataFrame(columns=["Timestamp", "Open", "High", "Low", "Close", "Volume", "DollarVolume"]), buf
+            return pd.DataFrame(columns=["dt", "timestamp", "open", "high", "low", "close", "volume", "dollar_volume"]), buf
 
         partial_ts = bars.index[-1]
         partial = {
@@ -380,13 +394,14 @@ class DirectRollupWriter:
 
         if not to_write.empty:
             out = to_write.reset_index()
-            out["Timestamp"] = out["ts"].dt.strftime("%Y-%m-%d %H:%M")
+            out["dt"] = out["ts"].dt.strftime("%Y-%m-%d %H:%M:%S")
+            out["timestamp"] = out["ts"].astype("int64") // 10**9
             out = out.rename(
-                columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume", "dv": "DollarVolume"}
+                columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume", "dv": "dollar_volume"}
             )
-            out = out[["Timestamp", "Open", "High", "Low", "Close", "Volume", "DollarVolume"]]
+            out = out[["dt", "timestamp", "open", "high", "low", "close", "volume", "dollar_volume"]]
         else:
-            out = pd.DataFrame(columns=["Timestamp", "Open", "High", "Low", "Close", "Volume", "DollarVolume"])
+            out = pd.DataFrame(columns=["dt", "timestamp", "open", "high", "low", "close", "volume", "dollar_volume"])
 
         return out, partial
 

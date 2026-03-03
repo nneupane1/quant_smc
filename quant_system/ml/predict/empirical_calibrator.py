@@ -11,6 +11,22 @@ from sklearn.metrics import brier_score_loss
 from quant_system.utils.logger import log
 
 
+class HistogramBinningCalibrator:
+    """
+    Pickle-friendly histogram-binning calibrator.
+    """
+
+    def __init__(self, edges: np.ndarray, bin_means: Dict[int, float]):
+        self.edges = np.asarray(edges, dtype=float)
+        self.bin_means = {int(k): float(v) for k, v in bin_means.items()}
+
+    def predict(self, p: np.ndarray) -> np.ndarray:
+        vals = np.asarray(p, dtype=float).reshape(-1)
+        idx = np.digitize(vals, self.edges) - 1
+        idx = np.clip(idx, 0, len(self.edges) - 2)
+        return np.array([self.bin_means.get(int(i), 0.5) for i in idx], dtype=float)
+
+
 class EmpiricalCalibrator:
     """
     Provides Platt, Isotonic, and Histogram Binning calibration.
@@ -43,12 +59,7 @@ class EmpiricalCalibrator:
             else:
                 bin_means[b] = 0.5
 
-        def predictor(px: float):
-            bi = np.digitize([px], edges)[0] - 1
-            bi = max(0, min(bi, bins - 1))
-            return bin_means[bi]
-
-        return predictor
+        return HistogramBinningCalibrator(edges, bin_means)
 
     def _apply_calibrator(self, cal, p: np.ndarray) -> np.ndarray:
         """
@@ -64,8 +75,8 @@ class EmpiricalCalibrator:
             # isotonic regression
             return cal.predict(p)
 
-        # histogram binning (callable)
-        return np.array([cal(pi) for pi in p])
+        # histogram binning
+        return cal.predict(p)
 
     def calibrate(self, p_raw: np.ndarray, y_true: np.ndarray) -> Any:
         """

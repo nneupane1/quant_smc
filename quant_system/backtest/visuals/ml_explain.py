@@ -1,20 +1,55 @@
-import streamlit as st
-import shap
+from typing import Any, Dict, Optional
+
 import pandas as pd
-from quant_system.ml.model_registry import ModelRegistry
+
+from quant_system.ml.registry.model_registry import ModelRegistry
 
 
-def explain_trade(model_version: str, trade_features: pd.DataFrame):
+def _optional_streamlit():
+    try:
+        import streamlit as st
+
+        return st
+    except Exception:
+        return None
+
+
+def explain_trade(
+    trade_features: pd.DataFrame,
+    model_name: str = "confluence_model",
+    registry_dir: str = "models",
+    render: bool = True,
+) -> Dict[str, Any]:
     """
-    SHAP explanation for a single trade's features.
-    Only LightGBM/XGB supported.
+    Lightweight model introspection for a single trade row.
+    Uses the saved model bundle and feature column list from the registry.
     """
-    registry = ModelRegistry()
-    model = registry.load_model(model_version, "meta")  # meta model governs confluence
+    registry = ModelRegistry(registry_dir)
+    clf, _cal, cfg = registry.load_latest_bundle(model_name)
+    feature_cols = cfg.get("features", list(trade_features.columns))
+    X = trade_features.reindex(columns=feature_cols).copy()
 
-    explainer = shap.TreeExplainer(model)
-    values = explainer.shap_values(trade_features)
+    prediction = None
+    try:
+        prediction = float(clf.predict_proba(X)[0][1]) if hasattr(clf, "predict_proba") else float(clf.predict(X)[0])
+    except Exception:
+        prediction = None
 
-    st.subheader("ML Explainability (SHAP)")
-    shap_html = shap.plots.force(explainer.expected_value, values, trade_features, matplotlib=False)
-    st.components.v1.html(shap_html.html(), height=350)
+    summary = {
+        "model_name": model_name,
+        "prediction": prediction,
+        "features_used": feature_cols,
+        "feature_values": X.iloc[0].dropna().to_dict() if not X.empty else {},
+        "estimator": type(clf).__name__,
+    }
+
+    if not render:
+        return summary
+
+    st = _optional_streamlit()
+    if st is None:
+        return summary
+
+    st.subheader("ML Explanation Snapshot")
+    st.json(summary)
+    return summary

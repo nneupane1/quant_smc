@@ -7,6 +7,7 @@ controls (cooldown, top_k_per_hour). Compatible with legacy decide() calls.
 
 import pandas as pd
 from typing import Dict, Any, Union
+import math
 
 from quant_system.utils.logger import get_logger
 
@@ -76,6 +77,11 @@ class TieringEngine:
         med_r = evr_result.get("median_r")
         conf = row.get("confluence_score", row.get("conf_score", 0.0))
 
+        conf = 0.0 if conf is None or (isinstance(conf, float) and math.isnan(conf)) else float(conf)
+        evr = float("-inf") if evr is None or (isinstance(evr, float) and math.isnan(evr)) else float(evr)
+        med_r = float("-inf") if med_r is None or (isinstance(med_r, float) and math.isnan(med_r)) else float(med_r)
+        hazard_score = 1.0 if hazard_score is None or (isinstance(hazard_score, float) and math.isnan(hazard_score)) else float(hazard_score)
+
         if ts is None:
             ts = pd.Timestamp.utcnow()
 
@@ -131,3 +137,9 @@ class TieringEngine:
             )
             return result.get("tier", "skip")
         return self.classify(*args, **kwargs)
+
+    def state_snapshot(self) -> Dict[str, Any]:
+        return {
+            "last_trade_bar": self.last_trade_bar,
+            "hourly_count": {str(k): v for k, v in self.hourly_count.items()},
+        }

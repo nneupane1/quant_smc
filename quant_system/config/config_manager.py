@@ -3,6 +3,7 @@ Central configuration manager providing global, cached, structured access
 to all YAML configs loaded by ConfigLoader.
 """
 
+import os
 import threading
 from typing import Any, Dict
 
@@ -17,24 +18,28 @@ class ConfigManager:
     """
 
     _instance_lock = threading.Lock()
-    _instance = None
+    _instances = {}
 
     def __new__(cls, conf_dir: str, env: str = None):
+        key = (os.path.abspath(conf_dir), (env or os.getenv("QS_ENV", "DEV")).upper())
         with cls._instance_lock:
-            if cls._instance is None:
-                cls._instance = super().__new__(cls)
-        return cls._instance
+            if key not in cls._instances:
+                instance = super().__new__(cls)
+                instance._instance_key = key
+                cls._instances[key] = instance
+        return cls._instances[key]
 
     def __init__(self, conf_dir: str, env: str = None):
-        if hasattr(self, "_initialized") and self._initialized:
+        current_key = (os.path.abspath(conf_dir), (env or os.getenv("QS_ENV", "DEV")).upper())
+        if getattr(self, "_initialized_key", None) == current_key:
             return  # initialized already
 
         self.conf_dir = conf_dir
-        self.env = env
+        self.env = env or os.getenv("QS_ENV", "DEV").upper()
         loader = ConfigLoader(conf_dir, env)
         self._cfg = loader.load()
 
-        self._initialized = True
+        self._initialized_key = current_key
         log("ConfigManager initialized with unified configuration.")
 
     def get(self, key: str, default: Any = None) -> Any:

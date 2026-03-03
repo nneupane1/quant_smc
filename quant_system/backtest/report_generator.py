@@ -1,34 +1,52 @@
-from quant_system.backtest.equity_curve import equity_curve_chart
-from quant_system.backtest.drawdown_plot import drawdown_chart
-from quant_system.backtest.heatmaps import session_heatmap, regime_heatmap, tier_heatmap
-from quant_system.backtest.tier_breakdown import tier_breakdown
-from quant_system.backtest.ml_explain import explain_trade
-from quant_system.backtest.moonshots import moonshot_table
-# EQUITY CURVE
-equity_curve_chart(df)
-st.markdown("<br>", unsafe_allow_html=True)
+"""
+High-level backtest reporting helpers.
+"""
 
-# DRAWDOWN
-drawdown_chart(df)
-st.markdown("<br>", unsafe_allow_html=True)
+from pathlib import Path
+from typing import Dict, Optional
 
-# HEATMAPS
-session_heatmap(df)
-regime_heatmap(df)
-tier_heatmap(df)
-st.markdown("<br>", unsafe_allow_html=True)
+import pandas as pd
 
-# TIER BREAKDOWN
-tier_breakdown(df)
-st.markdown("<br>", unsafe_allow_html=True)
-
-# MOONSHOTS
-moonshot_table(df)
-st.markdown("<br>", unsafe_allow_html=True)
+from quant_system.backtest.visuals.report_builder import build_report as build_report_artifacts
+from quant_system.backtest.visuals.report_generator import render_report
 
 
-st.subheader("Explain a Trade")
-selected_trade = st.selectbox("Select Trade ID", df.index.tolist())
-row = df.loc[[selected_trade]]
-features = row.filter(regex="feature_")  # your feature columns
-explain_trade(model_version="latest", trade_features=features)
+def generate_backtest_artifacts(
+    result: Dict,
+    output_dir: Path,
+    *,
+    candles: Optional[pd.DataFrame] = None,
+    smc_features: Optional[pd.DataFrame] = None,
+    starting_equity: float = 0.0,
+):
+    trades = result.get("trades", pd.DataFrame())
+    metrics = result.get("metrics", {})
+    equity_df = result.get("equity_curve")
+    execution_log = result.get("execution_log")
+    return build_report_artifacts(
+        trades,
+        output_dir,
+        metrics=metrics,
+        equity_df=equity_df,
+        execution_log=execution_log,
+        candles=candles,
+        smc_features=smc_features,
+        starting_equity=starting_equity,
+    )
+
+
+def render_backtest_report(
+    trades: pd.DataFrame,
+    *,
+    equity_df: Optional[pd.DataFrame] = None,
+    starting_equity: float = 0.0,
+    explain_model: Optional[str] = None,
+    registry_dir: str = "models",
+):
+    return render_report(
+        trades,
+        equity_df=equity_df,
+        starting_equity=starting_equity,
+        explain_model=explain_model,
+        registry_dir=registry_dir,
+    )

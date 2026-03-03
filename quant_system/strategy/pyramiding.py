@@ -2,7 +2,14 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 
 from quant_system.strategy.types import Position, Leg, Side
-from quant_system.strategy.utils import tokens_for_risk, r_multiple, throttle_by_absorption
+from quant_system.strategy.utils import (
+    boolish,
+    first_number,
+    first_text,
+    r_multiple,
+    throttle_by_absorption,
+    tokens_for_risk,
+)
 
 
 @dataclass
@@ -39,14 +46,36 @@ class Pyramider:
         self.cfg = cfg
 
     # ---------- Helpers ----------
+    def _atr(self, row: Dict[str, Any]) -> float:
+        return first_number(row, ["atr_15m", "atr"], 0.0)
+
+    def _confluence(self, row: Dict[str, Any]) -> float:
+        return first_number(row, ["confluence_score", "conf_score", "prob_confluence", "conf"], 0.0)
+
+    def _regime(self, row: Dict[str, Any]) -> str:
+        return first_text(row, ["regime_state", "regime", "dominant_regime"], "")
+
+    def _flow_ok(self, row: Dict[str, Any]) -> bool:
+        if boolish(row.get("bos_flag_1h")):
+            return True
+        if first_number(row, ["prob_flow_1h", "p_flow_1h", "flow_1h"], 0.0) >= 0.55:
+            return True
+        return first_number(row, ["flow_strength_1h"], 0.0) > 0.0
+
+    def _displacement_ok(self, row: Dict[str, Any]) -> bool:
+        return boolish(row.get("displacement_15m")) or first_number(row, ["body_pct_15m"], 0.0) >= 0.55
+
+    def _retest_ok(self, row: Dict[str, Any]) -> bool:
+        return boolish(row.get("fresh_retest_15m")) or boolish(row.get("retest_fvg_ob_15m"))
+
     def _gate_quality(self, row: Dict[str, Any]) -> bool:
         if float(row.get("session_weight", 0.0)) < self.cfg.session_min_weight:
             return False
-        if float(row.get("confluence_score", 0.0)) < self.cfg.confluence_min:
+        if self._confluence(row) < self.cfg.confluence_min:
             return False
-        if float(row.get("absorption_score", 0.0)) >= self.cfg.absorption_veto:
+        if first_number(row, ["absorption_score"], 0.0) >= self.cfg.absorption_veto:
             return False
-        regime = str(row.get("regime_state", ""))
+        regime = self._regime(row)
         if self.cfg.allow_regimes and regime and regime not in self.cfg.allow_regimes:
             return False
         if self.cfg.block_regimes and regime and regime in self.cfg.block_regimes:
@@ -56,10 +85,24 @@ class Pyramider:
     def _structural_stop(self, side: Side, row: Dict[str, Any], atr: float) -> Optional[float]:
         buf = self.cfg.min_stop_buffer_atr * atr if atr and atr > 0 else 0.0
         if side == Side.LONG:
-            base = row.get("recent_pivot_low") or row.get("ob_low") or row.get("low")
+            base = next(
+                (
+                    row.get(key)
+                    for key in ("recent_pivot_low", "swing_low", "ob_low", "zone_lo", "zone_low", "demand_zone", "low")
+                    if row.get(key) is not None
+                ),
+                None,
+            )
             return float(base) - buf if base is not None else None
         else:
-            base = row.get("recent_pivot_high") or row.get("ob_high") or row.get("high")
+            base = next(
+                (
+                    row.get(key)
+                    for key in ("recent_pivot_high", "swing_high", "ob_high", "zone_hi", "zone_high", "supply_zone", "high")
+                    if row.get(key) is not None
+                ),
+                None,
+            )
             return float(base) + buf if base is not None else None
 
     # ---------- Entry ----------
@@ -67,12 +110,12 @@ class Pyramider:
         if not self._gate_quality(row):
             return None
 
-        atr = float(row.get("atr", 0.0))
+        atr = self._atr(row)
         stop = self._structural_stop(side, row, atr)
         if not stop:
             return None
 
-        absorption = float(row.get("absorption_score", 0.0))
+        absorption = first_number(row, ["absorption_score"], 0.0)
         mult = throttle_by_absorption(absorption, *self.cfg.absorption_band)
         qty = tokens_for_risk(equity, self.cfg.base_risk_pct * mult, price, stop, side.value)
         if qty <= 0:
@@ -93,7 +136,8 @@ class Pyramider:
 
     # ---------- Adds ----------
     def maybe_add(self, pos: Position, equity: float, price: float, row: Dict[str, Any]) -> Optional[Leg]:
-        if len(pos.legs) >= self.cfg.max_adds:
+        add_count = max(len(pos.legs) - 1, 0)
+        if add_count >= self.cfg.max_adds:
             return None
         if not self._gate_quality(row):
             return None
@@ -101,18 +145,18 @@ class Pyramider:
         # structural triggers
         if len(pos.legs) == 1:
             need_ok = (
-                bool(row.get("bos_flag_1h", 0))
-                and bool(row.get("displacement_15m", 0))
-                and bool(row.get("retest_fvg_ob_15m", 0))
+                self._flow_ok(row)
+                and self._displacement_ok(row)
+                and self._retest_ok(row)
             )
             if not need_ok:
                 return None
         elif len(pos.legs) == 2:
-            need_ok = bool(row.get("bos_flag", 0)) and bool(row.get("fresh_retest_15m", 0))
+            need_ok = boolish(row.get("bos_flag")) and self._retest_ok(row)
             if not need_ok:
                 return None
         elif len(pos.legs) == 3:
-            need_ok = bool(row.get("bos_flag_1h", 0))
+            need_ok = self._flow_ok(row)
             if not need_ok:
                 return None
 
@@ -120,10 +164,10 @@ class Pyramider:
         if live_risk_pct + self.cfg.add_unit_risk_pct > self.cfg.max_live_risk_pct:
             return None
 
-        absorption = float(row.get("absorption_score", 0.0))
+        absorption = first_number(row, ["absorption_score"], 0.0)
         mult = throttle_by_absorption(absorption, *self.cfg.absorption_band)
 
-        atr = float(row.get("atr", 0.0))
+        atr = self._atr(row)
         stop = self._structural_stop(pos.side, row, atr)
         if not stop:
             return None
@@ -154,9 +198,9 @@ class Pyramider:
     # ---------- Ongoing management ----------
     def manage_stops_and_partials(self, pos: Position, price: float, row: Dict[str, Any]) -> Dict[str, Any]:
         out = {"move_stop_to": None, "do_partial": 0.0}
-        atr = float(row.get("atr", 0.0))
+        atr = self._atr(row)
 
-        if bool(row.get("absorption_near_stop", 0)):
+        if boolish(row.get("absorption_near_stop")):
             if pos.side == Side.LONG and pos.base_stop:
                 out["move_stop_to"] = max(pos.base_stop, price - 0.5 * atr)
             elif pos.side == Side.SHORT and pos.base_stop:

@@ -1,12 +1,9 @@
-"""
-Unified feature store for all timeframes.
-Handles saving and loading engineered feature tables (CSV-only, append-safe).
-"""
+"""Unified CSV feature store with canonical datetime-index handling."""
 
-import os
-import pandas as pd
-from typing import List, Optional
 from pathlib import Path
+from typing import List, Optional
+
+import pandas as pd
 
 from quant_system.config.config_manager import ConfigManager
 from quant_system.utils.logger import get_logger
@@ -21,11 +18,14 @@ class FeatureStore:
     Ensures schema consistency and provides safe updates.
     """
 
-    def __init__(self, base_dir: str, conf_dir: str):
-        self.base = Path(base_dir)
+    def __init__(self, base_dir: Optional[str] = None, conf_dir: str = "quant_system/config"):
+        manager = ConfigManager(conf_dir)
+        storage_cfg = manager.full.get("paths", {})
+        base_path = base_dir or storage_cfg.get("features", "data/features")
+        self.base = Path(base_path)
         self.base.mkdir(parents=True, exist_ok=True)
 
-        cfg = ConfigManager(conf_dir).get("features")
+        cfg = manager.get("features")
         self.join_cfg = cfg.get("join", {})
         self.scale_cfg = cfg.get("scale", {})
 
@@ -41,6 +41,25 @@ class FeatureStore:
         missing = [c for c in required_cols if c not in df.columns]
         if missing:
             raise ValueError(f"FeatureStore schema error. Missing columns: {missing}")
+
+    def _normalize_frame(self, df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        if not isinstance(out.index, pd.DatetimeIndex):
+            if "dt" in out.columns:
+                out["dt"] = pd.to_datetime(out["dt"], utc=True)
+                out = out.set_index("dt")
+            elif "timestamp" in out.columns:
+                out.index = pd.to_datetime(out["timestamp"], unit="s", utc=True)
+            else:
+                raise ValueError("FeatureStore requires a DatetimeIndex or `dt` / `timestamp` column.")
+        elif out.index.tz is None:
+            out.index = out.index.tz_localize("UTC")
+        else:
+            out.index = out.index.tz_convert("UTC")
+
+        out = out.sort_index()
+        out.index.name = "dt"
+        return out
 
     # ----------------------------------------------------------
     # Save features
@@ -60,6 +79,7 @@ class FeatureStore:
 
         LOG.info(f"Saving features for {timeframe} in {mode} mode to {f}")
 
+        df = self._normalize_frame(df)
         if required_cols:
             self._validate_schema(df, required_cols)
 
@@ -90,6 +110,9 @@ class FeatureStore:
             return pd.DataFrame()
 
         df = pd.read_csv(f, index_col=0, parse_dates=True)
+        df.index = pd.to_datetime(df.index, utc=True)
+        df = df.sort_index()
+        df.index.name = "dt"
         LOG.info(f"FeatureStore: loaded {len(df)} rows from {f}")
         return df
 
@@ -111,7 +134,8 @@ class FeatureStore:
             LOG.info(f"FeatureStore: merge skipped for {timeframe} (empty dataset)")
             return base_df
 
-        df = base_df.join(fdf, how=how, rsuffix=suffix)
+        base_norm = self._normalize_frame(base_df)
+        df = base_norm.join(fdf, how=how, rsuffix=suffix)
         LOG.info(f"FeatureStore: merged {timeframe} features into master frame")
         return df
 

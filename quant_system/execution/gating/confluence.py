@@ -33,12 +33,14 @@ class ConfluenceEngine:
         self.weights = {
             "specialist": float(self.conf_cfg.get("weight_specialist", 1.0)),
             "meta": float(self.conf_cfg.get("weight_meta", 0.5)),
+            "flow": float(self.conf_cfg.get("weight_flow", 0.75)),
             "rsv": float(self.conf_cfg.get("weight_rsv", 0.5)),
             "smc": float(self.conf_cfg.get("weight_smc", 0.5)),
             "session": float(self.conf_cfg.get("weight_session", 1.0)),
         }
 
         self.session_weights = self.conf_cfg.get("session_weights", {})
+        self.normalize = bool(self.conf_cfg.get("normalize", True))
         self.default_threshold = float(
             self.conf_cfg.get(
                 "default_threshold",
@@ -59,25 +61,61 @@ class ConfluenceEngine:
     def _first(row: pd.Series, candidates):
         for key in candidates:
             if key in row and row[key] is not None:
-                return float(row[key])
+                try:
+                    value = float(row[key])
+                except Exception:
+                    continue
+                if np.isnan(value):
+                    continue
+                return value
         return 0.0
 
-    def _session_weight(self, session: str) -> float:
+    def _session_weight(self, row: pd.Series) -> float:
+        direct = row.get("session_weight")
+        if direct is not None:
+            try:
+                value = float(direct)
+                if not np.isnan(value):
+                    return max(value, 0.0) * self.weights["session"]
+            except Exception:
+                pass
+
+        if bool(row.get("session_overlap", 0)):
+            session = "overlap"
+        elif bool(row.get("session_london", 0)):
+            session = "london"
+        elif bool(row.get("session_ny", 0)):
+            session = "new_york"
+        else:
+            session = str(row.get("session", "other") or "other").lower()
+
+        aliases = {
+            "ny": "new_york",
+            "newyork": "new_york",
+            "new_york": "new_york",
+            "off_hours": "other",
+            "offhours": "other",
+        }
+        session = aliases.get(session, session)
         return float(self.session_weights.get(session, 1.0)) * self.weights["session"]
 
     def _specialist_score(self, row: pd.Series) -> float:
         p_liq = self._first(row, ["p_liq_flow", "prob_liq_flow"])
         p_bos = self._first(row, ["p_bos_cont", "prob_bos_cont"])
+        p_flow = self._first(row, ["p_flow_1h", "prob_flow_1h"])
         p_momo = self._first(row, ["p_momo", "prob_momo", "prob_micro_momentum"])
-        probs = [p for p in [p_liq, p_bos, p_momo] if p is not None]
+        probs = [p for p in [p_liq, p_bos, p_flow, p_momo] if p is not None]
         return float(np.nanmean(probs)) if probs else 0.0
 
     def _meta_score(self, row: pd.Series) -> float:
         return self._first(row, ["prob_meta", "meta_prob"])
 
+    def _flow_score(self, row: pd.Series) -> float:
+        return self._first(row, ["p_flow_1h", "prob_flow_1h"])
+
     def _regime_score(self, row: pd.Series) -> float:
-        trend_up = self._first(row, ["p_trend_up"])
-        expansion = self._first(row, ["p_expansion"])
+        trend_up = self._first(row, ["p_trend_up", "p_regime_trend"])
+        expansion = self._first(row, ["p_expansion", "p_regime_expansion"])
         tox = self._first(row, ["toxicity_12h", "toxicity"])
         score = trend_up + 0.5 * expansion - 0.5 * tox
         return float(score)
@@ -99,21 +137,28 @@ class ConfluenceEngine:
               "passed": bool
             }
         """
-        session_w = self._session_weight(row.get("session", "other"))
+        session_w = self._session_weight(row)
 
-        score = (
+        raw_score = (
             self.weights["specialist"] * self._specialist_score(row)
             + self.weights["meta"] * self._meta_score(row)
+            + self.weights["flow"] * self._flow_score(row)
             + self.weights["rsv"] * self._regime_score(row)
             + self.weights["smc"] * self._smc_score(row)
         )
+        if self.normalize:
+            denom = sum(
+                self.weights[name] for name in ("specialist", "meta", "flow", "rsv", "smc")
+            )
+            raw_score = raw_score / max(denom, 1e-9)
 
-        score *= session_w
+        score = raw_score * session_w
         passed = score >= self.default_threshold
 
         LOG.debug(
-            "[ConfluenceEngine] score=%.4f passed=%s session_w=%.2f",
+            "[ConfluenceEngine] score=%.4f raw=%.4f passed=%s session_w=%.2f",
             score,
+            raw_score,
             passed,
             session_w,
         )

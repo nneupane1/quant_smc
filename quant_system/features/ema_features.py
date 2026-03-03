@@ -1,48 +1,59 @@
-"""
-EMA Feature Builder
--------------------
+"""EMA feature engineering with deterministic pandas and candle-list paths."""
 
-Builds high-quality EMA-derived features for all TFs:
-    - EMA values
-    - Slopes (percent change between bars)
-    - Distance-to-EMA normalized by ATR
-    - Z-scored distance
-    - EMA band regime (inside/outside ± k * ATR)
-    - Alignment flags (multi-TF trend agreement)
+from __future__ import annotations
 
-Supports:
-    15m, 1h, 6h, 12h
-"""
+from typing import Any, Dict, List, Optional
 
-from typing import Dict, List, Optional
+import numpy as np
+import pandas as pd
+
+from quant_system.config.config_loader import ConfigLoader
 from quant_system.data.store.datamodel import Candle
-from quant_system.utils.logger import log
+from quant_system.utils.logger import get_logger
+
+LOG = get_logger("ema_features")
 
 
 class EMAFeatureBuilder:
     """
     Compute EMA-based features for per-TF candle streams.
 
-    Parameters:
-        periods_by_tf: { "15m": [21,55], "1h":[50,200], ... }
-        band_k_atr: width of EMA band = EMA ± k * ATR
-        z_window: number of candles over which to compute z-score of distance
+    Accepted constructor inputs:
+      - `ConfigLoader`
+      - a merged config dict with `features.ema`
+      - a direct `{tf: [periods]}` mapping
     """
 
     def __init__(
         self,
-        periods_by_tf: Dict[str, List[int]],
+        periods_by_tf: Optional[Any] = None,
         band_k_atr: float = 1.5,
         z_window: int = 200,
     ):
-        self.periods_by_tf = periods_by_tf
-        self.band_k_atr = band_k_atr
-        self.z_window = z_window
+        cfg = self._resolve_cfg(periods_by_tf)
+        ema_cfg = cfg.get("features", {}).get("ema", {}) if isinstance(cfg, dict) else {}
 
-        log(
-            f"EMAFeatureBuilder initialized "
-            f"(band_k_atr={band_k_atr}, z_window={z_window})."
+        direct_periods = periods_by_tf if isinstance(periods_by_tf, dict) and "features" not in periods_by_tf else None
+        self.periods_by_tf = direct_periods or ema_cfg.get(
+            "periods",
+            {"15m": [21, 55], "1h": [50, 200], "6h": [100], "12h": [200]},
         )
+        self.band_k_atr = float(ema_cfg.get("band_k_atr", band_k_atr))
+        self.z_window = int(ema_cfg.get("z_window", z_window))
+
+        LOG.info(
+            "EMAFeatureBuilder initialized (band_k_atr=%s, z_window=%s).",
+            self.band_k_atr,
+            self.z_window,
+        )
+
+    @staticmethod
+    def _resolve_cfg(config_like: Optional[Any]) -> Dict[str, Any]:
+        if isinstance(config_like, ConfigLoader):
+            return config_like.load_yaml("features.yaml")
+        if isinstance(config_like, dict):
+            return config_like
+        return {}
 
     def _ema(self, prev: float, price: float, period: int) -> float:
         k = 2.0 / (period + 1.0)
@@ -77,10 +88,10 @@ class EMAFeatureBuilder:
             }
         """
 
-        log(f"Building EMA features for TF={tf}, count={len(candles):,}.")
+        LOG.info("Building EMA features for TF=%s, count=%s.", tf, len(candles))
 
         if tf not in self.periods_by_tf:
-            log(f"No EMA periods specified for TF={tf}. Returning empty result.")
+            LOG.info("No EMA periods specified for TF=%s. Returning empty result.", tf)
             return {}
 
         periods = self.periods_by_tf[tf]
@@ -149,12 +160,131 @@ class EMAFeatureBuilder:
 
             result[ts] = rec
 
-        log(f"EMA feature building complete for TF={tf}.")
+        LOG.info("EMA feature building complete for TF=%s.", tf)
         return result
 
-    # Pandas-friendly wrapper (placeholder passthrough for current pipeline)
-    def apply(self, df15, df1h=None, df6h=None, df12h=None):
+    @staticmethod
+    def _normalize_frame(df: pd.DataFrame) -> pd.DataFrame:
+        frame = df.copy()
+        frame.columns = [c.lower() for c in frame.columns]
+        if "dt" not in frame.columns:
+            if "timestamp" in frame.columns:
+                frame["dt"] = pd.to_datetime(frame["timestamp"], unit="s", utc=True)
+            else:
+                raise ValueError("EMAFeatureBuilder.apply requires `dt` or `timestamp`.")
+        frame["dt"] = pd.to_datetime(frame["dt"], utc=True)
+        for col in ("open", "high", "low", "close", "volume"):
+            if col in frame.columns:
+                frame[col] = pd.to_numeric(frame[col], errors="coerce")
+        return frame.sort_values("dt").reset_index(drop=True)
+
+    @staticmethod
+    def _atr(frame: pd.DataFrame, period: int = 14) -> pd.Series:
+        prev_close = frame["close"].shift(1)
+        tr = pd.concat(
+            [
+                frame["high"] - frame["low"],
+                (frame["high"] - prev_close).abs(),
+                (frame["low"] - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        return tr.rolling(period, min_periods=1).mean()
+
+    def _build_tf_frame(self, df: pd.DataFrame, tf: str) -> pd.DataFrame:
+        frame = self._normalize_frame(df)
+        periods = [int(p) for p in self.periods_by_tf.get(tf, [])]
+        if not periods:
+            return frame[["dt"]].copy()
+
+        out = frame[["dt"]].copy()
+        atr = frame["atr"] if "atr" in frame.columns else self._atr(frame)
+        close = frame["close"]
+
+        for p in periods:
+            ema = close.ewm(span=p, adjust=False, min_periods=1).mean()
+            slope = ema.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            dist = ((close - ema) / atr.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+            z = (
+                (dist - dist.rolling(self.z_window, min_periods=10).mean())
+                / dist.rolling(self.z_window, min_periods=10).std().replace(0, np.nan)
+            ).replace([np.inf, -np.inf], np.nan)
+
+            upper = ema + self.band_k_atr * atr
+            lower = ema - self.band_k_atr * atr
+            regime = pd.Series(0.0, index=frame.index)
+            regime = regime.mask(close > upper, 1.0)
+            regime = regime.mask(close < lower, -1.0)
+
+            out[f"ema_{p}_{tf}"] = ema
+            out[f"ema_slope_{p}_{tf}"] = slope
+            out[f"dist_ema_{p}_{tf}"] = dist
+            out[f"z_dist_ema_{p}_{tf}"] = z
+            out[f"band_regime_{p}_{tf}"] = regime
+
+        fast = periods[0]
+        slow = periods[-1]
+        out[f"ema_fast_{tf}"] = out[f"ema_{fast}_{tf}"]
+        out[f"ema_slow_{tf}"] = out[f"ema_{slow}_{tf}"]
+        out[f"dist_to_ema_{tf}"] = out[f"dist_ema_{fast}_{tf}"]
+        out[f"band_regime_{tf}"] = out[f"band_regime_{fast}_{tf}"]
+        out[f"ema_alignment_{tf}"] = (
+            (out[f"ema_fast_{tf}"] > out[f"ema_slow_{tf}"]).astype(int)
+            - (out[f"ema_fast_{tf}"] < out[f"ema_slow_{tf}"]).astype(int)
+        )
+        return out
+
+    @staticmethod
+    def _join(anchor: pd.DataFrame, ctx: pd.DataFrame) -> pd.DataFrame:
+        if ctx is None or ctx.empty:
+            return anchor
+        return pd.merge_asof(
+            anchor.sort_values("dt"),
+            ctx.sort_values("dt"),
+            on="dt",
+            direction="backward",
+            allow_exact_matches=False,
+        )
+
+    def apply(
+        self,
+        df15: pd.DataFrame,
+        df1h: Optional[pd.DataFrame] = None,
+        df6h: Optional[pd.DataFrame] = None,
+        df12h: Optional[pd.DataFrame] = None,
+    ) -> pd.DataFrame:
         """
-        Placeholder to keep pipeline moving; extend with pandas EMA features if needed.
+        Build EMA-derived features on each timeframe and project higher-TF EMA
+        state onto the 15m execution spine.
         """
-        return df15
+        if df15 is None or df15.empty:
+            return df15
+
+        out = self._build_tf_frame(df15, "15m")
+        base = self._normalize_frame(df15)
+        merged = base.merge(out, on="dt", how="left")
+
+        for tf, frame in (("1h", df1h), ("6h", df6h), ("12h", df12h)):
+            if frame is None or frame.empty:
+                continue
+            merged = self._join(merged, self._build_tf_frame(frame, tf))
+
+        periods_15m = [int(p) for p in self.periods_by_tf.get("15m", [])]
+        if periods_15m:
+            fast = periods_15m[0]
+            slow = periods_15m[-1]
+            merged["ema_fast"] = merged[f"ema_{fast}_15m"]
+            merged["ema_slow"] = merged[f"ema_{slow}_15m"]
+            merged["dist_ema"] = merged[f"dist_ema_{fast}_15m"]
+            merged["dist_to_ema"] = merged[f"dist_ema_{fast}_15m"]
+            merged["band_regime"] = merged[f"band_regime_{fast}_15m"]
+
+        if "ema_fast_1h" in merged.columns and "ema_slow_1h" in merged.columns:
+            merged["ema_rel_1h"] = (
+                (merged["ema_fast_1h"] - merged["ema_slow_1h"])
+                / merged["ema_slow_1h"].replace(0, np.nan)
+            )
+
+        if "timestamp" not in merged.columns:
+            merged["timestamp"] = (pd.to_datetime(merged["dt"], utc=True).astype("int64") // 10**9).astype("int64")
+        return merged

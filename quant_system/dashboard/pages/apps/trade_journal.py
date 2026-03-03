@@ -1,224 +1,123 @@
-import streamlit as st
+from __future__ import annotations
+
 import pandas as pd
-import numpy as np
-import json
-from pathlib import Path
-from quant_system.utils.logger import get_logger
+import streamlit as st
 
-LOG = get_logger("trade_journal")
+from quant_system.dashboard.data_access import DashboardContext
+from quant_system.dashboard.ui import metric_grid, page_header, section_title
 
 
-# ------------------------------------------------------------
-# Load journal data
-# ------------------------------------------------------------
-def _load_journal():
-    base = Path.cwd() / "backtest_outputs"
-    trades_file = base / "trades.csv"
-    reasoning_file = base / "reasoning.json"
+def _filter_trades(trades: pd.DataFrame) -> pd.DataFrame:
+    if trades.empty:
+        return trades
 
-    if not trades_file.exists():
-        return None, None
-
-    trades = pd.read_csv(trades_file)
-
-    reasoning = {}
-    if reasoning_file.exists():
-        with open(reasoning_file, "r") as f:
-            reasoning = json.load(f)
-
-    return trades, reasoning
-
-
-# ------------------------------------------------------------
-# Filters
-# ------------------------------------------------------------
-def _render_filters(trades):
-    st.sidebar.markdown("### Filters")
-
-    sides = st.sidebar.multiselect(
-        "Side",
-        ["long", "short"],
-        default=["long", "short"],
-    )
-
-    results = st.sidebar.multiselect(
-        "Outcome",
-        ["win", "loss"],
-        default=["win", "loss"],
-    )
-
-    sessions = st.sidebar.multiselect(
-        "Session",
-        sorted(trades["session"].dropna().unique().tolist()),
-        default=trades["session"].dropna().unique().tolist(),
-    )
-
-    regimes = st.sidebar.multiselect(
-        "Regime",
-        sorted(trades["regime"].dropna().unique().tolist()),
-        default=trades["regime"].dropna().unique().tolist(),
-    )
-
-    start_date = st.sidebar.date_input("Start Date", trades["entry_time"].min())
-    end_date = st.sidebar.date_input("End Date", trades["entry_time"].max())
-
-    moonshots = st.sidebar.checkbox("Only Moonshots (≥5R)", value=False)
+    sides = st.sidebar.multiselect("Side", sorted(trades["side"].dropna().unique()), default=sorted(trades["side"].dropna().unique()))
+    tiers = st.sidebar.multiselect("Tier", sorted(trades["tier"].dropna().unique()), default=sorted(trades["tier"].dropna().unique()))
+    sessions = st.sidebar.multiselect("Session", sorted(trades["session"].dropna().unique()), default=sorted(trades["session"].dropna().unique()))
+    regimes = st.sidebar.multiselect("Regime", sorted(trades["regime"].dropna().unique()), default=sorted(trades["regime"].dropna().unique()))
+    min_r = st.sidebar.slider("Min R", min_value=float(trades["r"].min()), max_value=float(max(trades["r"].max(), 1.0)), value=float(min(trades["r"].min(), 0.0)))
+    moonshots = st.sidebar.checkbox("Moonshots >= 5R", value=False)
 
     df = trades.copy()
-    df["entry_time"] = pd.to_datetime(df["entry_time"])
-
-    df = df[
-        (df["side"].isin(sides))
-        & (df["result"].isin(results))
-        & (df["session"].isin(sessions))
-        & (df["regime"].isin(regimes))
-        & (df["entry_time"] >= pd.Timestamp(start_date))
-        & (df["entry_time"] <= pd.Timestamp(end_date))
-    ]
-
+    mask = (
+        df["side"].isin(sides)
+        & df["tier"].isin(tiers)
+        & df["session"].isin(sessions)
+        & df["regime"].isin(regimes)
+        & (df["r"] >= min_r)
+    )
+    df = df.loc[mask]
     if moonshots:
-        df = df[df["realized_r"] >= 5.0]
-
+        df = df[df["r"] >= 5.0]
     return df
 
 
-# ------------------------------------------------------------
-# Trade Screenshot Panel
-# ------------------------------------------------------------
-def _chart_snapshot(time):
-    """
-    Injects JS command to make the TradingView chart jump to
-    the selected trade's timestamp.
-    """
-    js = f"""
-        <script>
-            if (window.tv_chart_jump) {{
-                window.tv_chart_jump({int(time)});
-            }}
-        </script>
-    """
-    st.markdown(js, unsafe_allow_html=True)
+def render_journal(theme_choice: str, model_version: str, *, context: DashboardContext) -> None:
+    trades = context.backtest["trades"]
+    reasoning = context.backtest["reasoning"]
 
-
-# ------------------------------------------------------------
-# Reasoning Tree Renderer
-# ------------------------------------------------------------
-def _reasoning_tree(reason):
-    if not reason:
-        st.info("No reasoning data for this trade.")
-        return
-
-    st.markdown(
-        """
-        <style>
-        .tree-box {
-            background:#111;
-            border:1px solid #333;
-            padding:10px;
-            border-radius:6px;
-            margin-bottom:10px;
-        }
-        .tree-key { font-weight:600; color:#cce3ff; }
-        .tree-val { color:#ddd; }
-        </style>
-        """,
-        unsafe_allow_html=True,
+    page_header(
+        "Trade Journal",
+        "Review the canonical backtest ledger with filters, reasoning payloads, and replay-ready timestamps.",
+        kicker="Post Trade Review",
     )
 
-    for k, v in reason.items():
-        st.markdown(
-            f"""
-            <div class="tree-box">
-                <div class="tree-key">{k}</div>
-                <div class="tree-val">{v}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-
-# ------------------------------------------------------------
-# Main Page Renderer
-# ------------------------------------------------------------
-def render_journal(theme_choice, model_version):
-    LOG.info("Rendering Trade Journal")
-
-    st.markdown(
-        """
-        <h1>Trade Journal</h1>
-        <span style="color:#888;">TradeZella-style Review • Reasoning • Snapshots • Filters</span>
-        <hr style="margin-top:12px;margin-bottom:20px;opacity:0.25;">
-        """,
-        unsafe_allow_html=True,
-    )
-
-    trades, reasoning = _load_journal()
-
-    if trades is None:
-        st.warning("No trades found. Run a backtest first.")
+    if trades.empty:
+        st.info("No trades found in the active backtest directory.")
         return
 
-    # Side filters
-    filtered = _render_filters(trades)
+    filtered = _filter_trades(trades)
+    metric_grid(
+        [
+            {"label": "Filtered Trades", "value": f"{len(filtered)}"},
+            {"label": "Win Rate", "value": f"{(filtered['pnl'] > 0).mean() * 100:.2f}%"},
+            {"label": "Avg R", "value": f"{filtered['r'].mean():.2f}"},
+            {"label": "PnL", "value": f"${filtered['pnl'].sum():,.2f}"},
+        ]
+    )
 
-    # Overview metrics
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Trades", len(filtered))
-    col2.metric("Win Rate", f"{filtered['result'].eq('win').mean()*100:.2f}%")
-    col3.metric("Avg R", f"{filtered['realized_r'].mean():.2f}")
-    col4.metric("PnL", f"{filtered['pnl'].sum():.2f}")
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # Master table
-    st.subheader("Trades")
+    section_title("Trade Ledger", "Filtered trade journal view")
     st.dataframe(
         filtered[
             [
-                "entry_time",
-                "exit_time",
+                "trade_id",
+                "entry_ts",
+                "exit_ts",
+                "asset",
                 "side",
-                "result",
-                "evr",
+                "tier",
+                "leg",
                 "conf",
-                "realized_r",
+                "evr",
+                "r",
                 "pnl",
                 "session",
                 "regime",
+                "reason",
             ]
         ],
-        height=300,
+        use_container_width=True,
+        hide_index=True,
     )
 
-    st.markdown("<hr>", unsafe_allow_html=True)
-
-    # Trade Detail Viewer
-    st.subheader("Trade Details")
-
-    trade_ids = filtered.index.tolist()
+    trade_ids = filtered["trade_id"].tolist()
     if not trade_ids:
-        st.info("No trades match the filters.")
+        st.info("No trades match the active filters.")
         return
 
-    selected_id = st.selectbox("Select Trade", trade_ids)
+    selected_trade_id = st.selectbox("Inspect Trade", trade_ids)
+    trade = filtered[filtered["trade_id"] == selected_trade_id].iloc[0]
+    detail_col, reason_col = st.columns([1.2, 1.1])
 
-    trade = filtered.loc[selected_id]
-    ts = pd.to_datetime(trade["entry_time"]).timestamp()
+    with detail_col:
+        section_title("Trade Detail", "Execution snapshot")
+        st.json(
+            {
+                "trade_id": trade["trade_id"],
+                "asset": trade["asset"],
+                "side": trade["side"],
+                "tier": trade["tier"],
+                "leg": trade["leg"],
+                "entry_ts": str(trade["entry_ts"]),
+                "exit_ts": str(trade["exit_ts"]),
+                "entry_price": trade["entry_price"],
+                "exit_price": trade["exit_price"],
+                "stop_price": trade["stop_price"],
+                "conf": trade["conf"],
+                "evr": trade["evr"],
+                "r": trade["r"],
+                "pnl": trade["pnl"],
+                "reason": trade["reason"],
+            }
+        )
 
-    # Left = chart snapshot | Right = reasoning tree
-    left, right = st.columns([3, 2])
+    with reason_col:
+        section_title("Reasoning Payload", "If recorded during backtest/forward execution")
+        payload = reasoning.get(str(selected_trade_id), {})
+        if payload:
+            st.json(payload)
+        else:
+            st.info("No reasoning payload stored for this trade.")
 
-    with left:
-        st.markdown("### Chart Snapshot")
-        _chart_snapshot(ts)
-
-    with right:
-        st.markdown("### Reasoning Tree")
-        tr_id = str(trade["trade_id"]) if "trade_id" in trade else str(selected_id)
-        reason = reasoning.get(tr_id, {})
-        _reasoning_tree(reason)
-
-    # Export
-    st.markdown("<br>", unsafe_allow_html=True)
-    csv = filtered.to_csv(index=False)
-    st.download_button("Export Filtered Trades (CSV)", csv, "trades_filtered.csv")
+    csv_data = filtered.to_csv(index=False).encode("utf-8")
+    st.download_button("Download Filtered Journal", csv_data, file_name="trade_journal.csv", mime="text/csv")

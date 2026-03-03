@@ -1,14 +1,26 @@
 /* Bloomberg-inspired theme */
-body {
-    background: #0A0A0C !important;
-    color: #F0F0F0 !important;
+:root {
+    --qs-bg: #090908;
+    --qs-surface: rgba(24, 16, 8, 0.84);
+    --qs-panel: rgba(19, 13, 8, 0.95);
+    --qs-panel-2: rgba(14, 11, 8, 0.96);
+    --qs-border: rgba(255, 160, 0, 0.16);
+    --qs-border-strong: rgba(255, 181, 46, 0.42);
+    --qs-text: #fff6df;
+    --qs-muted: #d3bf9a;
+    --qs-accent: #ffb000;
+    --qs-accent-2: #ffdf7a;
+    --qs-good: #4ce68a;
+    --qs-bad: #ff7b6b;
+    --qs-warn: #ffd166;
 }
 
-.block-container {
-    max-width: 1400px !important;
+.qs-hero {
+    background:
+        linear-gradient(130deg, rgba(255, 176, 0, 0.14), transparent 24%),
+        linear-gradient(180deg, rgba(20, 13, 8, 0.98), rgba(14, 10, 7, 0.94)) !important;
 }
 
-.stButton button {
-    background: #1e1e28 !important;
-    border: 1px solid #3a3a45 !important;
+[data-testid="metric-container"]::before {
+    background: linear-gradient(90deg, #ffb000, rgba(255, 176, 0, 0.08), transparent 75%);
 }

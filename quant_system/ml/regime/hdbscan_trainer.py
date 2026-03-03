@@ -21,8 +21,8 @@ from sklearn.preprocessing import StandardScaler
 
 try:
     import hdbscan  # type: ignore
-except Exception as e:  # pragma: no cover - hard dependency
-    raise ImportError("hdbscan is required for liquidity clustering") from e
+except Exception:  # pragma: no cover - optional dependency
+    hdbscan = None
 
 
 @dataclass
@@ -40,6 +40,8 @@ class HDBSCANConfig:
 
 class LiquidityClusterTrainer:
     def __init__(self, cfg: HDBSCANConfig):
+        if hdbscan is None:
+            raise ImportError("hdbscan is required for liquidity clustering")
         self.cfg = cfg
         self.model: Optional[hdbscan.HDBSCAN] = None
         self.scaler: Optional[StandardScaler] = None
@@ -133,4 +135,3 @@ class LiquidityClusterTrainer:
         with open(Path(out_dir) / "meta.json", "w", encoding="utf-8") as f:
             json.dump(self.meta_, f, indent=2)
         states.to_csv(Path(out_dir) / "states.csv", index=False)
-

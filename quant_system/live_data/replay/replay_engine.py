@@ -1,17 +1,11 @@
-"""
-replay_engine.py
-Master replay controller that drives:
- - ReplayStream
- - ReplayTimeline
- - ForwardEngine
- - Dashboard (JS + Streamlit)
+"""Historical replay driver aligned with the live forward loop."""
 
-Real-time playback with speed controls and asset switching.
-"""
+from __future__ import annotations
 
 import time
-import pandas as pd
 from typing import Dict
+
+import pandas as pd
 
 from quant_system.live_data.replay.replay_state import ReplayState
 from quant_system.live_data.replay.replay_stream import ReplayStream
@@ -19,84 +13,49 @@ from quant_system.live_data.replay.replay_timeline import ReplayTimeline
 
 
 class ReplayEngine:
-    """Full multi-asset historical replay engine."""
+    """Multi-asset historical replay engine with manual and autoplay stepping."""
 
-    def __init__(self, data: Dict[str, Dict[str, pd.DataFrame]],
-                 forward_engine,
-                 dashboard_adapter):
-
-        """
-        data = {
-            "BTCUSDT": {
-                "15m": df15m,
-                "1h": df1h,
-                "6h": df6h,
-                "12h": df12h
-            },
-            ...
-        }
-        """
-
+    def __init__(self, data: Dict[str, Dict[str, pd.DataFrame]], forward_engine, dashboard_adapter):
         self.states = {
-            asset: ReplayState(df["15m"], df["1h"], df["6h"], df["12h"])
+            asset: ReplayState(df.get("15m", pd.DataFrame()), df.get("1h", pd.DataFrame()), df.get("6h", pd.DataFrame()), df.get("12h", pd.DataFrame()))
             for asset, df in data.items()
         }
-
         self.forward = forward_engine
         self.dashboard = dashboard_adapter
         self.timeline = ReplayTimeline(self.states)
+        self.stream = ReplayStream(self.states, self.forward, self.dashboard)
 
-        # Playback config
-        self.speed = 1.0        # seconds per bar
+        self.speed = 1.0
         self.running = False
+        self.cursor = 0
 
-    # ----------------------------------------------------------
-    # START REPLAY
-    # ----------------------------------------------------------
     def start(self):
         self.running = True
-
-        while self.running:
-            any_left = False
-            for asset, st in self.states.items():
-                if st.has_next():
-                    any_left = True
-
-            if not any_left:
-                self.running = False
-                break
-
+        while self.running and self.cursor < self.timeline.length:
             self.step()
             time.sleep(self.speed)
 
-    # ----------------------------------------------------------
     def step(self):
-        """Single replay step: emit bars for all assets."""
-        if not self.running:
-            return
+        if self.cursor >= self.timeline.length:
+            self.running = False
+            return None
+        dt = self.timeline.dt_at(self.cursor)
+        emitted = self.stream.step_to(dt)
+        self.cursor += 1
+        if self.cursor >= self.timeline.length:
+            self.running = False
+        return emitted
 
-        stream = ReplayStream(self.states, self.forward, self.dashboard)
-        stream.step()
-
-    # ----------------------------------------------------------
     def stop(self):
         self.running = False
 
-    # ----------------------------------------------------------
     def set_speed(self, seconds_per_bar: float):
-        self.speed = max(0.01, seconds_per_bar)
+        self.speed = max(0.01, float(seconds_per_bar))
 
-    # ----------------------------------------------------------
     def seek(self, idx: int):
-        """Jump to timeline index."""
-        target_dt = self.timeline.dt_at(idx)
-        if not target_dt:
+        self.cursor = max(0, min(int(idx), max(self.timeline.length - 1, 0)))
+        target_dt = self.timeline.dt_at(self.cursor)
+        if target_dt is None:
             return
-
-        # reset pointers to the target index
-        for _, st in self.states.items():
-            df = st.frames["15m"]
-            # find row matching dt
-            row = df.index[df["dt"] == target_dt]
-            if len(row) > 0:
-                st.cursor = row[0]
+        for state in self.states.values():
+            state.seek_to(target_dt)

@@ -10,6 +10,7 @@ This panel:
 """
 
 import streamlit as st
+
 from quant_system.config.config_loader import ConfigLoader
 from quant_system.utils.logger import get_logger
 
@@ -22,9 +23,10 @@ class AssetSelector:
     def __init__(self, cfg: ConfigLoader, dashboard_adapter=None):
         self.cfg = cfg
         self.dashboard = dashboard_adapter
-        assets_cfg = cfg.load_yaml("assets.yaml")
-        self.assets = assets_cfg["assets"]["enabled"]
-        self.default = assets_cfg["default_asset"]
+        merged = cfg.load()
+        assets_cfg = merged.get("assets", {})
+        self.assets = assets_cfg.get("enabled", [])
+        self.default = assets_cfg.get("default_asset", self.assets[0] if self.assets else "BTCUSD")
 
         # persistent state
         if "active_asset" not in st.session_state:
@@ -85,7 +87,7 @@ class AssetSelector:
                     LOG.info(f"[Dashboard] Asset switched to {asset}")
 
                     # Notify backend engine
-                    if self.dashboard:
+                    if self.dashboard and hasattr(self.dashboard, "set_active_asset"):
                         self.dashboard.set_active_asset(asset)
 
                     # Broadcast to JS widgets (TV chart, panels)

@@ -1,21 +1,17 @@
-"""
-Kraken OHLC downloader with retry and CSV export.
-"""
+"""Kraken OHLC downloader with retry, compatibility fetches, and CSV export."""
 
+import csv
 import os
 import time
-import csv
-import requests
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 load_dotenv()
 
 from quant_system.data.ingest.api_retry import RetrySession
-from quant_system.data.store.data_model import Candle
 from quant_system.config.config_loader import ConfigLoader
-from quant_system.utils.logger import get_logger, log
+from quant_system.utils.logger import get_logger
 
 LOG = get_logger("kraken_client")
 
@@ -86,6 +82,96 @@ class KrakenClient:
             LOG.error(f"[KrakenClient] Exception fetching chunk -> {e}")
             return None
 
+    def _rows_to_dicts(
+        self,
+        chunk: List[List[Any]],
+        end_ts: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for row in chunk:
+            try:
+                ts = int(float(row[0]))
+                if end_ts is not None and ts > end_ts:
+                    continue
+                rows.append(
+                    {
+                        "timestamp": ts,
+                        "open": float(row[1]),
+                        "high": float(row[2]),
+                        "low": float(row[3]),
+                        "close": float(row[4]),
+                        "volume": float(row[6]),  # Kraken index 6 = volume
+                    }
+                )
+            except Exception as e:
+                LOG.error(f"[KrakenClient] Failed mapping row -> {e}")
+        return rows
+
+    def fetch_ohlcv(
+        self,
+        start_ts: int,
+        end_ts: int,
+        batch_sleep: float = 1.2,
+        interval: int = 1,
+    ) -> List[Dict[str, Any]]:
+        """
+        Compatibility fetch API used by the ingestion layer.
+        Returns normalized dict rows:
+            {timestamp, open, high, low, close, volume}
+        """
+        LOG.info(
+            f"[KrakenClient] Fetch OHLCV {self.asset} | interval={interval}m | "
+            f"{start_ts} -> {end_ts}"
+        )
+
+        rows: List[Dict[str, Any]] = []
+        seen_ts = set()
+        since = start_ts
+        last_progress_ts = start_ts
+        stale_steps = 0
+
+        while since <= end_ts:
+            fetched = self._fetch_chunk(interval, since)
+            if not fetched:
+                LOG.info("[KrakenClient] Empty chunk received, stopping fetch.")
+                break
+
+            raw_rows, last_id = fetched
+            chunk_rows = self._rows_to_dicts(raw_rows, end_ts=end_ts)
+            new_rows = 0
+
+            for row in chunk_rows:
+                ts = row["timestamp"]
+                if ts < start_ts or ts in seen_ts:
+                    continue
+                seen_ts.add(ts)
+                rows.append(row)
+                new_rows += 1
+                last_progress_ts = ts
+
+            if new_rows == 0:
+                stale_steps += 1
+                if stale_steps > 3:
+                    LOG.info("[KrakenClient] Fetch stalled after repeated empty progress.")
+                    break
+            else:
+                stale_steps = 0
+
+            next_since = int(last_id or 0)
+            if next_since <= since:
+                next_since = last_progress_ts + interval * 60
+            if next_since <= since:
+                LOG.info("[KrakenClient] Cursor did not advance; stopping fetch.")
+                break
+
+            since = next_since
+            if last_progress_ts >= end_ts:
+                break
+            time.sleep(batch_sleep)
+
+        LOG.info(f"[KrakenClient] Fetch complete | rows={len(rows):,}")
+        return rows
+
     # ----------------------------------------------------------------------
     # PUBLIC METHOD: DOWNLOAD FULL HISTORY
     # ----------------------------------------------------------------------
@@ -112,38 +198,48 @@ class KrakenClient:
             LOG.info(f"[KrakenClient] Created directory: {out_dir}")
 
         header_written = False
-        columns = ["timestamp", "open", "high", "low", "close", "volume"]
+        columns = ["dt", "timestamp", "open", "high", "low", "close", "volume"]
 
         with open(output_csv, "w", newline="") as f:
             writer = csv.writer(f)
 
             for year in range(start_year, end_year + 1):
+                start_ts = int(datetime(year, 1, 1).timestamp())
+                year_end = int(datetime(year + 1, 1, 1).timestamp()) - interval * 60
+                LOG.info(f"[KrakenClient] Fetching year {year}, range={start_ts} -> {year_end}")
 
-                since = int(datetime(year, 1, 1).timestamp())
-                LOG.info(f"[KrakenClient] Fetching year {year}, since={since}")
+                candles = self.fetch_ohlcv(
+                    start_ts=start_ts,
+                    end_ts=year_end,
+                    batch_sleep=1.2,
+                    interval=interval,
+                )
+                if not candles:
+                    LOG.info("[KrakenClient] Empty year result, continuing.")
+                    continue
 
-                while True:
-                    chunk = self._fetch_chunk(interval, since)
-                    if not chunk:
-                        LOG.info("[KrakenClient] Empty chunk received, stopping year.")
-                        break
+                if not header_written:
+                    writer.writerow(columns)
+                    header_written = True
 
-                    candles = self._map_chunk(chunk)
+                for row in candles:
+                    ts = row["timestamp"]
+                    writer.writerow(
+                        [
+                            datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M"),
+                            ts,
+                            row["open"],
+                            row["high"],
+                            row["low"],
+                            row["close"],
+                            row["volume"],
+                        ]
+                    )
 
-                    # Write header only once
-                    if not header_written:
-                        writer.writerow(columns)
-                        header_written = True
-
-                    for c in candles:
-                        writer.writerow([c.timestamp, c.open, c.high, c.low, c.close, c.volume])
-
-                    LOG.info(f"[KrakenClient]   Wrote {len(candles)} candles | last ts={candles[-1].timestamp}")
-
-                    since = candles[-1].timestamp
-
-                    # Kraken limit protections
-                    time.sleep(1.2)
+                LOG.info(
+                    f"[KrakenClient]   Wrote {len(candles)} candles | "
+                    f"last ts={candles[-1]['timestamp']}"
+                )
 
                 LOG.info(f"[KrakenClient] Completed year {year}")
 
@@ -175,14 +271,17 @@ class KrakenClient:
             os.makedirs(out_dir, exist_ok=True)
             LOG.info(f"[KrakenClient] Created directory: {out_dir}")
 
+        rows = self.fetch_ohlcv(
+            start_ts=start_ts,
+            end_ts=end_ts,
+            batch_sleep=1.2,
+            interval=interval,
+        )
+
         mode = "a" if append and os.path.exists(output_csv) else "w"
         header_needed = not (append and os.path.exists(output_csv))
-
         rows_written = 0
         last_ts = start_ts
-        seen_ts = set()
-        no_progress = 0
-        prev_since = None
 
         with open(output_csv, mode, newline="") as f:
             writer = csv.writer(f)
@@ -190,47 +289,21 @@ class KrakenClient:
             if header_needed:
                 writer.writerow(columns)
 
-            since = start_ts
-            while since <= end_ts:
-                fetched = self._fetch_chunk(interval, since)
-                if not fetched:
-                    LOG.info("[KrakenClient] Empty chunk received, stopping range fetch.")
-                    break
-
-                raw_rows, last_id = fetched
-                candles = self._map_chunk(raw_rows, end_ts=end_ts)
-                if not candles:
-                    no_progress += 1
-                    if no_progress > 3:
-                        LOG.info("[KrakenClient] No progress after multiple attempts; stopping.")
-                        break
-                    break
-                no_progress = 0
-
-                for ts, o, h, l, c, v in candles:
-                    if ts in seen_ts:
-                        continue
-                    seen_ts.add(ts)
-                    writer.writerow([
+            for row in rows:
+                ts = row["timestamp"]
+                writer.writerow(
+                    [
                         datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M"),
-                        ts, o, h, l, c, v
-                    ])
-                    rows_written += 1
-                    last_ts = ts
-
-                LOG.info(f"[KrakenClient]   Wrote {len(candles)} candles | last ts={last_ts}")
-
-                # Advance cursor using Kraken-provided last cursor
-                if last_id == prev_since:
-                    LOG.info("[KrakenClient] last cursor repeated; stopping to avoid loop.")
-                    break
-                prev_since = last_id
-                since = last_id
-                if since <= 0:
-                    since = last_ts + interval * 60
-                if last_ts >= end_ts:
-                    break
-                time.sleep(1.2)
+                        ts,
+                        row["open"],
+                        row["high"],
+                        row["low"],
+                        row["close"],
+                        row["volume"],
+                    ]
+                )
+                rows_written += 1
+                last_ts = ts
 
         LOG.info(f"[KrakenClient] DONE | rows={rows_written:,} | last_ts={last_ts}")
         return rows_written, last_ts
@@ -239,24 +312,14 @@ class KrakenClient:
     # MAP RAW KRAKEN CANDLES -> tuples for CSV
     # ----------------------------------------------------------------------
     def _map_chunk(self, chunk: List[List], end_ts: Optional[int] = None) -> List[tuple]:
-
-        mapped = []
-        for row in chunk:
-            try:
-                ts = int(row[0])
-                if end_ts is not None and ts > end_ts:
-                    continue
-                mapped.append(
-                    (
-                        ts,
-                        float(row[1]),
-                        float(row[2]),
-                        float(row[3]),
-                        float(row[4]),
-                        float(row[6]),  # Kraken: index 6 = volume
-                    )
-                )
-            except Exception as e:
-                LOG.error(f"[KrakenClient] Failed mapping row -> {e}")
-
-        return mapped
+        return [
+            (
+                row["timestamp"],
+                row["open"],
+                row["high"],
+                row["low"],
+                row["close"],
+                row["volume"],
+            )
+            for row in self._rows_to_dicts(chunk, end_ts=end_ts)
+        ]

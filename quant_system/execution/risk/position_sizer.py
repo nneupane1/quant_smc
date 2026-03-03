@@ -63,13 +63,20 @@ class PositionSizer:
         px = float(row["close"])
         stop_dist = abs(px - stop_price)
         if stop_dist <= 0:
-            return {"qty": 0.0, "hedge_qty": 0.0, "value": 0.0}
+            return {"qty": 0.0, "hedge_qty": 0.0, "value": 0.0, "risk_dollars": 0.0, "leverage_estimate": 0.0}
 
         qty = self._compute_qty(equity, risk_mode, stop_dist, px)
         qty = self._adjust_for_regime(qty, row)
         hedge_qty = max(qty * hedge_ratio, 0.0)
+        value = qty * px
 
-        return {"qty": qty, "hedge_qty": hedge_qty, "value": qty * px}
+        return {
+            "qty": qty,
+            "hedge_qty": hedge_qty,
+            "value": value,
+            "risk_dollars": qty * stop_dist,
+            "leverage_estimate": (value / equity) if equity > 0 else 0.0,
+        }
 
     # Compatibility shim
     def size(self, equity: float, risk_mode: float) -> float:

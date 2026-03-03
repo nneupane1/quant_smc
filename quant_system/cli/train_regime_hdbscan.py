@@ -10,9 +10,10 @@ Example:
 """
 
 import argparse
-from pathlib import Path
-import sys
 import json
+import sys
+from pathlib import Path
+
 import pandas as pd
 
 from quant_system.ml.regime.hdbscan_clustering import (
@@ -59,14 +60,15 @@ def main():
     if args.cseps is not None:
         cfg.cluster_selection_epsilon = args.cseps
     if args.features:
-        cfg.feature_cols = [c.strip() for c in args.features.split(",") if c.strip()]
+        cfg.features = [c.strip() for c in args.features.split(",") if c.strip()]
 
     trainer = HDBSCANClusterer(cfg)
-    report = trainer.fit(df)
+    clusters = trainer.fit(df)
+    report = trainer.report_
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    trainer.save(out_dir)
+    trainer.save(out_dir, args.asset, args.tf, clusters)
 
     with open(out_dir / "train_report.json", "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)

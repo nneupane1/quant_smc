@@ -26,13 +26,15 @@ class RegimeRules:
         self.min_prob = float(self.config.get("min_prob", 0.15))
 
     # --------------------------------------------------------------
-    def apply(self, regime_probs: dict, vol_pctile: float, session: str):
+    def apply(self, regime_probs: dict, vol_pctile: float, session: str, available_models=None):
         """
         Returns model_id or None.
         """
 
+        regime_probs = self._normalize_regime_probs(regime_probs)
         if not regime_probs:
             return None
+        available = set(available_models or [])
 
         # Highest-prob regime
         r = max(regime_probs, key=lambda k: regime_probs[k])
@@ -54,8 +56,25 @@ class RegimeRules:
             block = cfg
 
         prefer = block.get("prefer", [])
-        if prefer:
-            LOG.info(f"[RegimeRules] regime={r} → {prefer[0]}")
-            return prefer[0]
+        for candidate in prefer:
+            if not available or candidate in available:
+                LOG.info(f"[RegimeRules] regime={r} → {candidate}")
+                return candidate
 
         return None
+
+    def _normalize_regime_probs(self, regime_probs: dict):
+        if not isinstance(regime_probs, dict):
+            return {}
+
+        out = {}
+        for key, value in regime_probs.items():
+            if not isinstance(value, (int, float)):
+                continue
+            name = str(key)
+            if name.startswith("p_regime_"):
+                name = name.replace("p_regime_", "", 1)
+            elif name.startswith("regime_"):
+                name = name.replace("regime_", "", 1)
+            out[name] = float(value)
+        return out

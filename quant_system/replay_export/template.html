@@ -1,53 +1,56 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
     <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Replay Export</title>
-
     <style>
         /*__CSS__*/
     </style>
 </head>
-
 <body>
-
 <div id="container">
-
-    <div id="header">
-        <h2>Replay Export</h2>
-        <div id="controls">
-            <button id="btn-back">◀</button>
-            <button id="btn-play">⏵</button>
-            <button id="btn-pause">⏸</button>
-            <button id="btn-forward">▶</button>
-
-            <span style="margin-left:20px;">Speed:</span>
-            <input id="speed" type="range" min="1" max="60" value="24">
-
-            <span style="margin-left:20px;">Frame:</span>
-            <input id="frame-slider" type="range" min="0" max="1" value="0">
+    <header id="header">
+        <div class="title-block">
+            <div class="eyebrow">Replay Export</div>
+            <h1>Research Trace Viewer</h1>
+            <p>Standalone replay of candles, equity, trades, and reasoning.</p>
         </div>
-    </div>
+        <div id="controls">
+            <button id="btn-back" title="Back one frame">◀</button>
+            <button id="btn-play" title="Play">⏵</button>
+            <button id="btn-pause" title="Pause">⏸</button>
+            <button id="btn-forward" title="Forward one frame">▶</button>
+            <label>Speed <input id="speed" type="range" min="1" max="48" value="16"></label>
+            <label class="slider-wrap">Frame <input id="frame-slider" type="range" min="0" max="1" value="0"></label>
+            <span id="frame-badge">0 / 0</span>
+        </div>
+    </header>
 
-    <div id="chart-area">
-        <canvas id="ohlc-canvas"></canvas>
-        <canvas id="pnl-canvas"></canvas>
-    </div>
+    <main id="main">
+        <section id="chart-pane">
+            <div id="stats"></div>
+            <div id="chart-area">
+                <canvas id="ohlc-canvas"></canvas>
+                <canvas id="pnl-canvas"></canvas>
+            </div>
+        </section>
 
-    <div id="side-panel">
-        <h3>Reasoning</h3>
-        <div id="reasoning-panel"></div>
-    </div>
-
+        <aside id="side-panel">
+            <div class="panel-header">
+                <div class="eyebrow">Decision Trace</div>
+                <h2>Reasoning</h2>
+            </div>
+            <div id="reasoning-panel"></div>
+        </aside>
+    </main>
 </div>
 
 <script>
 const PAYLOAD = __DATA__;
 </script>
-
 <script>
 //__JS__
 </script>
-
 </body>
 </html>

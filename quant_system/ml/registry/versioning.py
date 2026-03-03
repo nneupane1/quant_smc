@@ -28,6 +28,9 @@ class ModelVersionManager:
                 return {}
 
     def _save(self):
+        parent = os.path.dirname(self.index_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(self.index_path, "w") as f:
             json.dump(self._versions, f, indent=2)
 

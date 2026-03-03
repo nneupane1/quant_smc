@@ -33,6 +33,9 @@ htmlcov/
 
 # Frontend
 node_modules/
+frontend/.next/
+frontend/out/
+frontend/.turbo/
 
 # Logs / runtime output
 logs/
@@ -68,3 +71,7 @@ reports/
 tmp/
 temp/
 *.bak
+.model_versions.json
+backtest_outputs/
+forward_outputs/
+live_outputs/

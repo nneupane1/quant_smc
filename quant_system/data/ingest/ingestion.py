@@ -1,27 +1,15 @@
-"""
-Data Ingestion Engine
----------------------
-
-Responsible for orchestrating:
-- Historical OHLCV downloads from KrakenClient
-- Writing raw 1-minute data to CSV
-- Validating ranges and detecting gaps
-- Logging detailed progress for transparency
-
-This file produces clean, append-friendly CSVs:
-./data/raw/BTCUSD_1m.csv
-"""
+"""Authoritative raw 1m ingestion orchestration for the data layer."""
 
 import os
-import csv
 import time
-from typing import List, Dict, Any
-from datetime import datetime
+from typing import Any, Dict, List, Optional
 
+from quant_system.config.config_loader import ConfigLoader
+from quant_system.data.ingest.builder import TimeframeBuilder
 from quant_system.data.ingest.kraken_client import KrakenClient
-from quant_system.utils.logger import log
-from quant_system.data.store.writer import CSVWriter
 from quant_system.data.store.datamodel import Candle
+from quant_system.data.store.writer import CSVWriter
+from quant_system.utils.logger import log
 
 
 class DataIngestion:
@@ -35,17 +23,45 @@ class DataIngestion:
         pair: str,
         start_ts: int,
         end_ts: int,
-        output_path: str,
-        batch_sleep: float = 0.5
+        output_path: Optional[str] = None,
+        tf_output_dir: Optional[str] = None,
+        batch_sleep: float = 1.2,
+        interval: int = 1,
+        conf_dir: str = "quant_system/config",
+        build_timeframes: bool = True,
     ):
-        self.client = KrakenClient(pair=pair)
+        self.config_loader = ConfigLoader(conf_dir=conf_dir)
+        self.asset_cfg = self.config_loader.load_yaml("assets.yaml")
+        self.storage_cfg = self.config_loader.load_yaml("storage.yaml").get("paths", {})
+        self.asset = self._resolve_asset_key(pair)
+
+        self.client = KrakenClient(config_loader=self.config_loader)
+        self.client.set_asset(self.asset)
         self.start_ts = start_ts
         self.end_ts = end_ts
-        self.output_path = output_path
+        self.interval = interval
+        self.output_path = output_path or os.path.join(
+            self.storage_cfg.get("raw_1m", "data/raw_1m"),
+            f"{self.asset}_1m.csv",
+        )
+        self.tf_output_dir = tf_output_dir or self.storage_cfg.get("tf", "data/tf")
         self.batch_sleep = batch_sleep
+        self.build_timeframes = build_timeframes
 
-        log(f"DataIngestion initialized for {pair} from {start_ts} to {end_ts}")
+        log(f"DataIngestion initialized for {self.asset} from {start_ts} to {end_ts}")
         log(f"Saving output to: {self.output_path}")
+        if self.build_timeframes:
+            log(f"Timeframe output dir: {self.tf_output_dir}")
+
+    def _resolve_asset_key(self, asset_or_pair: str) -> str:
+        if asset_or_pair in self.asset_cfg["metadata"]:
+            return asset_or_pair
+
+        for asset, meta in self.asset_cfg["metadata"].items():
+            if meta.get("kraken_pair") == asset_or_pair:
+                return asset
+
+        raise ValueError(f"Unknown asset or Kraken pair: {asset_or_pair}")
 
     # ------------------------------------------------------------
     def _ensure_dir(self) -> None:
@@ -54,6 +70,9 @@ class DataIngestion:
         if dirname and not os.path.exists(dirname):
             os.makedirs(dirname)
             log(f"Created directory: {dirname}")
+        if self.build_timeframes and self.tf_output_dir and not os.path.exists(self.tf_output_dir):
+            os.makedirs(self.tf_output_dir, exist_ok=True)
+            log(f"Created timeframe directory: {self.tf_output_dir}")
 
     # ------------------------------------------------------------
     def _normalize_rows(self, rows: List[Dict[str, Any]]) -> List[Candle]:
@@ -100,12 +119,13 @@ class DataIngestion:
         log("Validation complete.")
 
     # ------------------------------------------------------------
-    def run(self) -> None:
+    def run(self) -> Dict[str, Any]:
         """
         Execute ingestion:
         - Fetch all 1m data from Kraken
         - Normalize & validate rows
-        - Write to CSV
+        - Write raw 1m CSV
+        - Optionally build 15m / 1h / 6h / 12h CSVs
         """
 
         self._ensure_dir()
@@ -116,18 +136,41 @@ class DataIngestion:
         raw_rows = self.client.fetch_ohlcv(
             start_ts=self.start_ts,
             end_ts=self.end_ts,
-            batch_sleep=self.batch_sleep
+            batch_sleep=self.batch_sleep,
+            interval=self.interval,
         )
 
         log(f"Fetched {len(raw_rows):,} rows from Kraken. Normalizing...")
 
         candles = self._normalize_rows(raw_rows)
+        if not candles:
+            raise ValueError("No candles returned for requested window.")
 
         log("Validating dataset integrity.")
         self._validate(candles)
 
-        writer = CSVWriter(self.output_path)
+        writer = CSVWriter(self.output_path, append=False)
         writer.write_candles(candles)
+
+        tf_paths: Dict[str, str] = {}
+        if self.build_timeframes:
+            builder = TimeframeBuilder(
+                input_csv=self.output_path,
+                output_dir=self.tf_output_dir,
+                pair=self.asset,
+            )
+            builder.build()
+            tf_paths = {
+                tf: os.path.join(self.tf_output_dir, f"{self.asset}_{tf}.csv")
+                for tf in TimeframeBuilder.TF_MAP
+            }
 
         dt = time.time() - t0
         log(f"Ingestion completed in {dt:.2f} seconds.")
+        return {
+            "asset": self.asset,
+            "rows": len(candles),
+            "raw_1m_path": self.output_path,
+            "tf_paths": tf_paths,
+            "duration_sec": dt,
+        }

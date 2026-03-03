@@ -1,20 +1,28 @@
 """
 Report Builder
-Transforms backtest trade logs into daily/monthly summaries and renders Streamlit dashboards.
+Transforms backtest outputs into saved artifacts and an optional Streamlit view.
 """
 
-import pandas as pd
-import numpy as np
-import streamlit as st
+import json
 from pathlib import Path
+from typing import Dict, Optional
+
+import pandas as pd
+
 from quant_system.utils.logger import get_logger
 
 LOG = get_logger("report_builder")
 
 
-# ============================================================
-# UTILITY COLORING (green for profit, red for loss)
-# ============================================================
+def _optional_streamlit():
+    try:
+        import streamlit as st
+
+        return st
+    except Exception:
+        return None
+
+
 def _color_pnl(val):
     if val > 0:
         return "color: #00FF99;"
@@ -23,162 +31,143 @@ def _color_pnl(val):
     return "color: white;"
 
 
-# ============================================================
-# KPI PANEL RENDERER
-# ============================================================
-def _render_kpi_panels(df):
-    df["date"] = pd.to_datetime(df["entry_ts"]).dt.date
-    df["month"] = pd.to_datetime(df["entry_ts"]).dt.to_period("M")
-
-    current_equity = df["pnl"].fillna(0).cumsum().iloc[-1]
-    today = df["date"].iloc[-1]
-    month = df["month"].iloc[-1]
-
-    today_df = df[df["date"] == today]
-    month_df = df[df["month"] == month]
-
-    today_pnl = today_df["pnl"].sum()
-    month_pnl = month_df["pnl"].sum()
-    win_rate = (df["pnl"] > 0).mean() * 100
-    drawdown = df["pnl"].fillna(0).cumsum().cummax() - df["pnl"].fillna(0).cumsum()
-    max_dd = drawdown.max()
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-
-    c1.metric("Current Equity", f"{current_equity:,.2f}")
-    c2.metric("Today's PnL", f"{today_pnl:,.2f}")
-    c3.metric("This Month PnL", f"{month_pnl:,.2f}")
-    c4.metric("Win Rate", f"{win_rate:.2f}%")
-    c5.metric("Max Drawdown", f"{max_dd:,.2f}")
+def _daily_report(df: pd.DataFrame):
+    out = df.copy()
+    out["date"] = pd.to_datetime(out["entry_ts"]).dt.date
+    return (
+        out.groupby("date")
+        .agg(
+            pnl_sum=("pnl", "sum"),
+            trades=("pnl", "count"),
+            win_rate=("pnl", lambda x: (x > 0).mean() * 100),
+            avg_r=("r", "mean"),
+            best_r=("r", "max"),
+            worst_r=("r", "min"),
+        )
+        .reset_index()
+    )
 
 
-# ============================================================
-# DAILY TABLE AGGREGATION
-# ============================================================
-def _daily_report(df):
-    df["date"] = pd.to_datetime(df["entry_ts"]).dt.date
-
-    daily = df.groupby("date").agg(
-        pnl_sum=("pnl", "sum"),
-        trades=("pnl", "count"),
-        win_rate=("pnl", lambda x: (x > 0).mean() * 100),
-        avg_r=("r", "mean"),
-        best_r=("r", "max"),
-        worst_r=("r", "min"),
-    ).reset_index()
-
-    return daily
-
-
-# ============================================================
-# MONTHLY TABLE AGGREGATION
-# ============================================================
-def _monthly_report(df):
-    df["month"] = pd.to_datetime(df["entry_ts"]).dt.to_period("M")
-
-    monthly = df.groupby("month").agg(
-        pnl_sum=("pnl", "sum"),
-        trades=("pnl", "count"),
-        win_rate=("pnl", lambda x: (x > 0).mean() * 100),
-        avg_r=("r", "mean"),
-        best_r=("r", "max"),
-        worst_r=("r", "min"),
-    ).reset_index()
-
+def _monthly_report(df: pd.DataFrame):
+    out = df.copy()
+    out["month"] = pd.to_datetime(out["entry_ts"]).dt.to_period("M")
+    monthly = (
+        out.groupby("month")
+        .agg(
+            pnl_sum=("pnl", "sum"),
+            trades=("pnl", "count"),
+            win_rate=("pnl", lambda x: (x > 0).mean() * 100),
+            avg_r=("r", "mean"),
+            best_r=("r", "max"),
+            worst_r=("r", "min"),
+        )
+        .reset_index()
+    )
     monthly["month"] = monthly["month"].astype(str)
     return monthly
 
 
-# ============================================================
-# LEDGER TABLE (each trade)
-# ============================================================
-def _trade_ledger(df):
-    ledger = df.copy()
-    ledger["pnl_color"] = ledger["pnl"]
-    return ledger
+def _summary(df: pd.DataFrame, starting_equity: float = 0.0) -> Dict[str, float]:
+    pnl = df["pnl"].fillna(0.0)
+    equity = starting_equity + pnl.cumsum()
+    dd = equity - equity.cummax()
+    return {
+        "starting_equity": float(starting_equity),
+        "ending_equity": float(equity.iloc[-1]) if not equity.empty else float(starting_equity),
+        "total_pnl": float(pnl.sum()),
+        "win_rate": float((df["pnl"] > 0).mean()) if not df.empty else 0.0,
+        "max_drawdown": float(dd.min()) if not dd.empty else 0.0,
+        "trades": int(len(df)),
+    }
 
 
-# ============================================================
-# MAIN DASHBOARD
-# Called by Backtester when run completes
-# ============================================================
 def launch_dashboard(trade_log_path: Path):
-    """
-    Loads the backtest CSV and launches a Streamlit dashboard
-    with KPIs, daily/monthly stats, and full trade ledger.
-    """
-    LOG.info("Launching report dashboard")
+    st = _optional_streamlit()
+    if st is None:
+        raise RuntimeError("streamlit is required to launch the backtest dashboard.")
 
     if not trade_log_path.exists():
-        LOG.error(f"Trade log missing: {trade_log_path}")
-        return
+        raise FileNotFoundError(f"Trade log missing: {trade_log_path}")
 
     df = pd.read_csv(trade_log_path, parse_dates=["entry_ts", "exit_ts"])
-
     if df.empty:
-        LOG.error("Trade log empty.")
-        return
+        raise ValueError("Trade log is empty.")
 
-    st.markdown("""
-    <h1>Backtest Results Dashboard</h1>
-    <span style='color:#AAA;'>Live Summary • Daily Breakdown • Monthly Breakdown • Ledger</span>
-    <hr style='opacity:0.2;margin-top:10px;'>
-    """, unsafe_allow_html=True)
+    summary = _summary(df)
+    daily = _daily_report(df)
+    monthly = _monthly_report(df)
 
-    # KPI panels
-    _render_kpi_panels(df)
-    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown(
+        """
+        <h1>Backtest Results Dashboard</h1>
+        <span style='color:#AAA;'>Summary • Daily Breakdown • Monthly Breakdown • Ledger</span>
+        <hr style='opacity:0.2;margin-top:10px;'>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    # Daily
+    cols = st.columns(5)
+    cols[0].metric("Ending Equity", f"{summary['ending_equity']:,.2f}")
+    cols[1].metric("Total PnL", f"{summary['total_pnl']:,.2f}")
+    cols[2].metric("Trades", f"{summary['trades']}")
+    cols[3].metric("Win Rate", f"{summary['win_rate'] * 100:.2f}%")
+    cols[4].metric("Max Drawdown", f"{summary['max_drawdown']:,.2f}")
+
     st.subheader("Daily Performance")
-    daily = _daily_report(df)
-    st.dataframe(
-        daily.style.applymap(_color_pnl, subset=["pnl_sum"]),
-        height=300,
-        use_container_width=True
-    )
+    st.dataframe(daily.style.applymap(_color_pnl, subset=["pnl_sum"]), height=300, use_container_width=True)
 
-    # Monthly
     st.subheader("Monthly Performance")
-    monthly = _monthly_report(df)
-    st.dataframe(
-        monthly.style.applymap(_color_pnl, subset=["pnl_sum"]),
-        height=300,
-        use_container_width=True
-    )
+    st.dataframe(monthly.style.applymap(_color_pnl, subset=["pnl_sum"]), height=300, use_container_width=True)
 
-    # Full ledger
     st.subheader("Trade Ledger")
-    ledger = _trade_ledger(df)
-    st.dataframe(
-        ledger.style.applymap(_color_pnl, subset=["pnl"]),
-        height=500,
-        use_container_width=True
-    )
-
-    st.markdown("<hr>", unsafe_allow_html=True)
-    st.success("Backtest report generated successfully.")
+    st.dataframe(df.style.applymap(_color_pnl, subset=["pnl"]), height=500, use_container_width=True)
+    return {"summary": summary, "daily": daily, "monthly": monthly, "ledger": df}
 
 
-# ============================================================
-# EXTERNAL API FOR BACKTESTER.PY
-# ============================================================
-def build_report(df: pd.DataFrame, save_path: Path):
+def build_report(
+    df: pd.DataFrame,
+    save_path: Path,
+    *,
+    metrics: Optional[Dict] = None,
+    equity_df: Optional[pd.DataFrame] = None,
+    execution_log: Optional[pd.DataFrame] = None,
+    candles: Optional[pd.DataFrame] = None,
+    smc_features: Optional[pd.DataFrame] = None,
+    starting_equity: float = 0.0,
+):
     """
-    Used by backtester to save tables before dashboard is launched.
+    Save backtest artifacts for downstream dashboard/replay use.
     """
-
     LOG.info("Building standalone report artifacts")
-
-    daily = _daily_report(df)
-    monthly = _monthly_report(df)
-    ledger = df.copy()
-
-    # save
     save_path.mkdir(parents=True, exist_ok=True)
 
+    daily = _daily_report(df) if not df.empty else pd.DataFrame()
+    monthly = _monthly_report(df) if not df.empty else pd.DataFrame()
+    summary = metrics or _summary(df, starting_equity=starting_equity)
+
+    df.to_csv(save_path / "ledger.csv", index=False)
     daily.to_csv(save_path / "daily_report.csv", index=False)
     monthly.to_csv(save_path / "monthly_report.csv", index=False)
-    ledger.to_csv(save_path / "ledger.csv", index=False)
+    with open(save_path / "summary.json", "w") as f:
+        json.dump(summary, f, indent=2, default=str)
+
+    if equity_df is not None:
+        equity_df.to_csv(save_path / "equity_curve.csv", index=False)
+    if execution_log is not None:
+        execution_log.to_csv(save_path / "execution_log.csv", index=False)
+    if candles is not None:
+        candles.to_csv(save_path / "candles_15m.csv", index=False)
+    if smc_features is not None:
+        smc_features.to_csv(save_path / "smc_features.csv", index=False)
 
     LOG.info("Report artifacts saved.")
+    return {
+        "summary": save_path / "summary.json",
+        "ledger": save_path / "ledger.csv",
+        "daily": save_path / "daily_report.csv",
+        "monthly": save_path / "monthly_report.csv",
+        "equity_curve": save_path / "equity_curve.csv" if equity_df is not None else None,
+        "execution_log": save_path / "execution_log.csv" if execution_log is not None else None,
+        "candles": save_path / "candles_15m.csv" if candles is not None else None,
+        "smc_features": save_path / "smc_features.csv" if smc_features is not None else None,
+    }

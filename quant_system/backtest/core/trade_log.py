@@ -17,6 +17,32 @@ class TradeLog:
         self.trades: List[Dict[str, Any]] = []
         self._id_seq = count(1)
         LOG.info("TradeLog initialized.")
+        self._columns = [
+            "trade_id",
+            "asset",
+            "side",
+            "entry_ts",
+            "exit_ts",
+            "entry_price",
+            "exit_price",
+            "pnl",
+            "r",
+            "tier",
+            "conf",
+            "evr",
+            "risk",
+            "override",
+            "reason",
+            "stop_price",
+            "size_usd",
+            "qty",
+            "leg",
+            "regime",
+            "session",
+            "hazard_entry",
+            "gates",
+            "gate_reasons",
+        ]
 
     # ---------------------------------------------------------------
     def append_open(
@@ -29,6 +55,7 @@ class TradeLog:
         risk: float,
         leg: str = "core",
         regime: str = None,
+        session: str = None,
         hazard: float = None,
         gates: dict = None,
         gate_reasons: list = None,
@@ -54,6 +81,7 @@ class TradeLog:
             "qty": pos.qty,
             "leg": leg,
             "regime": regime,
+            "session": session,
             "hazard_entry": hazard,
             "gates": gates or {},
             "gate_reasons": gate_reasons or [],
@@ -99,4 +127,6 @@ class TradeLog:
 
     # ---------------------------------------------------------------
     def to_dataframe(self) -> pd.DataFrame:
+        if not self.trades:
+            return pd.DataFrame(columns=self._columns)
         return pd.DataFrame(self.trades)

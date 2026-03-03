@@ -139,7 +139,7 @@ class FVGDetector:
         if "timestamp" not in frame.columns:
             if "dt" not in frame.columns:
                 raise ValueError("FVGDetector.apply requires 'dt' or 'timestamp' column.")
-            frame["timestamp"] = pd.to_datetime(frame["dt"], utc=True).view("int64") // 10**9
+            frame["timestamp"] = pd.to_datetime(frame["dt"], utc=True).astype("int64") // 10**9
 
         for col in ("open", "high", "low", "close"):
             frame[col] = pd.to_numeric(frame[col], errors="coerce")
@@ -166,6 +166,8 @@ class FVGDetector:
             gap_top = gap_bot = gap_size = None
             fvg_is_broken = 0
             fvg_broken_level = np.nan
+            fvg_touch_flag = 0
+            fvg_filled_flag = 0
 
             # creation on this bar using c1 and c3 (current)
             if i >= 2:
@@ -197,11 +199,16 @@ class FVGDetector:
                 g["age"] += 1
                 mitigated = self._is_mitigated(g, c)
                 broken = self._is_broken(g, c)
+                touched = self._is_touched(g, c)
                 if last_ctx is not None and self._same_gap(g, last_ctx):
                     if broken and last_ctx["broken_i"] is None:
                         last_ctx["broken_i"] = i
                     if mitigated and last_ctx["mitigated_i"] is None:
                         last_ctx["mitigated_i"] = i
+                if touched:
+                    fvg_touch_flag = 1
+                if mitigated:
+                    fvg_filled_flag = 1
                 if broken and not mitigated:
                     fvg_is_broken = 1
                     fvg_broken_level = c.close
@@ -252,8 +259,22 @@ class FVGDetector:
                     "fvg_gap_top": gap_top,
                     "fvg_gap_bottom": gap_bot,
                     "fvg_gap_size": gap_size,
+                    "fvg_mid": (
+                        (gap_top + gap_bot) / 2.0
+                        if gap_top is not None and gap_bot is not None
+                        else np.nan
+                    ),
+                    "fvg_mid_price": (
+                        (gap_top + gap_bot) / 2.0
+                        if gap_top is not None and gap_bot is not None
+                        else np.nan
+                    ),
+                    "fvg_hi": gap_top,
+                    "fvg_lo": gap_bot,
                     "fvg_is_broken": int(fvg_is_broken),
                     "fvg_broken_level": fvg_broken_level,
+                    "fvg_touch_flag": int(fvg_touch_flag),
+                    "fvg_filled_flag": int(fvg_filled_flag),
                     "fvg_open_up": open_up,
                     "fvg_open_down": open_dn,
                     "fvg_open_total": open_up + open_dn,
@@ -295,6 +316,10 @@ class FVGDetector:
         if g["dir"] == "up":
             return c.close < (g["bottom"] - self.cfg.eps)
         return c.close > (g["top"] + self.cfg.eps)
+
+    def _is_touched(self, g: Dict, c: Candle) -> bool:
+        top, bot = g["top"], g["bottom"]
+        return (c.low <= top + self.cfg.eps) and (c.high >= bot - self.cfg.eps)
 
     def _same_gap(self, g: Dict, ctx: Dict) -> bool:
         return (

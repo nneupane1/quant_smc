@@ -1,168 +1,87 @@
-import streamlit as st
-import pandas as pd
-import json
+from __future__ import annotations
+
 import time
 
+import pandas as pd
+import streamlit as st
+
 from quant_system.backtest.replay_controller import ReplayController
-from quant_system.ml.model_registry import ModelRegistry
-from quant_system.utils.logger import get_logger
-from streamlit.components.v1 import html
-
-LOG = get_logger("replay_mode")
-
-# ------------------------------------------------------------------
-# Page Configuration
-# ------------------------------------------------------------------
-st.set_page_config(
-    page_title="Replay Mode",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-st.title("Backtest Replay Engine")
+from quant_system.dashboard.components.js.tv_chart.tv_chart import render_tv_chart
+from quant_system.dashboard.data_access import DashboardContext
+from quant_system.dashboard.ui import page_header, section_title
+from quant_system.ml.registry.model_registry import ModelRegistry
 
 
-# ------------------------------------------------------------------
-# UI Helpers
-# ------------------------------------------------------------------
-
-def load_backtest_artifacts(path_prefix: str):
-    """Loads candles, SMC, execution logs, model bundle."""
-    LOG.info(f"Loading backtest artifacts from {path_prefix}")
-
-    candles = pd.read_csv(f"{path_prefix}/candles_15m.csv", parse_dates=["timestamp"])
-    smc = pd.read_csv(f"{path_prefix}/smc_features.csv", parse_dates=["timestamp"])
-    exec_log = pd.read_csv(f"{path_prefix}/execution_log.csv")
-
-    registry = ModelRegistry()
-    model_bundle = registry.load_all_models(path_prefix)
-
-    conf = registry.load_yaml(f"{path_prefix}/config_used.yaml")
-
-    return candles, smc, exec_log, model_bundle, conf
-
-
-# ------------------------------------------------------------------
-# Sidebar Controls
-# ------------------------------------------------------------------
-with st.sidebar:
-    st.header("Replay Controls")
-
-    bt_path = st.text_input("Backtest folder", "backtest_output/latest")
-
-    if st.button("Load Backtest"):
-        st.session_state["loaded"] = True
-        st.session_state["bt_artifacts"] = load_backtest_artifacts(bt_path)
-        st.success("Backtest loaded.")
-
-    speed = st.slider("Playback Speed (ms per candle)", 150, 1500, 450, 50)
-
-    jump_ts = st.text_input("Jump to timestamp (YYYY-MM-DD HH:MM)")
-
-    col_jump = st.columns(2)
-    with col_jump[0]:
-        if st.button("Jump"):
-            st.session_state["jump_target"] = jump_ts
-    with col_jump[1]:
-        if st.button("Clear Jump"):
-            st.session_state["jump_target"] = None
-
-    st.markdown("---")
-    st.header("Actions")
-    play_clicked = st.button("Play / Stop")
-    next_clicked = st.button("Step →")
-    prev_clicked = st.button("← Step")
-
-
-# ------------------------------------------------------------------
-# Load Replay Controller
-# ------------------------------------------------------------------
-
-if "loaded" not in st.session_state or not st.session_state["loaded"]:
-    st.warning("Load a backtest to begin replay.")
-    st.stop()
-
-candles, smc, exec_log, model_bundle, config = st.session_state["bt_artifacts"]
-
-if "controller" not in st.session_state:
-    controller = ReplayController(
-        candles_15m=candles,
-        smc_features=smc,
-        execution_log=exec_log,
-        model_bundle=model_bundle,
-        config=config
-    )
-    st.session_state["controller"] = controller
-else:
-    controller = st.session_state["controller"]
-
-
-# ------------------------------------------------------------------
-# TradingView Replay Component (JS)
-# ------------------------------------------------------------------
-st.subheader("TradingView Replay")
-
-# Load the replay widget
-component_html = open("dashboard/streamlit_app/components/tv_replay/index.html").read()
-chart_area = html(component_html, height=680, scrolling=False)
-
-
-# ------------------------------------------------------------------
-# REPLAY ACTION LOGIC
-# ------------------------------------------------------------------
-
-# Jump to timestamp
-if st.session_state.get("jump_target"):
+def _registry(context: DashboardContext):
     try:
-        ts = pd.to_datetime(st.session_state["jump_target"])
-        controller.jump_to_timestamp(ts)
-        payload = controller.export_last_json()
-        js = f"<script>window.replay_load(`{payload}`);</script>"
-        st.markdown(js, unsafe_allow_html=True)
-    except Exception as e:
-        st.error(str(e))
+        if context.model_dir.exists():
+            return ModelRegistry(str(context.model_dir))
+    except Exception:
+        return None
+    return None
 
 
-# Step forward/back
-if next_clicked:
-    payload = controller.step_forward()
-    js = f"<script>window.replay_load(`{json.dumps(payload)}`);</script>"
-    st.markdown(js, unsafe_allow_html=True)
+def _controller(context: DashboardContext) -> ReplayController:
+    key = ("replay_controller", str(context.backtest_dir), str(context.model_dir))
+    cached_key = st.session_state.get("replay_controller_key")
+    if cached_key == key and "replay_controller" in st.session_state:
+        return st.session_state["replay_controller"]
 
-if prev_clicked:
-    payload = controller.step_backward()
-    js = f"<script>window.replay_load(`{json.dumps(payload)}`);</script>"
-    st.markdown(js, unsafe_allow_html=True)
-
-
-# Play / Stop
-if play_clicked:
-    if "playing" not in st.session_state:
-        st.session_state["playing"] = False
-
-    st.session_state["playing"] = not st.session_state["playing"]
-
-# Continuous playback loop
-if st.session_state.get("playing", False):
-    placeholder = st.empty()
-    for _ in range(len(candles)):
-        if not st.session_state.get("playing"):
-            break
-
-        payload = controller.step_forward()
-        js = f"<script>window.replay_load(`{json.dumps(payload)}`);</script>"
-        placeholder.markdown(js, unsafe_allow_html=True)
-
-        time.sleep(speed / 1000)
+    controller = ReplayController(
+        candles_15m=context.backtest["candles"],
+        smc_features=context.backtest["smc_features"],
+        execution_log=context.backtest["execution_log"] if not context.backtest["execution_log"].empty else context.backtest["trades"],
+        model_bundle=_registry(context),
+        config=context.config,
+    )
+    st.session_state["replay_controller"] = controller
+    st.session_state["replay_controller_key"] = key
+    st.session_state["replay_index"] = 0
+    return controller
 
 
-# ------------------------------------------------------------------
-# Lower Panel: Meta Information
-# ------------------------------------------------------------------
-st.markdown("---")
-st.subheader("Trade List")
+def render_replay_mode(theme_choice: str, model_version: str, *, context: DashboardContext) -> None:
+    if context.backtest["candles"].empty:
+        st.info("Replay requires saved candles in the active backtest directory.")
+        return
 
-if len(exec_log) > 0:
-    st.dataframe(exec_log)
-else:
-    st.info("No trades recorded in this backtest.")
+    page_header(
+        "Replay Mode",
+        "Candle-by-candle replay on top of the repaired backtest artifacts and current predictor stack.",
+        kicker="Replay Engine",
+    )
+    controller = _controller(context)
+    candles = context.backtest["candles"].copy()
+    candles["timestamp"] = pd.to_datetime(
+        candles["timestamp"] if "timestamp" in candles.columns else candles["dt"], errors="coerce"
+    )
+    max_idx = max(len(candles) - 1, 0)
+
+    controls = st.columns([1.1, 1.1, 1.1, 2.1])
+    if controls[0].button("Step Back", use_container_width=True):
+        controller.step_backward()
+    if controls[1].button("Step Forward", use_container_width=True):
+        controller.step_forward()
+    playing = controls[2].toggle("Auto Play", value=False)
+    speed_ms = controls[3].slider("Playback ms/bar", min_value=100, max_value=1500, value=350, step=50)
+
+    idx = st.slider("Replay Index", min_value=0, max_value=max_idx, value=int(controller.state.ptr), step=1)
+    if idx != controller.state.ptr:
+        controller.jump_to(idx)
+
+    if playing:
+        time.sleep(speed_ms / 1000.0)
+        controller.step_forward()
+        st.rerun()
+
+    payload = controller.render_payload()
+    window_start = max(0, controller.state.ptr - 120)
+    render_tv_chart(candles.iloc[window_start: controller.state.ptr + 1].copy(), key="replay_window")
+
+    left, right = st.columns([1.3, 1.1])
+    with left:
+        section_title("Replay Payload", "What the chart/reasoning layer sees at this step")
+        st.json(payload)
+    with right:
+        section_title("Events At Cursor", "Entries, exits, stops, and hedge events")
+        st.json(payload.get("trade", {}))
