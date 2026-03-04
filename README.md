@@ -1,11 +1,36 @@
 # Quant SMC
 
-Quant SMC is a research-to-execution crypto trading system built around a deterministic multi-timeframe feature graph, supervised specialist models, structured execution logic, and operator-facing telemetry. The project is designed so that research, backtest, forward test, live runtime, and dashboards all reason over the same `15m` decision spine with joined `1h`, `6h`, and `12h` context, rather than each runtime inventing its own view of the market.
+Quant SMC is a research-to-execution quantitative trading platform for crypto markets. It is built around a deterministic multi-timeframe feature graph, supervised specialist models, structured execution logic, and operator-facing telemetry. The system is designed so that research, backtest, forward test, live runtime, and dashboards all reason over the same `15m` decision spine with joined `1h`, `6h`, and `12h` context, rather than each runtime inventing its own version of market state.
 
-This repository now contains a repaired baseline that includes historical ingestion, feature engineering, label generation, model training, backtesting, forward simulation, live orchestration, a Streamlit research shell, and a `Next.js + FastAPI + WebSocket` operator terminal. The current tagged baseline is `v0.1.0`.
+This repository contains the repaired baseline of that platform: historical ingestion, feature engineering, label generation, model training, backtesting, forward simulation, live orchestration, a Streamlit research shell, and a `Next.js + FastAPI + WebSocket` operator terminal. The current tagged baseline is `v0.1.0`.
+
+## Executive Summary
+
+Quant SMC is not a single model and it is not a single dashboard. It is a layered decision system. Raw exchange data is normalized into canonical bars; canonical bars are transformed into engineered structural, statistical, and regime-aware features; those features are converted into supervised targets; specialist models and stackers are trained over those targets; runtime engines score new bars against the same feature contract; execution logic then combines gates, confluence, EVR, tiering, sizing, and trailing into a trade decision that can be inspected by an operator. The repo is therefore best understood as a full pipeline for building, validating, and operating a structured trading process.
+
+The central design promise of the project is research-to-execution parity. The same market state representation should feed backtests, forward simulation, live operation, and operator telemetry. That is the reason for the multi-timeframe contract, the repaired feature builder, the governed label tuning path, the versioned model registry, and the telemetry layer that exposes decision reasoning rather than only final alerts.
+
+## At A Glance
+
+| Dimension | Current Baseline |
+|---|---|
+| Market focus | Crypto spot / derivatives-style directional trading logic |
+| Primary asset launcher | `BTCUSD` |
+| Exchange integration | Kraken historical fetch and streaming paths |
+| Decision spine | `15m` |
+| Higher-timeframe context | `1h`, `6h`, `12h` |
+| Regime layer | `12h` HMM + HDBSCAN |
+| Main supervised layer | tabular specialists + stackers |
+| Forecast layer | quantile forecaster active, `NARX` deferred |
+| Runtime modes | backtest, forward, live |
+| UI surfaces | Streamlit research shell + Next terminal |
+| Telemetry transport | FastAPI + WebSocket |
+| Capital baseline | `20,000 USD` ticket policy with compounding and cooling |
 
 ## Table Of Contents
 
+- [Executive Summary](#executive-summary)
+- [At A Glance](#at-a-glance)
 - [1. Project Purpose](#1-project-purpose)
 - [2. What This System Actually Does](#2-what-this-system-actually-does)
 - [3. Core Design Principles](#3-core-design-principles)
@@ -26,6 +51,7 @@ This repository now contains a repaired baseline that includes historical ingest
 - [18. Expected Artifacts By Stage](#18-expected-artifacts-by-stage)
 - [19. Project Layout](#19-project-layout)
 - [20. Release Status And Current Caveats](#20-release-status-and-current-caveats)
+- [21. Troubleshooting And Operator Notes](#21-troubleshooting-and-operator-notes)
 
 ## 1. Project Purpose
 
@@ -80,6 +106,25 @@ This repo is wired around a fixed timeframe contract:
 This separation matters because the models and labels are not meant to answer the same question at every timeframe. `12h` is asking whether the environment is supportive. `6h` is asking whether price is sitting in a structurally meaningful location. `1h` is asking whether flow is fresh enough to matter. `15m` is asking whether to act now.
 
 ## 5. End-To-End Architecture
+
+### Architectural Flow
+
+```mermaid
+flowchart LR
+    A[Kraken Historical Fetch / Live Stream] --> B[Canonical 1m Bars]
+    B --> C[15m / 1h / 6h / 12h Rebuild]
+    C --> D[Multi-Timeframe Feature Graph]
+    D --> E[Label Builder]
+    D --> F[Inference Frame]
+    E --> G[Model Training]
+    G --> H[Registry + Versioned Artifacts]
+    H --> F
+    F --> I[Gates + Confluence + EVR + Tiering]
+    I --> J[Capital + Risk + Profit Ladder + Hazard]
+    J --> K[Backtest / Forward / Live]
+    K --> L[FastAPI + WebSocket Telemetry]
+    L --> M[Next Terminal / Streamlit Research Shell]
+```
 
 The high-level system loop is:
 
@@ -221,6 +266,23 @@ The current modeling contract is:
 | `15m` execution | supervised tabular specialists + stackers |
 | auxiliary forecast | quantile forecaster now; `NARX` reserved for later soft use only |
 
+### Training Contract
+
+The trained models in this repository are not interchangeable generic classifiers. Each one exists to answer a specific trading question over a specific slice of the engineered state space. The correct way to reason about the stack is therefore model-by-model rather than as a single monolith.
+
+| Model | Target | Feature Scope | Why It Exists | Main Runtime Use |
+|---|---|---|---|---|
+| `liq_flow` | `label_liq_flow` | `15m` execution row with joined HTF context | evaluate sweep/liquidity reaction quality | contributes to entry-quality assessment |
+| `bos_cont` | `label_bos_cont` | `15m` execution row with joined HTF context | evaluate continuation after structural break | continuation confidence |
+| `flow_1h` | `label_flow_1h` | `1h` flow features plus allowed `6h/12h` context | determine whether higher-timeframe impulse is fresh enough | flow readiness gating and ranking |
+| `momo` | `label_momo` | `15m` execution row | capture short-horizon directional energy | execution timing and near-term momentum |
+| `eop` | `label_eop` | `15m` execution row | estimate upside opportunity state | opportunity ranking and positive pressure |
+| `edp` | `label_edp` | `15m` execution row | estimate downside danger state | danger awareness and de-risking context |
+| `meta_model` | stack over specialists | specialist outputs | produce an integrated second-layer probability | downstream fusion input |
+| `confluence_model` | stack over specialists and meta | specialist outputs + meta outputs | represent the final learned decision strength | primary ranked confluence score |
+| `hazard` | `hazard_event`, `hazard_time` | `15m` execution row | estimate failure timing / exit risk | trailing, tightening, exit pressure |
+| `quantile` | direct future return distribution | `15m` execution row | estimate tail behavior and distribution shape | EV context, runner logic, risk shaping |
+
 ### Specialist Models
 
 The repo currently trains these specialist families:
@@ -253,6 +315,10 @@ On top of the specialist layer, the repo trains:
 - not used as a hard guardrail
 - not used for cooling triggers
 - not used to override the main `12h/6h/1h/15m` decision stack
+
+### Inference Contract
+
+At inference time, the predictor is expected to return a structured output rather than a single scalar. The downstream execution layer expects specialist probabilities, meta probability, confluence probability, hazard shape, and quantile outputs in a schema-stable form. That is why model registry artifacts persist their feature lists and why the predictor reads those persisted feature contracts instead of guessing from column names at runtime.
 
 ## 10. Execution, Risk, And Capital Logic
 
@@ -299,13 +365,30 @@ The repaired runtime now supports a more explicit trade-management structure:
 
 Historical execution and analytics are under `quant_system/backtest/`. The core backtester is the authoritative historical runtime path.
 
+Primary use:
+- research validation
+- trade distribution analysis
+- equity curve and drawdown analysis
+- replay exports and post-trade audit
+
 ### Forward Test
 
 The forward runtime in `quant_system/forward_test/` mirrors live-style decisioning on new bars without placing real exchange orders.
 
+Primary use:
+- pre-production runtime validation
+- model and execution parity checks
+- dashboard and reasoning inspection under fresh incoming data
+
 ### Live
 
 The live runtime in `quant_system/live/` mirrors the repaired forward logic and publishes structured telemetry. The transport architecture is moving toward a stricter shared event plane rather than independent console/UI logic.
+
+Primary use:
+- real-time alerting
+- execution intent generation
+- operator monitoring
+- telemetry publishing to the terminal and research surfaces
 
 ## 12. Dashboards, Terminal, And Telemetry
 
@@ -369,6 +452,18 @@ These can be inspected in both the Streamlit shell and the Next terminal.
 
 ## 13. Installation
 
+### Prerequisites
+
+The baseline environment assumes:
+
+| Component | Recommended |
+|---|---|
+| Python | `3.11` |
+| Node.js | `>= 20` |
+| Package manager | `pip` and `npm` |
+| Optional shell | `conda` recommended for isolation |
+| OS | macOS or Linux-like environment |
+
 ### Python
 
 ```bash
@@ -382,6 +477,22 @@ pip install -r requirements.txt
 ```bash
 cd frontend
 npm install
+```
+
+### Backend + Frontend Quick Start
+
+Once models and artifacts exist, the normal operator startup flow is:
+
+```bash
+python -m quant_system.cli.forward_cli --terminal-server
+cd frontend
+npm run dev
+```
+
+Optional research shell:
+
+```bash
+streamlit run quant_system/dashboard/app.py
 ```
 
 ### Note About Local Python
@@ -404,6 +515,17 @@ Frontend env template:
 - `NEXT_PUBLIC_TERMINAL_WS_URL=ws://127.0.0.1:8100/ws/terminal`
 
 Do not commit exchange credentials. The config-local `secrets.env` is a sensitive file and should not be treated as safe for source control.
+
+### Configuration Model
+
+The configuration system merges a base config, module configs, overrides, and environment substitutions into one unified runtime config. In practical terms, that means:
+
+1. `base.yaml` establishes the global baseline
+2. module YAMLs under `quant_system/config/` fill in data, features, labels, models, execution, and observability
+3. environment values can override placeholders
+4. runtime components read the merged contract rather than one-off local files
+
+This matters because the repo is trying to avoid per-script drift. Data, training, execution, and telemetry should all read the same resolved configuration model.
 
 ## 15. Main Entry Points
 
@@ -472,6 +594,18 @@ The cleanest manual workflow is:
 | 11 | `python train_BTCUSD_confluence_model.py` | Trains the confluence stacker. | `artifacts/train/BTCUSD/confluence_model/` |
 | 12 | `python train_BTCUSD_hazard_model.py` | Trains the hazard timing layer. | `artifacts/train/BTCUSD/hazard/` |
 | 13 | `python train_BTCUSD_quantile_model.py` | Trains the quantile forecaster. | `artifacts/train/BTCUSD/quantile/` |
+
+### Recommended Interpretation Of The Sequence
+
+This runbook is intentionally explicit. A professional workflow should make the dependency chain visible rather than hide it behind a single opaque command. The order matters because every downstream stage assumes a completed upstream contract:
+
+- training assumes engineered features and labels already exist
+- labels assume engineered features already exist
+- engineered features assume canonical timeframe bars already exist
+- runtime inference assumes versioned model artifacts already exist
+- dashboards become meaningfully informative only after runtime and model artifacts exist
+
+If a later stage fails, the right response is usually to inspect the expected outputs of the immediately previous stage rather than rerunning unrelated parts of the stack.
 
 ### Strict Sequence Warnings
 
@@ -611,3 +745,25 @@ This project is now best understood as a structured quant trading platform with:
 - governed tuning paths for key research assumptions
 
 It is not just a signal script. It is an evolving decision system whose design intent is to make research, execution, and operator judgment coherent with each other rather than separate worlds.
+
+## 21. Troubleshooting And Operator Notes
+
+### The Fetch Script Shows A 2016 UTC Start When I Asked For 2017 Berlin
+
+That is expected. `2017-01-01 00:00 Europe/Berlin` converts to `2016-12-31 23:00 UTC`. The fetch script logs both representations because Kraken requests are executed in UTC while the requested business boundary is Berlin-local.
+
+### `pandas` Or Another Dependency Is Missing When Running A Top-Level Script
+
+The BTCUSD launchers include a Python bootstrap helper and will try to re-exec into a compatible interpreter when possible. The preferred environment is still a dedicated project environment with `requirements.txt` installed.
+
+### Why Is `data/raw_1m/` Filling Before `data/tf/`?
+
+That is normal. For a long Kraken history job, the raw download and normalization step finishes first. The `15m`, `1h`, `6h`, and `12h` outputs are rebuilt after the raw stage completes.
+
+### Why Are Labels Using Default Horizons Unless Tuning Has Been Run?
+
+Because default label horizons are the stable production baseline. Tuning is a governed challenger path. Once a challenger profile is promoted, future label builds can automatically pick it up from the active label profile file.
+
+### Why Is `NARX` Not In The Main Runtime Yet?
+
+Because the current repo policy keeps `NARX` as a later soft-enhancement layer for ranking, runner handling, and moonshot logic only. It is intentionally not allowed to become a hard guardrail or a replacement for the main multi-timeframe supervised stack.
