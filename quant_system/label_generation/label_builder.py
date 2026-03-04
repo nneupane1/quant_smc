@@ -17,6 +17,7 @@ from quant_system.label_generation.utils import (
     compute_liq_flow_labels,
     compute_momo_labels,
 )
+from quant_system.label_generation.profile_manager import LabelProfileManager
 from quant_system.utils.logger import get_logger
 
 LOG = get_logger("label_builder")
@@ -25,7 +26,9 @@ LOG = get_logger("label_builder")
 class LabelBuilder:
     def __init__(self, config_loader: ConfigLoader):
         self.cfg_loader = config_loader
-        self.labels_cfg = config_loader.load_yaml("labels.yaml")["labels"]
+        default_cfg = config_loader.load_yaml("labels.yaml")["labels"]
+        self.profile_manager = LabelProfileManager()
+        self.labels_cfg = self.profile_manager.resolve_labels_cfg(default_cfg)
 
     def apply(self, df15: pd.DataFrame) -> pd.DataFrame:
         df = df15.copy()
