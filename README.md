@@ -149,6 +149,39 @@ or via the console script:
 quant-terminal-api
 ```
 
+## BTCUSD Runbook
+
+The cleanest manual workflow for this repo is to run the BTCUSD launchers in order. These scripts keep the pipeline explicit:
+
+- fetch and rebuild raw/timeframe data first
+- build engineered features next
+- build labels from those engineered features
+- train each model family with its own launcher
+
+| Step | Run | What it does | Main outputs |
+|---|---|---|---|
+| 1 | `python fetch_1m_BTCUSD_from_Kraken.py` | Fetches BTCUSD history from Kraken, using the Berlin-local window `2017-01-01 00:00` through yesterday `23:59:59`. For deep history it automatically switches from shallow OHLC paging to the trades-backed bootstrap path, then rebuilds canonical `1m`, `15m`, `1h`, `6h`, and `12h` files. | `data/raw_1m/BTCUSD_1m.csv`, `data/tf/BTCUSD_15m.csv`, `data/tf/BTCUSD_1h.csv`, `data/tf/BTCUSD_6h.csv`, `data/tf/BTCUSD_12h.csv` |
+| 2 | `python build_BTCUSD_features.py` | Runs the canonical feature builder over the timeframe CSVs. This is the feature-engineering stage that matters for training: SMC structure, regime context, EMA state, volatility, liquidity, session state, and joined higher-timeframe context are all materialized here. | `artifacts/features/BTCUSD/BTCUSD_features.csv` |
+| 3 | `python build_BTCUSD_labels.py` | Applies the canonical label builder on the engineered feature frame. This creates the supervised targets used by the specialist models, hazard models, and ranking stack. | `artifacts/labels/BTCUSD/BTCUSD_labels.csv` |
+| 4 | `python train_BTCUSD_liq_flow_model.py` | Trains the liquidity-flow specialist on the engineered BTCUSD feature set. Use this after features and labels are already built. | `artifacts/train/BTCUSD/liq_flow/`, model registry entries for `liq_flow` |
+| 5 | `python train_BTCUSD_bos_cont_model.py` | Trains the BOS continuation specialist. This model focuses on whether structure continuation setups are likely to follow through. | `artifacts/train/BTCUSD/bos_cont/`, model registry entries for `bos_cont` |
+| 6 | `python train_BTCUSD_flow_1h_model.py` | Trains the dedicated `1h` flow model, using the scoped higher-timeframe feature contract for flow quality and follow-through. | `artifacts/train/BTCUSD/flow_1h/`, model registry entries for `flow_1h` |
+| 7 | `python train_BTCUSD_momo_model.py` | Trains the short-horizon momentum specialist used in the `15m` execution stack. | `artifacts/train/BTCUSD/momo/`, model registry entries for `momo` |
+| 8 | `python train_BTCUSD_eop_model.py` | Trains the upside opportunity specialist (`EOP`), used to evaluate how favorable the forward opportunity distribution looks. | `artifacts/train/BTCUSD/eop/`, model registry entries for `eop` |
+| 9 | `python train_BTCUSD_edp_model.py` | Trains the downside danger specialist (`EDP`), used by confluence and risk logic to model adverse conditions. | `artifacts/train/BTCUSD/edp/`, model registry entries for `edp` |
+| 10 | `python train_BTCUSD_meta_model.py` | Trains the meta stacker on top of the specialist outputs. This is the first aggregation layer above the single-purpose specialist models. | `artifacts/train/BTCUSD/meta_model/`, model registry entries for `meta_model` |
+| 11 | `python train_BTCUSD_confluence_model.py` | Trains the confluence model that turns specialist outputs into the final scored trade-quality layer used by downstream ranking and gating. | `artifacts/train/BTCUSD/confluence_model/`, model registry entries for `confluence_model` |
+| 12 | `python train_BTCUSD_hazard_model.py` | Trains the discrete-time hazard stack used by trailing, danger detection, and exit timing logic. | `artifacts/train/BTCUSD/hazard/`, model registry entries for `hazard` |
+| 13 | `python train_BTCUSD_quantile_model.py` | Trains the quantile forecaster used for return-distribution and tail-shape estimates in risk and runner management. | `artifacts/train/BTCUSD/quantile/`, model registry entries for `quantile` |
+
+### Why This Order Matters
+
+- The training launchers are designed around engineered features, not raw exchange data.
+- `build_BTCUSD_features.py` is the step that turns raw Kraken data into the model-ready state space the rest of the repo expects.
+- `build_BTCUSD_labels.py` should be run after features, because labels are computed from those engineered states.
+- The specialist models should be trained before `meta_model` and `confluence_model`, because the stackers sit on top of specialist outputs.
+- `hazard` and `quantile` are downstream risk/exit layers and should be trained after the feature and label substrate is stable.
+
 ## Dashboards
 
 ### Streamlit research shell

@@ -75,8 +75,9 @@ class StructureContext:
         """
         pd_vals = []
         lookback = max(3, min(self.external_range_lookback, max(len(df_6h), 3)))
-        rolling_high = df_6h["high"].rolling(lookback, min_periods=5).max()
-        rolling_low = df_6h["low"].rolling(lookback, min_periods=5).min()
+        min_periods = max(1, min(5, lookback))
+        rolling_high = df_6h["high"].rolling(lookback, min_periods=min_periods).max()
+        rolling_low = df_6h["low"].rolling(lookback, min_periods=min_periods).min()
         for i in range(len(df_6h)):
             row = df_6h.iloc[i]
             pdv = row.get("pd_value", None)
@@ -109,7 +110,9 @@ class StructureContext:
         """
         vals = []
         range_pct = ((df_6h["high"] - df_6h["low"]) / df_6h["close"].replace(0, pd.NA)).astype(float)
-        range_roll = range_pct.rolling(20, min_periods=5).mean()
+        lookback = min(20, max(len(df_6h), 1))
+        min_periods = max(1, min(5, lookback))
+        range_roll = range_pct.rolling(lookback, min_periods=min_periods).mean()
         vol_drop_series = ((range_roll.shift(5) - range_roll) / range_roll.shift(5).replace(0, pd.NA)).fillna(0.0)
         for i in range(len(df_6h)):
             row = df_6h.iloc[i]

@@ -10,9 +10,11 @@ Implements:
 """
 
 from typing import Dict, List, Any, Tuple, Optional
+from contextlib import contextmanager
 import time
 from pathlib import Path
 import re
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -26,6 +28,7 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.exceptions import UndefinedMetricWarning
 
 try:
     import optuna
@@ -47,7 +50,13 @@ from quant_system.ml.predict.empirical_calibrator import EmpiricalCalibrator
 from quant_system.ml.registry.versioning import ModelVersionManager
 
 from quant_system.config.config_loader import ConfigLoader
-from quant_system.utils.logger import get_logger
+from quant_system.utils.logger import (
+    console_kv,
+    console_stage,
+    fmt_num,
+    fmt_seconds,
+    get_logger,
+)
 
 LOG = get_logger("model_trainer")
 
@@ -111,6 +120,105 @@ class ModelTrainer:
         self.versioner = ModelVersionManager(str(version_index))
 
         LOG.info("[ModelTrainer] Initialized (walk-forward + HPO)")
+
+    @staticmethod
+    @contextmanager
+    def _suppress_low_signal_warnings():
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
+            warnings.filterwarnings(
+                "ignore",
+                message="Skipping features without any observed values.*",
+                category=UserWarning,
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message="No positive class found in y_true.*",
+                category=UserWarning,
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message="Only one class is present in y_true.*",
+                category=UserWarning,
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message="The least populated class in y has only.*",
+                category=UserWarning,
+            )
+            yield
+
+    @staticmethod
+    def _display_name(name: str) -> str:
+        return str(name).replace("_", " ").upper()
+
+    def _log_training_header(
+        self,
+        name: str,
+        algo: str,
+        rows: int,
+        features: int,
+        class_counts: Optional[Dict[Any, Any]] = None,
+        trials: Optional[int] = None,
+    ) -> None:
+        payload = {
+            "model": self._display_name(name),
+            "algo": algo,
+            "rows": fmt_num(rows),
+            "features": fmt_num(features),
+        }
+        if trials is not None:
+            payload["trials"] = fmt_num(trials)
+        if class_counts is not None:
+            payload["class_mix"] = ", ".join(f"{k}:{v}" for k, v in sorted(class_counts.items()))
+        console_kv("Model Room", payload, style="magenta")
+
+    def _log_hpo_progress(
+        self,
+        name: str,
+        trial_number: int,
+        total_trials: int,
+        trial_value: float,
+        best_value: float,
+        started_at: float,
+        direction: str = "maximize",
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if direction == "minimize":
+            current_display = trial_value
+            best_display = best_value
+        else:
+            current_display = -trial_value
+            best_display = -best_value
+        payload = {
+            "model": self._display_name(name),
+            "trial": f"{trial_number}/{total_trials}",
+            "score": f"{current_display:.4f}",
+            "best": f"{best_display:.4f}",
+            "elapsed": fmt_seconds(time.perf_counter() - started_at),
+        }
+        if extra:
+            payload.update(extra)
+        console_kv("HPO Pulse", payload, style="bright_blue")
+
+    def _log_hpo_summary(
+        self,
+        name: str,
+        best_score: float,
+        best_params: Dict[str, Any],
+        started_at: float,
+        metric_label: str = "best_score",
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        payload = {
+            "model": self._display_name(name),
+            metric_label: f"{best_score:.4f}",
+            "elapsed": fmt_seconds(time.perf_counter() - started_at),
+            "params": best_params,
+        }
+        if extra:
+            payload.update(extra)
+        console_kv("HPO Summary", payload, style="green")
 
     @staticmethod
     def _midpoint(bounds, cast=float):
@@ -686,13 +794,27 @@ class ModelTrainer:
             LOG.info(f"[ModelTrainer] {name} class_weight={cw} counts={class_counts}")
         else:
             LOG.info(f"[ModelTrainer] {name} class counts={class_counts} (no weighting applied)")
+        self._log_training_header(
+            name=name,
+            algo=algo,
+            rows=len(X_df),
+            features=len(X_df.columns),
+            class_counts=class_counts,
+            trials=n_trials,
+        )
         # single-class guard: fall back to a constant predictor so pipeline doesn't explode
         if pd.Series(y).nunique() < 2:
             LOG.warning(f"[ModelTrainer] {name} target has single class; training DummyClassifier.")
+            console_stage(
+                f"{self._display_name(name)} single-class target",
+                f"class={next(iter(class_counts.keys())) if class_counts else 'n/a'} -> DummyClassifier",
+                status="warn",
+            )
             pre = self._build_preprocessor(num_cols, cat_cols)
             dummy = DummyClassifier(strategy="most_frequent")
             model = Pipeline([("pre", pre), ("clf", dummy)])
-            model.fit(X_df, y)
+            with self._suppress_low_signal_warnings():
+                model.fit(X_df, y)
             metrics = {"cv_score": None, "best_params": {}, "hpo_trials": 0, "class_counts": class_counts}
             return model, metrics
 
@@ -788,23 +910,25 @@ class ModelTrainer:
             model = Pipeline([("pre", pre), ("clf", base_model)])
             tscv = self._make_tscv(len(X_df), cv_splits)
             if tscv is None:
-                model.fit(X_df, y)
-                prob = self._positive_class_proba(model, X_df)
-                try:
-                    return float(average_precision_score(y, prob))
-                except Exception:
-                    return 0.5
+                with self._suppress_low_signal_warnings():
+                    model.fit(X_df, y)
+                    prob = self._positive_class_proba(model, X_df)
+                    try:
+                        return float(average_precision_score(y, prob))
+                    except Exception:
+                        return 0.5
             scores = []
             for tr_idx, va_idx in tscv.split(X_df):
                 Xt, Xv = X_df.iloc[tr_idx], X_df.iloc[va_idx]
                 yt, yv = y[tr_idx], y[va_idx]
-                model.fit(Xt, yt)
-                prob = self._positive_class_proba(model, Xv)
-                pr = average_precision_score(yv, prob)
-                try:
-                    auc = roc_auc_score(yv, prob)
-                except Exception:
-                    auc = 0.5
+                with self._suppress_low_signal_warnings():
+                    model.fit(Xt, yt)
+                    prob = self._positive_class_proba(model, Xv)
+                    pr = average_precision_score(yv, prob)
+                    try:
+                        auc = roc_auc_score(yv, prob)
+                    except Exception:
+                        auc = 0.5
                 scores.append(pr if not np.isnan(pr) else auc)
             return float(np.mean(scores))
 
@@ -814,14 +938,21 @@ class ModelTrainer:
             return -ts_score(params)
 
         def _cb(study, trial):
-            # periodic progress logging
             if trial.value is None:
                 return
-            if (trial.number % 5 == 0) or (trial.number + 1 == n_trials):
-                best = study.best_value
-                LOG.info(
-                    f"[ModelTrainer] {name} HPO trial {trial.number + 1}/{n_trials} "
-                    f"value={trial.value:.4f} best={best:.4f} elapsed={time.perf_counter() - hpo_t0:.1f}s"
+            should_log = (
+                trial.number == 0
+                or (trial.number + 1) == n_trials
+                or ((trial.number + 1) % max(1, min(5, n_trials // 4 or 1)) == 0)
+            )
+            if should_log:
+                self._log_hpo_progress(
+                    name=name,
+                    trial_number=trial.number + 1,
+                    total_trials=n_trials,
+                    trial_value=float(trial.value),
+                    best_value=float(study.best_value),
+                    started_at=hpo_t0,
                 )
 
         if optuna is None or n_trials <= 0:
@@ -830,18 +961,21 @@ class ModelTrainer:
             best_cv = ts_score(best_params)
         else:
             study = optuna.create_study(direction="minimize")
-            study.optimize(objective, n_trials=n_trials, show_progress_bar=False, callbacks=[_cb])
+            with self._suppress_low_signal_warnings():
+                study.optimize(objective, n_trials=n_trials, show_progress_bar=False, callbacks=[_cb])
             best_params = study.best_params
             best_cv = -study.best_value
             LOG.info(
                 f"[ModelTrainer] Best params {name}: {best_params} | cv_score={best_cv:.4f} "
                 f"HPO elapsed={time.perf_counter() - hpo_t0:.1f}s"
             )
+            self._log_hpo_summary(name, best_cv, best_params, hpo_t0)
             best_params = {k: v for k, v in best_params.items() if v is not None}
 
         pre = self._build_preprocessor(num_cols, cat_cols)
         final_model = Pipeline([("pre", pre), ("clf", build_model(best_params))])
-        final_model.fit(X_df, y)
+        with self._suppress_low_signal_warnings():
+            final_model.fit(X_df, y)
         metrics = {
             "cv_score": best_cv,
             "best_params": best_params,
@@ -866,7 +1000,8 @@ class ModelTrainer:
         if method in ("platt", "isotonic"):
             cv = max(3, min(5, len(y) // 200))
             calib = CalibratedClassifierCV(model, cv=cv, method="sigmoid" if method == "platt" else "isotonic")
-            calib.fit(X_df, y)
+            with self._suppress_low_signal_warnings():
+                calib.fit(X_df, y)
             return calib
 
         p_raw = self._positive_class_proba(model, X_df)
@@ -888,6 +1023,14 @@ class ModelTrainer:
         n_trials = int(cfg.get("hpo_trials", 10))
         cv_splits = int(cfg.get("cv_splits", 3))
         default_params = self._default_params_for_algo("logistic", hpo_space)
+        self._log_training_header(
+            name=f"{target_key}_stack",
+            algo="logistic_stack",
+            rows=len(df),
+            features=len(inputs),
+            class_counts=pd.Series(df[target_key].astype(int).values if target_key in df else df["label_liq_flow"].astype(int).values).value_counts().to_dict(),
+            trials=n_trials,
+        )
 
         base_cols = []
         for key in inputs:
@@ -950,16 +1093,18 @@ class ModelTrainer:
             model = build_meta(params)
             meta_tscv = self._make_tscv(len(meta_train), cv_splits)
             if meta_tscv is None:
-                model.fit(meta_train, y_train)
-                prob = self._positive_class_proba(model, meta_train)
-                return float(average_precision_score(y_train, prob))
+                with self._suppress_low_signal_warnings():
+                    model.fit(meta_train, y_train)
+                    prob = self._positive_class_proba(model, meta_train)
+                    return float(average_precision_score(y_train, prob))
             scores = []
             for tr_idx, va_idx in meta_tscv.split(meta_train):
                 Xt, Xv = meta_train[tr_idx], meta_train[va_idx]
                 yt, yv = y_train[tr_idx], y_train[va_idx]
-                model.fit(Xt, yt)
-                prob = self._positive_class_proba(model, Xv)
-                pr = average_precision_score(yv, prob)
+                with self._suppress_low_signal_warnings():
+                    model.fit(Xt, yt)
+                    prob = self._positive_class_proba(model, Xv)
+                    pr = average_precision_score(yv, prob)
                 scores.append(pr)
             return float(np.mean(scores))
 
@@ -969,17 +1114,49 @@ class ModelTrainer:
         if optuna is None or n_trials <= 0:
             LOG.warning("[ModelTrainer] Optuna unavailable for stacking; using default params=%s", default_params)
             best_params = default_params
+            hpo_t0 = time.perf_counter()
+            self._log_hpo_summary(
+                f"{target_key}_stack",
+                meta_score(best_params),
+                best_params,
+                hpo_t0,
+                extra={"mode": "default_params"},
+            )
         else:
             study = optuna.create_study(direction="minimize")
-            study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+            hpo_t0 = time.perf_counter()
+
+            def _cb(study, trial):
+                if trial.value is None:
+                    return
+                should_log = (
+                    trial.number == 0
+                    or (trial.number + 1) == n_trials
+                    or ((trial.number + 1) % max(1, min(5, n_trials // 4 or 1)) == 0)
+                )
+                if should_log:
+                    self._log_hpo_progress(
+                        name=f"{target_key}_stack",
+                        trial_number=trial.number + 1,
+                        total_trials=n_trials,
+                        trial_value=float(trial.value),
+                        best_value=float(study.best_value),
+                        started_at=hpo_t0,
+                    )
+
+            with self._suppress_low_signal_warnings():
+                study.optimize(objective, n_trials=n_trials, show_progress_bar=False, callbacks=[_cb])
             best_params = study.best_params
+            self._log_hpo_summary(f"{target_key}_stack", -study.best_value, best_params, hpo_t0)
 
         if np.unique(y_train).size < 2:
             final_meta = DummyClassifier(strategy="most_frequent")
-            final_meta.fit(meta_train, y_train)
+            with self._suppress_low_signal_warnings():
+                final_meta.fit(meta_train, y_train)
         else:
             final_meta = build_meta(best_params)
-            final_meta.fit(meta_train, y_train)
+            with self._suppress_low_signal_warnings():
+                final_meta.fit(meta_train, y_train)
         LOG.info(f"[ModelTrainer] Stacking model trained with params={best_params}")
         return final_meta, {"stack_inputs": inputs}
 
@@ -999,11 +1176,27 @@ class ModelTrainer:
             task_name="hazard",
         )
         models = {}
+        console_kv(
+            "Hazard Room",
+            {
+                "rows": fmt_num(len(X_all)),
+                "features": fmt_num(len(feature_cols)),
+                "horizon_bins": fmt_num(horizon),
+                "trials_per_bin": fmt_num(hpo_trials),
+            },
+            style="yellow",
+        )
 
         for b in range(1, horizon + 1):
             y_bin = ((event == 1) & (tte <= b)).astype(int)
             if y_bin.mean() < cfg.get("min_event_fraction", 0.005):
                 continue
+            if b == 1 or b == horizon or b % max(1, horizon // 6) == 0:
+                console_stage(
+                    f"Hazard bin {b}/{horizon}",
+                    f"event_rate={y_bin.mean():.4f}",
+                    status="info",
+                )
 
             def param_space(trial):
                 return {
@@ -1021,22 +1214,25 @@ class ModelTrainer:
                 model = Pipeline([("pre", pre), ("clf", base)])
                 tscv = self._make_tscv(len(X_all), cv_splits)
                 if tscv is None:
-                    model.fit(X_all, y_bin)
-                    prob = self._positive_class_proba(model, X_all)
-                    return -float(average_precision_score(y_bin, prob))
+                    with self._suppress_low_signal_warnings():
+                        model.fit(X_all, y_bin)
+                        prob = self._positive_class_proba(model, X_all)
+                        return -float(average_precision_score(y_bin, prob))
                 scores = []
                 for tr_idx, va_idx in tscv.split(X_all):
                     Xt, Xv = X_all.iloc[tr_idx], X_all.iloc[va_idx]
                     yt, yv = y_bin[tr_idx], y_bin[va_idx]
-                    model.fit(Xt, yt)
-                    prob = self._positive_class_proba(model, Xv)
-                    pr = average_precision_score(yv, prob)
+                    with self._suppress_low_signal_warnings():
+                        model.fit(Xt, yt)
+                        prob = self._positive_class_proba(model, Xv)
+                        pr = average_precision_score(yv, prob)
                     scores.append(pr)
                 return -float(np.mean(scores))
 
             if cfg.get("hpo", {}).get("enabled", True) and optuna is not None and hpo_trials > 0:
                 study = optuna.create_study(direction="minimize")
-                study.optimize(objective, n_trials=hpo_trials, show_progress_bar=False)
+                with self._suppress_low_signal_warnings():
+                    study.optimize(objective, n_trials=hpo_trials, show_progress_bar=False)
                 best_C = study.best_params["C"]
             else:
                 best_C = float(default_params["C"])
@@ -1044,7 +1240,8 @@ class ModelTrainer:
             clf = LogisticRegression(C=float(best_C), max_iter=400, penalty="l2", solver="lbfgs")
             pre = self._build_preprocessor(num_cols, cat_cols)
             pipe = Pipeline([("pre", pre), ("clf", clf)])
-            pipe.fit(X_all, y_bin)
+            with self._suppress_low_signal_warnings():
+                pipe.fit(X_all, y_bin)
             models[b] = pipe
 
         LOG.info(f"[ModelTrainer] Hazard model trained with {len(models)} bins.")
@@ -1072,9 +1269,23 @@ class ModelTrainer:
         returns = returns.loc[valid_mask].astype(float).values
 
         models = {}
+        console_kv(
+            "Quantile Room",
+            {
+                "rows": fmt_num(len(X_all)),
+                "features": fmt_num(len(feature_cols)),
+                "quantiles": ", ".join(str(q) for q in quantiles),
+                "algo": algo,
+                "trials": fmt_num(n_trials),
+            },
+            style="cyan",
+        )
 
         for q in quantiles:
             LOG.info(f"[ModelTrainer] Training quantile model q={q}")
+            q_name = f"quantile_{q}"
+            q_t0 = time.perf_counter()
+            console_stage(f"Quantile q={q}", f"algo={algo}", status="info")
 
             def param_space(trial):
                 params = {
@@ -1146,33 +1357,75 @@ class ModelTrainer:
                 model = Pipeline([("pre", pre), ("reg", base_model)])
                 tscv = self._make_tscv(len(X_all), cv_splits)
                 if tscv is None:
-                    model.fit(X_all, returns)
-                    pred = model.predict(X_all)
-                    e = returns - pred
-                    return float(np.mean(np.maximum(q * e, (q - 1) * e)))
+                    with self._suppress_low_signal_warnings():
+                        model.fit(X_all, returns)
+                        pred = model.predict(X_all)
+                        e = returns - pred
+                        return float(np.mean(np.maximum(q * e, (q - 1) * e)))
                 losses = []
                 for tr_idx, va_idx in tscv.split(X_all):
                     Xt, Xv = X_all.iloc[tr_idx], X_all.iloc[va_idx]
                     yt, yv = returns[tr_idx], returns[va_idx]
-                    model.fit(Xt, yt)
-                    pred = model.predict(Xv)
-                    e = yv - pred
-                    pinball = np.mean(np.maximum(q * e, (q - 1) * e))
+                    with self._suppress_low_signal_warnings():
+                        model.fit(Xt, yt)
+                        pred = model.predict(Xv)
+                        e = yv - pred
+                        pinball = np.mean(np.maximum(q * e, (q - 1) * e))
                     losses.append(pinball)
                 return float(np.mean(losses))
 
             if optuna is None or n_trials <= 0:
                 LOG.warning("[ModelTrainer] Optuna unavailable for quantile q=%s; using default params=%s", q, default_params)
                 best_params = default_params
+                console_stage(
+                    f"Quantile q={q} default params",
+                    f"trials={n_trials} -> using midpoint defaults",
+                    status="warn",
+                )
             else:
                 study = optuna.create_study(direction="minimize")
-                study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+                def _cb(study, trial):
+                    if trial.value is None:
+                        return
+                    should_log = (
+                        trial.number == 0
+                        or (trial.number + 1) == n_trials
+                        or ((trial.number + 1) % max(1, min(5, n_trials // 4 or 1)) == 0)
+                    )
+                    if should_log:
+                        self._log_hpo_progress(
+                            name=q_name,
+                            trial_number=trial.number + 1,
+                            total_trials=n_trials,
+                            trial_value=float(trial.value),
+                            best_value=float(study.best_value),
+                            started_at=q_t0,
+                            direction="minimize",
+                            extra={"objective": "pinball"},
+                        )
+
+                with self._suppress_low_signal_warnings():
+                    study.optimize(objective, n_trials=n_trials, show_progress_bar=False, callbacks=[_cb])
                 best_params = study.best_params
+                self._log_hpo_summary(
+                    q_name,
+                    float(study.best_value),
+                    best_params,
+                    q_t0,
+                    metric_label="best_loss",
+                    extra={"objective": "pinball"},
+                )
 
             base_final = build_quantile_model(best_params)
             pre = self._build_preprocessor(num_cols, cat_cols)
             pipe = Pipeline([("pre", pre), ("reg", base_final)])
-            pipe.fit(X_all, returns)
+            with self._suppress_low_signal_warnings():
+                pipe.fit(X_all, returns)
             models[f"q_{q}"] = pipe
+            console_stage(
+                f"Quantile q={q} ready",
+                f"elapsed={fmt_seconds(time.perf_counter() - q_t0)}",
+                status="success",
+            )
 
         return models, {"quantiles": quantiles, "features": feature_cols}

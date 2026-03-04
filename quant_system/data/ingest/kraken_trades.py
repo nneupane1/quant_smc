@@ -10,12 +10,20 @@ import os
 import csv
 import time
 import requests
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 from datetime import datetime
 
-from quant_system.utils.logger import get_logger
+try:  # pragma: no cover - optional pretty progress
+    from rich.console import Console
+    from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+except Exception:  # pragma: no cover
+    Console = None
+    Progress = None
+
+from quant_system.utils.logger import console_stage, fmt_num, fmt_seconds, get_logger
 
 LOG = get_logger("kraken_trades")
+RICH_CONSOLE = Console() if Console is not None else None
 
 
 class KrakenTradesDownloader:
@@ -68,6 +76,35 @@ class KrakenTradesDownloader:
         cur = start_cursor
         rows_written = 0
         seen = set()
+        start_ts = float(start_cursor) / 1_000_000_000.0
+        total_span = max(float(end_ts) - start_ts, 1.0)
+        batch_no = 0
+        milestone_key: Optional[str] = None
+        started_at = time.perf_counter()
+
+        progress = None
+        task_id = None
+        if Progress is not None and RICH_CONSOLE is not None:
+            progress = Progress(
+                SpinnerColumn(style="bright_cyan"),
+                TextColumn("[bold bright_cyan]Kraken trades[/bold bright_cyan]"),
+                BarColumn(bar_width=32),
+                TaskProgressColumn(),
+                TextColumn("[white]{task.fields[window]}[/white]"),
+                TextColumn("[magenta]{task.fields[rows]} rows[/magenta]"),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                console=RICH_CONSOLE,
+                transient=False,
+            )
+            progress.start()
+            task_id = progress.add_task(
+                "download",
+                total=total_span,
+                completed=0.0,
+                window="-",
+                rows="0",
+            )
 
         with open(output_csv, mode, newline="") as f:
             w = csv.writer(f)
@@ -75,18 +112,33 @@ class KrakenTradesDownloader:
                 w.writerow(["dt", "timestamp", "price", "volume", "side"])
 
             while True:
+                batch_no += 1
                 trades, last = self.fetch(cur)
                 if not trades:
-                    LOG.info("[Trades] no trades returned, stopping.")
+                    console_stage("Trades download stopped", "no trades returned", status="warn")
                     break
 
+                batch_last_ts: Optional[float] = None
                 for t in trades:
                     price = float(t[0])
                     volume = float(t[1])
                     ts = float(t[2])
+                    batch_last_ts = ts
                     side = t[3]  # b/s
                     if ts > end_ts:
-                        LOG.info("[Trades] reached end_ts, stopping.")
+                        if progress is not None and task_id is not None:
+                            progress.update(
+                                task_id,
+                                completed=total_span,
+                                window=datetime.utcfromtimestamp(end_ts).strftime("%Y-%m"),
+                                rows=fmt_num(rows_written),
+                            )
+                            progress.stop()
+                        console_stage(
+                            "Trades download complete",
+                            f"rows={fmt_num(rows_written)} elapsed={fmt_seconds(time.perf_counter() - started_at)}",
+                            status="ok",
+                        )
                         return rows_written, ts
                     key = (ts, price, volume, side)
                     if key in seen:
@@ -101,12 +153,49 @@ class KrakenTradesDownloader:
                     ])
                     rows_written += 1
 
-                LOG.info(f"[Trades] wrote {rows_written} rows so far | last cursor={last}")
+                if batch_last_ts is not None:
+                    current_month = datetime.utcfromtimestamp(batch_last_ts).strftime("%Y-%m")
+                    if current_month != milestone_key:
+                        milestone_key = current_month
+                        console_stage(
+                            "History milestone",
+                            (
+                                f"{current_month} | rows={fmt_num(rows_written)} "
+                                f"cursor={last}"
+                            ),
+                            status="info",
+                        )
+
+                    if progress is not None and task_id is not None:
+                        completed = max(0.0, min(batch_last_ts, float(end_ts)) - start_ts)
+                        progress.update(
+                            task_id,
+                            completed=completed,
+                            window=current_month,
+                            rows=fmt_num(rows_written),
+                        )
+                    elif batch_no == 1 or batch_no % 25 == 0:
+                        pct = (max(0.0, min(batch_last_ts, float(end_ts)) - start_ts) / total_span) * 100.0
+                        console_stage(
+                            "Trades progress",
+                            (
+                                f"{pct:5.1f}% | month={current_month} | rows={fmt_num(rows_written)} "
+                                f"| elapsed={fmt_seconds(time.perf_counter() - started_at)}"
+                            ),
+                            status="info",
+                        )
 
                 if last == cur:
-                    LOG.info("[Trades] cursor did not advance; stopping.")
+                    console_stage("Trades download stopped", "cursor did not advance", status="warn")
                     break
                 cur = last
                 time.sleep(sleep)
 
+        if progress is not None and task_id is not None:
+            progress.stop()
+        console_stage(
+            "Trades download complete",
+            f"rows={fmt_num(rows_written)} elapsed={fmt_seconds(time.perf_counter() - started_at)}",
+            status="ok",
+        )
         return rows_written, cur
