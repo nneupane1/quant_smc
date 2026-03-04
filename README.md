@@ -182,6 +182,52 @@ The cleanest manual workflow for this repo is to run the BTCUSD launchers in ord
 - The specialist models should be trained before `meta_model` and `confluence_model`, because the stackers sit on top of specialist outputs.
 - `hazard` and `quantile` are downstream risk/exit layers and should be trained after the feature and label substrate is stable.
 
+## How To Run In Sequence
+
+Use this section as the strict operator checklist. If a step says a previous step is required, do not skip that requirement.
+
+| Step | Run now | Must already be completed | Warning before you run it |
+|---|---|---|---|
+| 1 | `python fetch_1m_BTCUSD_from_Kraken.py` | Nothing. This is the starting point. | This is the only correct first step for a fresh BTCUSD pipeline run. It fetches deep history from `2017-01-01 00:00 Europe/Berlin` through yesterday `23:59:59 Europe/Berlin`, then rebuilds `1m`, `15m`, `1h`, `6h`, and `12h`. |
+| 2 | `python build_BTCUSD_features.py` | Step 1 must be finished. `data/tf/BTCUSD_15m.csv`, `BTCUSD_1h.csv`, `BTCUSD_6h.csv`, and `BTCUSD_12h.csv` must exist. | Do not run this before the timeframe files exist. This is the feature-engineering stage that converts raw/resampled market data into the model-ready state space used everywhere else. |
+| 3 | `python build_BTCUSD_labels.py` | Step 2 must be finished. `artifacts/features/BTCUSD/BTCUSD_features.csv` must exist. | Do not run this before features exist. Labels are computed from engineered states, not directly from exchange candles. |
+| 4 | `python train_BTCUSD_liq_flow_model.py` | Steps 1, 2, and 3 must be finished. | Do not start model training from raw data alone. The model expects the canonical engineered feature frame and the canonical label frame. |
+| 5 | `python train_BTCUSD_bos_cont_model.py` | Steps 1, 2, and 3 must be finished. | Same warning as above. This specialist should only be trained after the shared BTCUSD features and labels are built. |
+| 6 | `python train_BTCUSD_flow_1h_model.py` | Steps 1, 2, and 3 must be finished. | This model relies on the correct `1h/6h/12h` feature scope. Do not run it before the canonical feature build has succeeded. |
+| 7 | `python train_BTCUSD_momo_model.py` | Steps 1, 2, and 3 must be finished. | Same requirement: engineered features first, labels second, training third. |
+| 8 | `python train_BTCUSD_eop_model.py` | Steps 1, 2, and 3 must be finished. | Same requirement. |
+| 9 | `python train_BTCUSD_edp_model.py` | Steps 1, 2, and 3 must be finished. | Same requirement. |
+| 10 | `python train_BTCUSD_meta_model.py` | Steps 1 through 9 should already be finished. | The meta model sits above specialist outputs. It is not the first thing to train. Train the specialist family first so the stacker has the intended upstream substrate. |
+| 11 | `python train_BTCUSD_confluence_model.py` | Steps 1 through 10 should already be finished. | The confluence model is the final scored aggregation layer. Do not treat it as a standalone first-stage model. |
+| 12 | `python train_BTCUSD_hazard_model.py` | Steps 1, 2, and 3 must be finished. Specialist training is strongly recommended before this stage. | Hazard controls exits and danger logic. It should be trained after the base research substrate is stable. |
+| 13 | `python train_BTCUSD_quantile_model.py` | Steps 1, 2, and 3 must be finished. Specialist training is strongly recommended before this stage. | Quantile forecasting is a risk/runner layer, not a substitute for the main execution stack. |
+
+### Minimum Safe Sequence
+
+If you want the shortest safe path, use this exact order:
+
+1. `python fetch_1m_BTCUSD_from_Kraken.py`
+2. `python build_BTCUSD_features.py`
+3. `python build_BTCUSD_labels.py`
+4. train the specialist models you need
+5. train `meta_model`
+6. train `confluence_model`
+7. train `hazard`
+8. train `quantile`
+
+### Required Files Before Training
+
+Before training any BTCUSD model, these files should exist:
+
+- `data/tf/BTCUSD_15m.csv`
+- `data/tf/BTCUSD_1h.csv`
+- `data/tf/BTCUSD_6h.csv`
+- `data/tf/BTCUSD_12h.csv`
+- `artifacts/features/BTCUSD/BTCUSD_features.csv`
+- `artifacts/labels/BTCUSD/BTCUSD_labels.csv`
+
+If those are missing, go back and run the earlier step instead of trying to force training forward.
+
 ## Dashboards
 
 ### Streamlit research shell
