@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 import pandas as pd
 
@@ -29,7 +29,7 @@ from quant_system.cli.common import (
 from quant_system.config.config_loader import ConfigLoader
 from quant_system.ml.registry.model_registry import ModelRegistry
 from quant_system.ml.training.model_trainer import ModelTrainer
-from quant_system.utils.logger import get_logger
+from quant_system.utils.logger import console_kv, console_rule, console_stage, fmt_num, get_logger
 
 LOG = get_logger("train_orchestrator")
 
@@ -104,11 +104,29 @@ class TrainOrchestrator:
         labels_out: Optional[str] = None,
         merged_out: Optional[str] = None,
         manifest_out: Optional[str] = None,
+        model_state_out: Optional[str] = None,
+        models: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         merged_out = merged_out or str(self.artifact_root / asset / "training_frame.csv")
         manifest_out = manifest_out or str(self.artifact_root / asset / "train_manifest.json")
+        model_state_out = model_state_out or str(self.artifact_root / asset / "model_state.json")
 
+        requested_models = ModelTrainer._normalize_requested_models(models)
+        console_rule(f"Training Room | {asset}", style="green")
+        console_kv(
+            "Training Plan",
+            {
+                "asset": asset,
+                "tf_dir": tf_dir or "-",
+                "features_csv": features_csv or "-",
+                "labels_csv": labels_csv or "-",
+                "requested_models": ", ".join(requested_models),
+                "registry": self.registry.base_dir,
+            },
+            style="green",
+        )
         LOG.info("[TrainOrchestrator] Building training frame for asset=%s", asset)
+        console_stage("Build training frame", "features -> labels -> merged frame", status="info")
         train_df = self.build_training_frame(
             asset=asset,
             tf_dir=tf_dir,
@@ -118,10 +136,31 @@ class TrainOrchestrator:
             labels_out=labels_out,
             merged_out=merged_out,
         )
+        console_stage(
+            "Training frame ready",
+            f"rows={fmt_num(len(train_df))} merged_out={merged_out}",
+            status="ok",
+        )
 
         LOG.info("[TrainOrchestrator] Training model suite for asset=%s rows=%s", asset, len(train_df))
-        version = self.trainer.train_asset(train_df, asset)
+        console_stage("Model training", f"requested={', '.join(requested_models)}", status="info")
+        train_result = self.trainer.train_asset_bundle(train_df, asset, selected_models=models)
+        version = str(train_result["version"])
         metrics = self._collect_metrics(asset, version)
+        model_state = {
+            "asset": asset,
+            "version": version,
+            "requested_models": train_result.get("requested_models", []),
+            "trained_models": train_result.get("trained_models", []),
+            "dependency_models": train_result.get("dependency_models", []),
+            "registry_dir": self.registry.base_dir,
+        }
+        save_json(model_state_out, model_state)
+        console_stage(
+            "Model state saved",
+            f"version={version} state={model_state_out}",
+            status="ok",
+        )
 
         manifest = {
             "asset": asset,
@@ -134,10 +173,24 @@ class TrainOrchestrator:
             "features_out": features_out,
             "labels_out": labels_out,
             "merged_out": str(merged_out),
+            "model_state_out": str(model_state_out),
+            "requested_models": train_result.get("requested_models", []),
+            "trained_models": train_result.get("trained_models", []),
+            "dependency_models": train_result.get("dependency_models", []),
             "metrics": metrics,
             "governance": self._governance_status(metrics),
         }
         save_json(manifest_out, manifest)
+        console_kv(
+            "Training Summary",
+            {
+                "version": version,
+                "trained_models": ", ".join(manifest["trained_models"]) or "-",
+                "dependency_models": ", ".join(manifest["dependency_models"]) or "-",
+                "manifest": manifest_out,
+            },
+            style="green",
+        )
         return manifest
 
     def run(self, asset_frames: Mapping[str, Any]) -> Dict[str, Any]:
@@ -147,14 +200,31 @@ class TrainOrchestrator:
                 merged_out = self.artifact_root / asset / "training_frame.csv"
                 merged_out.parent.mkdir(parents=True, exist_ok=True)
                 payload.to_csv(merged_out, index=False)
-                version = self.trainer.train_asset(payload, asset)
+                train_result = self.trainer.train_asset_bundle(payload, asset)
+                version = str(train_result["version"])
                 metrics = self._collect_metrics(asset, version)
+                model_state_out = self.artifact_root / asset / "model_state.json"
+                save_json(
+                    model_state_out,
+                    {
+                        "asset": asset,
+                        "version": version,
+                        "requested_models": train_result.get("requested_models", []),
+                        "trained_models": train_result.get("trained_models", []),
+                        "dependency_models": train_result.get("dependency_models", []),
+                        "registry_dir": self.registry.base_dir,
+                    },
+                )
                 manifest = {
                     "asset": asset,
                     "version": version,
                     "rows": int(len(payload)),
                     "registry_dir": self.registry.base_dir,
                     "merged_out": str(merged_out),
+                    "model_state_out": str(model_state_out),
+                    "requested_models": train_result.get("requested_models", []),
+                    "trained_models": train_result.get("trained_models", []),
+                    "dependency_models": train_result.get("dependency_models", []),
                     "metrics": metrics,
                     "governance": self._governance_status(metrics),
                 }
@@ -174,6 +244,8 @@ class TrainOrchestrator:
                 labels_out=payload.get("labels_out"),
                 merged_out=payload.get("merged_out"),
                 manifest_out=payload.get("manifest_out"),
+                model_state_out=payload.get("model_state_out"),
+                models=payload.get("models"),
             )
         return results
 
@@ -226,6 +298,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--labels-out", default=None, help="Optional generated labels output")
     parser.add_argument("--merged-out", default="artifacts/train/latest/training_frame.csv", help="Merged training frame output")
     parser.add_argument("--manifest-out", default="artifacts/train/latest/train_manifest.json", help="Training manifest output")
+    parser.add_argument("--model-state-out", default="artifacts/train/latest/model_state.json", help="Model state output")
+    parser.add_argument("--models", default=None, help="Comma-separated model list, e.g. liq_flow,flow_1h,meta_model")
     parser.add_argument("--model-registry", default=None, help="Override model registry directory")
     parser.add_argument("--artifact-root", default="artifacts/train/latest", help="Default artifact root for orchestrator outputs")
     return parser.parse_args()
@@ -248,6 +322,13 @@ def main() -> None:
         labels_out=args.labels_out,
         merged_out=args.merged_out,
         manifest_out=args.manifest_out,
+        model_state_out=args.model_state_out,
+        models=[m.strip() for m in args.models.split(",")] if args.models else None,
+    )
+    console_stage(
+        "Training complete",
+        f"asset={manifest['asset']} version={manifest['version']} trained={', '.join(manifest['trained_models'])}",
+        status="ok",
     )
     LOG.info("[TrainOrchestrator] Complete asset=%s version=%s", manifest["asset"], manifest["version"])
 

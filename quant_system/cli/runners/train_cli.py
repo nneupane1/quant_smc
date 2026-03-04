@@ -32,6 +32,7 @@ def parse_args():
     parser.add_argument("--labels", default=None, help="Prepared labels CSV or full feature+label CSV.")
     parser.add_argument("--features-out", default=None, help="Optional output CSV for built features.")
     parser.add_argument("--labels-out", default=None, help="Optional output CSV for generated labels.")
+    parser.add_argument("--models", default=None, help="Comma-separated model list, e.g. liq_flow,flow_1h,meta_model.")
     parser.add_argument("--model-registry", default=None, help="Model registry output directory.")
     parser.add_argument("--merged-out", default="artifacts/train/latest/training_frame.csv", help="Persist merged training frame.")
     return parser.parse_args()
@@ -75,12 +76,19 @@ def main():
 
     registry = load_registry(cfg, args.model_registry)
     trainer = ModelTrainer(loader, registry)
-    version = trainer.train_asset(train_df, asset)
+    train_result = trainer.train_asset_bundle(
+        train_df,
+        asset,
+        selected_models=[m.strip() for m in args.models.split(",")] if args.models else None,
+    )
+    version = train_result["version"]
 
     manifest = {
         "asset": asset,
         "version": version,
         "rows": int(len(train_df)),
+        "requested_models": train_result.get("requested_models", []),
+        "trained_models": train_result.get("trained_models", []),
         "features_out": args.features_out,
         "labels_out": args.labels_out,
         "merged_out": str(merged_out),

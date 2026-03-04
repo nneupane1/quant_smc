@@ -11,7 +11,7 @@ load_dotenv()
 
 from quant_system.data.ingest.api_retry import RetrySession
 from quant_system.config.config_loader import ConfigLoader
-from quant_system.utils.logger import get_logger
+from quant_system.utils.logger import console_stage, fmt_num, fmt_seconds, fmt_ts, get_logger
 
 LOG = get_logger("kraken_client")
 
@@ -129,11 +129,18 @@ class KrakenClient:
         since = start_ts
         last_progress_ts = start_ts
         stale_steps = 0
+        request_count = 0
+        t0 = time.time()
 
         while since <= end_ts:
+            request_count += 1
             fetched = self._fetch_chunk(interval, since)
             if not fetched:
-                LOG.info("[KrakenClient] Empty chunk received, stopping fetch.")
+                console_stage(
+                    "Kraken fetch stalled",
+                    f"request={request_count} cursor={since} received no data",
+                    status="warn",
+                )
                 break
 
             raw_rows, last_id = fetched
@@ -152,16 +159,34 @@ class KrakenClient:
             if new_rows == 0:
                 stale_steps += 1
                 if stale_steps > 3:
-                    LOG.info("[KrakenClient] Fetch stalled after repeated empty progress.")
+                    console_stage(
+                        "Kraken fetch stopped",
+                        f"request={request_count} repeated empty progress at {fmt_ts(last_progress_ts)}",
+                        status="warn",
+                    )
                     break
             else:
                 stale_steps = 0
+
+            latest_chunk_ts = chunk_rows[-1]["timestamp"] if chunk_rows else last_progress_ts
+            console_stage(
+                f"Kraken request {request_count}",
+                (
+                    f"new={fmt_num(new_rows)} total={fmt_num(len(rows))} "
+                    f"latest={fmt_ts(latest_chunk_ts)} next_cursor={int(last_id or 0)}"
+                ),
+                status="info",
+            )
 
             next_since = int(last_id or 0)
             if next_since <= since:
                 next_since = last_progress_ts + interval * 60
             if next_since <= since:
-                LOG.info("[KrakenClient] Cursor did not advance; stopping fetch.")
+                console_stage(
+                    "Kraken fetch stopped",
+                    f"cursor did not advance after {fmt_ts(last_progress_ts)}",
+                    status="warn",
+                )
                 break
 
             since = next_since
@@ -169,7 +194,15 @@ class KrakenClient:
                 break
             time.sleep(batch_sleep)
 
-        LOG.info(f"[KrakenClient] Fetch complete | rows={len(rows):,}")
+        console_stage(
+            "Kraken fetch complete",
+            (
+                f"requests={request_count} rows={fmt_num(len(rows))} "
+                f"start={fmt_ts(start_ts)} end={fmt_ts(last_progress_ts if rows else start_ts)} "
+                f"elapsed={fmt_seconds(time.time() - t0)}"
+            ),
+            status="ok",
+        )
         return rows
 
     # ----------------------------------------------------------------------

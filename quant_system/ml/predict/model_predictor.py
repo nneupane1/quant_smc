@@ -36,15 +36,33 @@ class ModelPredictor:
         data = {col: [row.get(col, np.nan)] for col in feature_cols}
         return pd.DataFrame(data)
 
+    @staticmethod
+    def _positive_class_proba(model: Any, X_in) -> float:
+        proba = model.predict_proba(X_in)
+        arr = np.asarray(proba, dtype=float)
+        if arr.ndim == 1:
+            return float(arr[0])
+        if arr.shape[1] == 1:
+            classes_attr = getattr(model, "classes_", None)
+            classes = list(classes_attr) if classes_attr is not None else []
+            if classes == [1]:
+                return 1.0
+            return 0.0
+        classes_attr = getattr(model, "classes_", None)
+        classes = list(classes_attr) if classes_attr is not None else []
+        if 1 in classes:
+            return float(arr[0, classes.index(1)])
+        return float(arr[0, min(1, arr.shape[1] - 1)])
+
     def _predict_specialist(self, model_name: str, row_like) -> float:
         clf, cal, cfg = self.registry.load_latest_bundle(model_name)
         feature_cols = cfg.get("features", [])
         X_in = self._row_frame(row_like, feature_cols) if feature_cols else self._row_frame(row_like, [])
         if isinstance(clf, dict) and "model" in clf:
             base = clf["model"]
-            p = base.predict_proba(X_in)[0][1]
+            p = self._positive_class_proba(base, X_in)
         else:
-            p = clf.predict_proba(X_in)[0][1]
+            p = self._positive_class_proba(clf, X_in)
         if cal:
             if hasattr(cal, "predict_proba"):
                 p = cal.predict_proba([[p]])[0][1]
@@ -58,7 +76,7 @@ class ModelPredictor:
         if not stack_inputs:
             return None
         vec = np.array([float(specialist_probs.get(name, 0.0)) for name in stack_inputs], dtype=float).reshape(1, -1)
-        return float(clf.predict_proba(vec)[0][1])
+        return self._positive_class_proba(clf, vec)
 
     def _predict_hazard_curve(self, row_like, model_name: str) -> Dict[int, float]:
         """
@@ -73,7 +91,7 @@ class ModelPredictor:
         for b in range(1, H + 1):
             if b in models:
                 clf = models[b]
-                p = clf.predict_proba(X_in)[0][1]
+                p = self._positive_class_proba(clf, X_in)
                 event_probs[b] = float(p)
             else:
                 event_probs[b] = 0.0

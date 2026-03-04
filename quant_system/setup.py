@@ -69,6 +69,8 @@ setup(
     entry_points={
         "console_scripts": [
             "quant-backtest=quant_system.cli.backtest_cli:main",
+            "quant-data=quant_system.cli.data_cli:main",
+            "quant-pipeline=quant_system.cli.pipeline_cli:main",
             "quant-forward=quant_system.cli.forward_cli:main",
             "quant-live=quant_system.cli.live_cli:main",
             "quant-train=quant_system.cli.train_cli:main",

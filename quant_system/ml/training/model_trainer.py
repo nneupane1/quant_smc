@@ -90,6 +90,14 @@ class ModelTrainer:
         "confluence",
         "hazard",
     }
+    SPECIALIST_MODELS = ["liq_flow", "bos_cont", "flow_1h", "momo", "eop", "edp"]
+    TRAINABLE_MODELS = SPECIALIST_MODELS + ["meta_model", "confluence_model", "hazard", "quantile"]
+    MODEL_NAME_ALIASES = {
+        "meta": "meta_model",
+        "confluence": "confluence_model",
+        "quantile_forecaster": "quantile",
+        "quantile_model": "quantile",
+    }
 
     def __init__(self, config_loader: ConfigLoader, registry: ModelRegistry):
         self.cfg_loader = config_loader
@@ -162,6 +170,24 @@ class ModelTrainer:
             return None
         return TimeSeriesSplit(n_splits=n_splits)
 
+    @staticmethod
+    def _positive_class_proba(model: Any, X_in) -> np.ndarray:
+        proba = model.predict_proba(X_in)
+        arr = np.asarray(proba, dtype=float)
+        if arr.ndim == 1:
+            return arr
+        if arr.shape[1] == 1:
+            classes_attr = getattr(model, "classes_", None)
+            classes = list(classes_attr) if classes_attr is not None else []
+            if classes == [1]:
+                return np.ones(arr.shape[0], dtype=float)
+            return np.zeros(arr.shape[0], dtype=float)
+        classes_attr = getattr(model, "classes_", None)
+        classes = list(classes_attr) if classes_attr is not None else []
+        if 1 in classes:
+            return arr[:, classes.index(1)]
+        return arr[:, min(1, arr.shape[1] - 1)]
+
     # ------------------------------------------------------------------
     # Utility: class weights and single-class safety
     # ------------------------------------------------------------------
@@ -193,10 +219,21 @@ class ModelTrainer:
     # Public entry: train all models for an asset
     # ------------------------------------------------------------------
     def train_asset(self, df: pd.DataFrame, asset: str) -> str:
-        LOG.info(f"[ModelTrainer] Training full model suite for asset={asset}")
-        t0 = time.perf_counter()
+        return self.train_asset_bundle(df, asset)["version"]
 
-        specialist_names = ["liq_flow", "bos_cont", "flow_1h", "momo", "eop", "edp"]
+    def train_asset_bundle(
+        self,
+        df: pd.DataFrame,
+        asset: str,
+        selected_models: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        requested_models = self._normalize_requested_models(selected_models)
+        LOG.info(
+            "[ModelTrainer] Training model bundle for asset=%s requested=%s",
+            asset,
+            requested_models,
+        )
+        t0 = time.perf_counter()
 
         targets = {
             "liq_flow": df.get("label_liq_flow", pd.Series(0, index=df.index)).astype(int).values,
@@ -218,10 +255,22 @@ class ModelTrainer:
             raise KeyError("No close/close_x/close_y column found for price extraction.")
         prices = df[price_col].astype(float).values
 
+        meta_cfg = self.model_cfg.get("meta_model", {})
+        conf_cfg = self.model_cfg.get("confluence_model", {})
+        required_specialists: List[str] = []
+        for name in requested_models:
+            if name in self.SPECIALIST_MODELS:
+                required_specialists.append(name)
+        if "meta_model" in requested_models:
+            required_specialists.extend(meta_cfg.get("specialist_inputs", self.SPECIALIST_MODELS))
+        if "confluence_model" in requested_models:
+            required_specialists.extend(conf_cfg.get("specialist_inputs", self.SPECIALIST_MODELS))
+        required_specialists = list(dict.fromkeys(required_specialists))
+
         # Specialist models ------------------------------------------------
         specialists = {}
         specialist_metrics = {}
-        for key in specialist_names:
+        for key in required_specialists:
             cfg = self.model_cfg[key]
             X_sel, cols_sel, num_cols, cat_cols = self._prepare_features(
                 df,
@@ -238,29 +287,31 @@ class ModelTrainer:
             specialist_metrics[key] = metrics
             LOG.info(f"[ModelTrainer] Specialist {key} done in {time.perf_counter() - t_spec:.2f}s")
 
-        # Meta model (stacking specialist outputs)
-        meta_cfg = self.model_cfg.get("meta_model", {})
-        LOG.info("[ModelTrainer] Training meta model (stacking)")
-        meta_model, meta_meta = self._train_stack(df, specialists, meta_cfg, target_key="label_liq_flow")
-        LOG.info("[ModelTrainer] Meta model done")
+        meta_model = meta_meta = None
+        if "meta_model" in requested_models:
+            LOG.info("[ModelTrainer] Training meta model (stacking)")
+            meta_model, meta_meta = self._train_stack(df, specialists, meta_cfg, target_key="label_liq_flow")
+            LOG.info("[ModelTrainer] Meta model done")
 
-        # Confluence model
-        conf_cfg = self.model_cfg.get("confluence_model", {})
-        LOG.info("[ModelTrainer] Training confluence model")
-        conf_model, conf_meta = self._train_stack(df, specialists, conf_cfg, target_key="label_liq_flow")
-        LOG.info("[ModelTrainer] Confluence model done")
+        conf_model = conf_meta = None
+        if "confluence_model" in requested_models:
+            LOG.info("[ModelTrainer] Training confluence model")
+            conf_model, conf_meta = self._train_stack(df, specialists, conf_cfg, target_key="label_liq_flow")
+            LOG.info("[ModelTrainer] Confluence model done")
 
-        # Hazard per-bin model
-        haz_cfg = self.model_cfg.get("hazard", {})
-        LOG.info("[ModelTrainer] Training hazard models")
-        hazard_models, haz_conf = self._train_hazard(df, haz_cfg, haz_event, haz_time)
-        LOG.info(f"[ModelTrainer] Hazard models done ({len(hazard_models)} bins)")
+        hazard_models = haz_conf = None
+        if "hazard" in requested_models:
+            haz_cfg = self.model_cfg.get("hazard", {})
+            LOG.info("[ModelTrainer] Training hazard models")
+            hazard_models, haz_conf = self._train_hazard(df, haz_cfg, haz_event, haz_time)
+            LOG.info(f"[ModelTrainer] Hazard models done ({len(hazard_models)} bins)")
 
-        # Quantile forecaster
-        q_cfg = self.model_cfg.get("quantile_forecaster", {})
-        LOG.info("[ModelTrainer] Training quantile forecaster")
-        quant_models, quant_conf = self._train_quantile(df, q_cfg, prices)
-        LOG.info("[ModelTrainer] Quantile forecaster done")
+        quant_models = quant_conf = None
+        if "quantile" in requested_models:
+            q_cfg = self.model_cfg.get("quantile_forecaster", {})
+            LOG.info("[ModelTrainer] Training quantile forecaster")
+            quant_models, quant_conf = self._train_quantile(df, q_cfg, prices)
+            LOG.info("[ModelTrainer] Quantile forecaster done")
 
         # Persist
         version = self.versioner.new_version(asset)
@@ -286,65 +337,108 @@ class ModelTrainer:
                 self.registry.save_metrics(f"{asset}_{key}", version, metrics)
                 self.registry.save_metrics(key, version, metrics)
 
-        self.registry.save_model(
-            model_name=f"{asset}_meta",
-            version=version,
-            clf=meta_model,
-            cal=None,
-            config=meta_meta,
-        )
-        self.registry.save_model(
-            model_name="meta_model",
-            version=version,
-            clf=meta_model,
-            cal=None,
-            config=meta_meta,
-        )
-        self.registry.save_model(
-            model_name=f"{asset}_confluence",
-            version=version,
-            clf=conf_model,
-            cal=None,
-            config=conf_meta,
-        )
-        self.registry.save_model(
-            model_name="confluence_model",
-            version=version,
-            clf=conf_model,
-            cal=None,
-            config=conf_meta,
-        )
+        if meta_model is not None and meta_meta is not None:
+            self.registry.save_model(
+                model_name=f"{asset}_meta",
+                version=version,
+                clf=meta_model,
+                cal=None,
+                config=meta_meta,
+            )
+            self.registry.save_model(
+                model_name="meta_model",
+                version=version,
+                clf=meta_model,
+                cal=None,
+                config=meta_meta,
+            )
+        if conf_model is not None and conf_meta is not None:
+            self.registry.save_model(
+                model_name=f"{asset}_confluence",
+                version=version,
+                clf=conf_model,
+                cal=None,
+                config=conf_meta,
+            )
+            self.registry.save_model(
+                model_name="confluence_model",
+                version=version,
+                clf=conf_model,
+                cal=None,
+                config=conf_meta,
+            )
 
-        self.registry.save_hazard_model(
-            model_name=f"{asset}_hazard",
-            version=version,
-            models=hazard_models,
-            config=haz_conf,
-        )
-        self.registry.save_hazard_model(
-            model_name="hazard",
-            version=version,
-            models=hazard_models,
-            config=haz_conf,
-        )
+        if hazard_models is not None and haz_conf is not None:
+            self.registry.save_hazard_model(
+                model_name=f"{asset}_hazard",
+                version=version,
+                models=hazard_models,
+                config=haz_conf,
+            )
+            self.registry.save_hazard_model(
+                model_name="hazard",
+                version=version,
+                models=hazard_models,
+                config=haz_conf,
+            )
 
-        self.registry.save_model(
-            model_name=f"{asset}_quantile",
-            version=version,
-            clf=quant_models,
-            cal=None,
-            config=quant_conf,
-        )
-        self.registry.save_model(
-            model_name="quantile",
-            version=version,
-            clf=quant_models,
-            cal=None,
-            config=quant_conf,
-        )
+        if quant_models is not None and quant_conf is not None:
+            self.registry.save_model(
+                model_name=f"{asset}_quantile",
+                version=version,
+                clf=quant_models,
+                cal=None,
+                config=quant_conf,
+            )
+            self.registry.save_model(
+                model_name="quantile",
+                version=version,
+                clf=quant_models,
+                cal=None,
+                config=quant_conf,
+            )
 
-        LOG.info(f"[ModelTrainer] Completed asset={asset}, version={version}, elapsed={time.perf_counter()-t0:.2f}s")
-        return version
+        persisted = list(dict.fromkeys(
+            list(specialists.keys())
+            + (["meta_model"] if meta_model is not None else [])
+            + (["confluence_model"] if conf_model is not None else [])
+            + (["hazard"] if hazard_models is not None else [])
+            + (["quantile"] if quant_models is not None else [])
+        ))
+        dependency_models = [m for m in specialists.keys() if m not in requested_models]
+        LOG.info(
+            "[ModelTrainer] Completed asset=%s version=%s models=%s elapsed=%.2fs",
+            asset,
+            version,
+            persisted,
+            time.perf_counter() - t0,
+        )
+        return {
+            "asset": asset,
+            "version": version,
+            "requested_models": requested_models,
+            "dependency_models": dependency_models,
+            "trained_models": persisted,
+            "specialist_metrics": specialist_metrics,
+        }
+
+    @classmethod
+    def _normalize_requested_models(cls, selected_models: Optional[List[str]]) -> List[str]:
+        if not selected_models:
+            return list(cls.TRAINABLE_MODELS)
+        normalized: List[str] = []
+        for raw in selected_models:
+            key = str(raw).strip()
+            if not key:
+                continue
+            key = cls.MODEL_NAME_ALIASES.get(key, key)
+            if key not in cls.TRAINABLE_MODELS:
+                raise ValueError(f"Unknown trainable model: {raw}")
+            if key not in normalized:
+                normalized.append(key)
+        if not normalized:
+            raise ValueError("At least one trainable model must be selected.")
+        return normalized
 
     # ------------------------------------------------------------------
     # Feature selection helpers
@@ -695,7 +789,7 @@ class ModelTrainer:
             tscv = self._make_tscv(len(X_df), cv_splits)
             if tscv is None:
                 model.fit(X_df, y)
-                prob = model.predict_proba(X_df)[:, 1]
+                prob = self._positive_class_proba(model, X_df)
                 try:
                     return float(average_precision_score(y, prob))
                 except Exception:
@@ -705,7 +799,7 @@ class ModelTrainer:
                 Xt, Xv = X_df.iloc[tr_idx], X_df.iloc[va_idx]
                 yt, yv = y[tr_idx], y[va_idx]
                 model.fit(Xt, yt)
-                prob = model.predict_proba(Xv)[:, 1]
+                prob = self._positive_class_proba(model, Xv)
                 pr = average_precision_score(yv, prob)
                 try:
                     auc = roc_auc_score(yv, prob)
@@ -775,7 +869,7 @@ class ModelTrainer:
             calib.fit(X_df, y)
             return calib
 
-        p_raw = model.predict_proba(X_df)[:, 1]
+        p_raw = self._positive_class_proba(model, X_df)
         # If probabilities are degenerate, skip calibration
         if np.unique(p_raw).size < 2:
             LOG.warning("[ModelTrainer] Skipping calibration: predicted probabilities are constant.")
@@ -809,7 +903,7 @@ class ModelTrainer:
             fold_preds = []
             for _, model, cols in base_cols:
                 X_fold = df.iloc[full_idx][cols]
-                prob = model.predict_proba(X_fold)[:, 1]
+                prob = self._positive_class_proba(model, X_fold)
                 fold_preds.append(prob)
             X_meta_parts.append((full_idx, np.vstack(fold_preds).T))
         else:
@@ -817,7 +911,7 @@ class ModelTrainer:
                 fold_preds = []
                 for _, model, cols in base_cols:
                     X_fold = df.iloc[val_idx][cols]
-                    prob = model.predict_proba(X_fold)[:, 1]
+                    prob = self._positive_class_proba(model, X_fold)
                     fold_preds.append(prob)
                 X_fold_mat = np.vstack(fold_preds).T
                 X_meta_parts.append((val_idx, X_fold_mat))
@@ -857,14 +951,14 @@ class ModelTrainer:
             meta_tscv = self._make_tscv(len(meta_train), cv_splits)
             if meta_tscv is None:
                 model.fit(meta_train, y_train)
-                prob = model.predict_proba(meta_train)[:, 1]
+                prob = self._positive_class_proba(model, meta_train)
                 return float(average_precision_score(y_train, prob))
             scores = []
             for tr_idx, va_idx in meta_tscv.split(meta_train):
                 Xt, Xv = meta_train[tr_idx], meta_train[va_idx]
                 yt, yv = y_train[tr_idx], y_train[va_idx]
                 model.fit(Xt, yt)
-                prob = model.predict_proba(Xv)[:, 1]
+                prob = self._positive_class_proba(model, Xv)
                 pr = average_precision_score(yv, prob)
                 scores.append(pr)
             return float(np.mean(scores))
@@ -928,14 +1022,14 @@ class ModelTrainer:
                 tscv = self._make_tscv(len(X_all), cv_splits)
                 if tscv is None:
                     model.fit(X_all, y_bin)
-                    prob = model.predict_proba(X_all)[:, 1]
+                    prob = self._positive_class_proba(model, X_all)
                     return -float(average_precision_score(y_bin, prob))
                 scores = []
                 for tr_idx, va_idx in tscv.split(X_all):
                     Xt, Xv = X_all.iloc[tr_idx], X_all.iloc[va_idx]
                     yt, yv = y_bin[tr_idx], y_bin[va_idx]
                     model.fit(Xt, yt)
-                    prob = model.predict_proba(Xv)[:, 1]
+                    prob = self._positive_class_proba(model, Xv)
                     pr = average_precision_score(yv, prob)
                     scores.append(pr)
                 return -float(np.mean(scores))
