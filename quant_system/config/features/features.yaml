@@ -92,6 +92,9 @@ features:
     hmm_states: 5
     hmm_covariance: "full"
     smoothing_factor: 0.7
+    model_clip_quantiles: [0.005, 0.995]
+    hdbscan_scaler: "robust"   # robust | standard
+    hmm_scaler: "standard"     # standard | robust
     volatility_percentile_window: 200
     toxicity_window: 30
     compression_lookback: 30

@@ -11,13 +11,13 @@ Saves:
 
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 import json
 import numpy as np
 import pandas as pd
 import joblib
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler, StandardScaler
 
 try:
     import hdbscan  # type: ignore
@@ -36,6 +36,8 @@ class HDBSCANConfig:
     metric: str = "euclidean"
     allow_single_cluster: bool = False
     seed: int = 42
+    scaler: str = "robust"  # robust | standard
+    clip_quantiles: Tuple[float, float] = (0.005, 0.995)
 
 
 class LiquidityClusterTrainer:
@@ -44,9 +46,12 @@ class LiquidityClusterTrainer:
             raise ImportError("hdbscan is required for liquidity clustering")
         self.cfg = cfg
         self.model: Optional[hdbscan.HDBSCAN] = None
-        self.scaler: Optional[StandardScaler] = None
+        self.scaler: Optional[object] = None
         self.columns_: List[str] = []
         self.meta_: Dict[str, Any] = {}
+        self.fill_values_: Optional[pd.Series] = None
+        self.clip_lower_: Optional[pd.Series] = None
+        self.clip_upper_: Optional[pd.Series] = None
 
     # --------------- data prep --------------- #
     def _resample(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -58,7 +63,7 @@ class LiquidityClusterTrainer:
         df = df.copy()
         df["dt"] = pd.to_datetime(df["dt"], utc=True)
         df = df.set_index("dt")
-        rule = "15T" if tf == "15m" else "1H"
+        rule = "15min" if tf == "15m" else "1h"
         # numeric columns mean; for non-numeric, drop
         num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
         res = df[num_cols].resample(rule, label="right", closed="right").mean()
@@ -88,14 +93,45 @@ class LiquidityClusterTrainer:
             raise ValueError("No usable feature columns found for clustering.")
         return df[cols], cols
 
+    def _build_scaler(self):
+        mode = str(getattr(self.cfg, "scaler", "robust")).strip().lower()
+        if mode == "standard":
+            return StandardScaler()
+        return RobustScaler()
+
+    def _prepare_matrix(self, X: pd.DataFrame, fit: bool) -> pd.DataFrame:
+        matrix = X.copy().apply(pd.to_numeric, errors="coerce")
+        matrix = matrix.replace([np.inf, -np.inf], np.nan)
+
+        lower_q, upper_q = self.cfg.clip_quantiles
+        lower_q = float(min(max(lower_q, 0.0), 0.49))
+        upper_q = float(max(min(upper_q, 1.0), 0.51))
+
+        if fit:
+            self.fill_values_ = matrix.median(axis=0, numeric_only=True).fillna(0.0)
+            self.clip_lower_ = matrix.quantile(lower_q, interpolation="linear").fillna(self.fill_values_)
+            self.clip_upper_ = matrix.quantile(upper_q, interpolation="linear").fillna(self.fill_values_)
+
+        if self.fill_values_ is None:
+            self.fill_values_ = matrix.median(axis=0, numeric_only=True).fillna(0.0)
+        if self.clip_lower_ is None or self.clip_upper_ is None:
+            self.clip_lower_ = matrix.quantile(lower_q, interpolation="linear").fillna(self.fill_values_)
+            self.clip_upper_ = matrix.quantile(upper_q, interpolation="linear").fillna(self.fill_values_)
+
+        matrix = matrix.fillna(self.fill_values_)
+        matrix = matrix.clip(lower=self.clip_lower_, upper=self.clip_upper_, axis=1)
+        matrix = matrix.fillna(0.0)
+        return matrix
+
     # --------------- fit --------------- #
     def fit(self, df: pd.DataFrame) -> pd.DataFrame:
         df = self._resample(df)
         X, cols = self._select_cols(df)
+        X = self._prepare_matrix(X, fit=True)
         self.columns_ = cols
 
-        self.scaler = StandardScaler()
-        Xs = self.scaler.fit_transform(X)
+        self.scaler = self._build_scaler()
+        Xs = self.scaler.fit_transform(X.values)
 
         self.model = hdbscan.HDBSCAN(
             min_cluster_size=self.cfg.min_cluster_size,
@@ -104,6 +140,7 @@ class LiquidityClusterTrainer:
             cluster_selection_method=self.cfg.cluster_selection_method,
             metric=self.cfg.metric,
             allow_single_cluster=self.cfg.allow_single_cluster,
+            prediction_data=True,
             core_dist_n_jobs= -1,
         )
         labels = self.model.fit_predict(Xs)
@@ -122,6 +159,11 @@ class LiquidityClusterTrainer:
             "features": cols,
             "n_clusters": n_clusters,
             "noise_rate": noise_rate,
+            "preprocessing": {
+                "fill_values": self.fill_values_.to_dict() if self.fill_values_ is not None else {},
+                "clip_lower": self.clip_lower_.to_dict() if self.clip_lower_ is not None else {},
+                "clip_upper": self.clip_upper_.to_dict() if self.clip_upper_ is not None else {},
+            },
         }
         return df_out
 

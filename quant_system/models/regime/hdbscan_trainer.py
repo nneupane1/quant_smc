@@ -56,6 +56,21 @@ class HDBSCANTrainer:
         self.features_: List[str] = []
         self.model = None
         self.scaler = None
+        self.preprocess_: Dict[str, Any] = {}
+
+    def _apply_preprocess(self, X: pd.DataFrame) -> pd.DataFrame:
+        out = X.copy().apply(pd.to_numeric, errors="coerce").replace([float("inf"), float("-inf")], float("nan"))
+        prep = self.preprocess_ or {}
+        fill_map = prep.get("fill_values", {}) if isinstance(prep, dict) else {}
+        clip_lower = prep.get("clip_lower", {}) if isinstance(prep, dict) else {}
+        clip_upper = prep.get("clip_upper", {}) if isinstance(prep, dict) else {}
+        if fill_map:
+            out = out.fillna(pd.Series(fill_map))
+        else:
+            out = out.fillna(out.median(numeric_only=True)).fillna(0.0)
+        if clip_lower and clip_upper:
+            out = out.clip(lower=pd.Series(clip_lower), upper=pd.Series(clip_upper), axis=1)
+        return out.fillna(0.0).astype(float)
 
     def fit(self, df: pd.DataFrame) -> Dict[str, Any]:
         states = self._trainer.fit(df)
@@ -66,6 +81,7 @@ class HDBSCANTrainer:
         self.model = self._trainer.model
         self.scaler = self._trainer.scaler
         meta = self._trainer.meta_
+        self.preprocess_ = dict(meta.get("preprocessing", {}) or {})
         return {
             "n_clusters": int(meta.get("n_clusters", 0)),
             "n_noise": int(round(meta.get("noise_rate", 0.0) * len(states))),
@@ -80,6 +96,7 @@ class HDBSCANTrainer:
         meta = {
             "cfg": self.cfg.__dict__,
             "features": self.features_,
+            "preprocessing": self.preprocess_,
         }
         with open(out / "legacy_meta.json", "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
@@ -94,8 +111,12 @@ class HDBSCANTrainer:
                 meta = json.load(f)
             cfg = HDBSCANConfig(**meta.get("cfg", {}))
             features = meta.get("features", [])
+            preprocess = meta.get("preprocessing", {}) or {}
+        else:
+            preprocess = {}
         obj = HDBSCANTrainer(cfg)
         obj.features_ = features
+        obj.preprocess_ = preprocess
         model_path = Path(model_dir) / "model.joblib"
         scaler_path = Path(model_dir) / "scaler.joblib"
         if model_path.exists():
@@ -115,9 +136,14 @@ class HDBSCANTrainer:
         feats = [c for c in self.features_ if c in df.columns]
         if not feats:
             raise ValueError("None of the trained feature columns are present in the dataframe.")
-        X = df[feats].astype(float).fillna(0.0)
-        Xs = self.scaler.transform(X)
-        labels, strengths = hdbscan.approximate_predict(self.model, Xs)
+        X = self._apply_preprocess(df[feats])
+        Xs = self.scaler.transform(X.values)
+        try:
+            labels, strengths = hdbscan.approximate_predict(self.model, Xs)
+        except AttributeError as exc:
+            raise RuntimeError(
+                "HDBSCAN model does not contain prediction_data. Retrain with latest trainer artifacts."
+            ) from exc
         out = pd.DataFrame(index=df.index)
         out["cluster_id"] = labels.astype(int)
         out["prob"] = strengths.astype(float)

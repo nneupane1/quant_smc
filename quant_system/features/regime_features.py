@@ -17,6 +17,7 @@ These features feed the:
 import pandas as pd
 import numpy as np
 from typing import Dict, Any
+from sklearn.preprocessing import RobustScaler, StandardScaler
 
 try:
     import hdbscan
@@ -151,6 +152,9 @@ class RegimeFeatureBlock:
         self.hmm_states = int(self.regime_cfg.get("hmm_states", 5))
         self.hmm_covariance = self.regime_cfg.get("hmm_covariance", "full")
         self.smoothing = float(self.regime_cfg.get("smoothing_factor", 0.7))
+        self.model_clip_quantiles = self.regime_cfg.get("model_clip_quantiles", [0.005, 0.995])
+        self.hdbscan_scaler = str(self.regime_cfg.get("hdbscan_scaler", "robust")).lower()
+        self.hmm_scaler = str(self.regime_cfg.get("hmm_scaler", "standard")).lower()
 
     # --------------------------------------------------------------
     def _prep_base_regime_frame(self, df_12h: pd.DataFrame) -> pd.DataFrame:
@@ -232,7 +236,8 @@ class RegimeFeatureBlock:
         Fit HDBSCAN + HMM on regime features and return probability columns aligned to reg_df index.
         """
         feature_cols = ["vol_pct", "trend_persist", "compression_12h", "toxicity_12h"]
-        feat = reg_df[feature_cols].dropna()
+        feat = reg_df[feature_cols].copy().replace([np.inf, -np.inf], np.nan)
+        feat = feat.loc[feat.notna().any(axis=1)]
 
         if len(feat) < max(30, self.min_cluster_size):
             LOG.warning("Regime block: insufficient data for clustering; returning defaults.")
@@ -253,13 +258,26 @@ class RegimeFeatureBlock:
             return self._deterministic_regime_fallback(feat, reg_df.index)
 
         try:
+            lower_q, upper_q = self.model_clip_quantiles
+            lower_q = float(min(max(float(lower_q), 0.0), 0.49))
+            upper_q = float(max(min(float(upper_q), 1.0), 0.51))
+            fill_values = feat.median(axis=0, numeric_only=True).fillna(0.0)
+            clip_lower = feat.quantile(lower_q, interpolation="linear").fillna(fill_values)
+            clip_upper = feat.quantile(upper_q, interpolation="linear").fillna(fill_values)
+            feat = feat.fillna(fill_values).clip(lower=clip_lower, upper=clip_upper, axis=1).fillna(0.0)
+
+            hdb_scaler = StandardScaler() if self.hdbscan_scaler == "standard" else RobustScaler()
+            hmm_scaler = RobustScaler() if self.hmm_scaler == "robust" else StandardScaler()
+            X_hdb = hdb_scaler.fit_transform(feat[feature_cols].values)
+            X_hmm = hmm_scaler.fit_transform(feat[feature_cols].values)
+
             # HDBSCAN clustering
             clusterer = hdbscan.HDBSCAN(
                 min_cluster_size=self.min_cluster_size,
                 min_samples=self.min_samples,
                 allow_single_cluster=True,
             )
-            cluster_labels = clusterer.fit_predict(feat.values)
+            cluster_labels = clusterer.fit_predict(X_hdb)
             feat = feat.assign(cluster=cluster_labels)
 
             # HMM smoothing on feature vectors
@@ -270,9 +288,9 @@ class RegimeFeatureBlock:
                 n_iter=50,
                 verbose=False,
             )
-            hmm.fit(feat[feature_cols].values)
-            posterior = hmm.predict_proba(feat[feature_cols].values)
-            hidden_seq = hmm.predict(feat[feature_cols].values)
+            hmm.fit(X_hmm)
+            posterior = hmm.predict_proba(X_hmm)
+            hidden_seq = hmm.predict(X_hmm)
         except Exception as exc:
             LOG.warning(
                 "Regime block: model fit failed (%s); using deterministic fallback.",
