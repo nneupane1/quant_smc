@@ -2,7 +2,7 @@
 Fetch BTCUSD 1m data from Kraken and rebuild 15m / 1h / 6h / 12h bars.
 
 Run:
-    python fetch_1m_BTCUSD_from_Kraken.py
+    python fetch_BTCUSD_resample.py
 
 What it does:
     1. tries the normal Kraken OHLC path with checkpoint resume

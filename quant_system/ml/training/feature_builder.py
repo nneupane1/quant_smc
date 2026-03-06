@@ -108,7 +108,33 @@ class FeatureBuilder:
                 break
         if time_col is None:
             raise ValueError(f"No time column found in dataframe {path_hint or ''}")
-        dt = pd.to_datetime(df[time_col], utc=True)
+        series = df[time_col]
+        numeric = pd.to_numeric(series, errors="coerce")
+        numeric_ratio = float(numeric.notna().mean()) if len(numeric) else 0.0
+
+        if numeric_ratio >= 0.95:
+            # Interpret numeric epochs by magnitude to avoid the default ns parser trap.
+            # Typical ranges:
+            #   seconds ~ 1e9
+            #   milliseconds ~ 1e12
+            #   microseconds ~ 1e15
+            #   nanoseconds ~ 1e18
+            abs_med = float(numeric.dropna().abs().median()) if numeric.notna().any() else 0.0
+            if abs_med >= 1e17:
+                unit = "ns"
+            elif abs_med >= 1e14:
+                unit = "us"
+            elif abs_med >= 1e11:
+                unit = "ms"
+            else:
+                unit = "s"
+            dt = pd.to_datetime(numeric, unit=unit, utc=True, errors="coerce")
+        else:
+            dt = pd.to_datetime(series, utc=True, errors="coerce")
+
+        if dt.isna().all():
+            raise ValueError(f"Failed to parse any timestamps from column '{time_col}' in {path_hint or 'dataframe'}")
+
         df["dt"] = dt
         # integer seconds since epoch for swing detector
         df["timestamp"] = (dt.astype("int64") // 10**9).astype("int64")

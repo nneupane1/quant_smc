@@ -147,7 +147,7 @@ The high-level system loop is:
 For BTCUSD, the canonical top-level fetch script is:
 
 ```bash
-python fetch_1m_BTCUSD_from_Kraken.py
+python fetch_BTCUSD_resample.py
 ```
 
 This script is intentionally named for what it does. It is the correct manual starting point for a fresh BTCUSD pipeline run. It uses a Berlin-local default window:
@@ -549,7 +549,7 @@ quant-terminal-api
 
 These are the human-friendly top-level scripts that make the pipeline explicit:
 
-- `fetch_1m_BTCUSD_from_Kraken.py`
+- `fetch_BTCUSD_resample.py`
 - `build_BTCUSD_features.py`
 - `build_BTCUSD_labels.py`
 - `train_BTCUSD_liq_flow_model.py`
@@ -581,7 +581,7 @@ The cleanest manual workflow is:
 
 | Step | Run | What it does | Main outputs |
 |---|---|---|---|
-| 1 | `python fetch_1m_BTCUSD_from_Kraken.py` | Fetches BTCUSD history from Kraken using the Berlin-local window from `2017-01-01 00:00` through yesterday `23:59:59`. Deep history automatically uses trades bootstrap, then rebuilds canonical timeframe bars. | `data/raw_1m/BTCUSD_1m.csv`, `data/tf/BTCUSD_15m.csv`, `data/tf/BTCUSD_1h.csv`, `data/tf/BTCUSD_6h.csv`, `data/tf/BTCUSD_12h.csv` |
+| 1 | `python fetch_BTCUSD_resample.py` | Fetches BTCUSD history from Kraken using the Berlin-local window from `2017-01-01 00:00` through yesterday `23:59:59`. Deep history automatically uses trades bootstrap, then rebuilds canonical timeframe bars. | `data/raw_1m/BTCUSD_1m.csv`, `data/tf/BTCUSD_15m.csv`, `data/tf/BTCUSD_1h.csv`, `data/tf/BTCUSD_6h.csv`, `data/tf/BTCUSD_12h.csv` |
 | 2 | `python build_BTCUSD_features.py` | Builds the engineered `15m` decision frame from the timeframe bars. | `artifacts/features/BTCUSD/BTCUSD_features.csv` |
 | 3 | `python build_BTCUSD_labels.py` | Builds canonical labels from the engineered feature frame. | `artifacts/labels/BTCUSD/BTCUSD_labels.csv` |
 | 4 | `python train_BTCUSD_liq_flow_model.py` | Trains the liquidity-flow specialist. | `artifacts/train/BTCUSD/liq_flow/` |
@@ -621,7 +621,7 @@ If a later stage fails, the right response is usually to inspect the expected ou
 
 ### Minimum Safe Sequence
 
-1. `python fetch_1m_BTCUSD_from_Kraken.py`
+1. `python fetch_BTCUSD_resample.py`
 2. `python build_BTCUSD_features.py`
 3. `python build_BTCUSD_labels.py`
 4. train the specialist models you need
