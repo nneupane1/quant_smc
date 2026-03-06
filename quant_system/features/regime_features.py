@@ -196,6 +196,37 @@ class RegimeFeatureBlock:
             mapping[state_id] = label
         return mapping
 
+    @staticmethod
+    def _deterministic_regime_fallback(feat: pd.DataFrame, reg_index: pd.Index) -> pd.DataFrame:
+        """
+        Build deterministic regime probabilities when unsupervised models are
+        unavailable or fail at runtime.
+        """
+        fallback = pd.DataFrame(index=feat.index)
+        trend_proxy = feat["trend_persist"].clip(lower=0.0, upper=1.0)
+        expansion_proxy = feat["vol_pct"].clip(lower=0.0, upper=1.0) * (1.0 - trend_proxy)
+        collapse_proxy = feat["compression_12h"].lt(-0.05).astype(float) * 0.5 + feat["toxicity_12h"].clip(lower=0.0).fillna(0.0) * 0.1
+        range_proxy = 1.0 + feat["compression_12h"].clip(upper=0.0).abs()
+        total = trend_proxy + expansion_proxy + collapse_proxy + range_proxy
+        fallback["p_regime_trend"] = (trend_proxy / total).fillna(0.25)
+        fallback["p_regime_expansion"] = (expansion_proxy / total).fillna(0.25)
+        fallback["p_regime_collapse"] = (collapse_proxy / total).fillna(0.25)
+        fallback["p_regime_range"] = (range_proxy / total).fillna(0.25)
+        fallback["regime_state"] = (
+            fallback[["p_regime_trend", "p_regime_range", "p_regime_expansion", "p_regime_collapse"]]
+            .idxmax(axis=1)
+            .str.replace("p_regime_", "", regex=False)
+        )
+        return fallback.reindex(reg_index).ffill().fillna(
+            {
+                "p_regime_trend": 0.25,
+                "p_regime_range": 0.25,
+                "p_regime_expansion": 0.25,
+                "p_regime_collapse": 0.25,
+                "regime_state": "unknown",
+            }
+        )
+
     def _run_regime_models(self, reg_df: pd.DataFrame) -> pd.DataFrame:
         """
         Fit HDBSCAN + HMM on regime features and return probability columns aligned to reg_df index.
@@ -219,51 +250,35 @@ class RegimeFeatureBlock:
 
         if hdbscan is None or GaussianHMM is None:
             LOG.warning("Regime block: hdbscan/hmmlearn unavailable; returning deterministic regime defaults.")
-            fallback = pd.DataFrame(index=feat.index)
-            trend_proxy = feat["trend_persist"].clip(lower=0.0, upper=1.0)
-            expansion_proxy = feat["vol_pct"].clip(lower=0.0, upper=1.0) * (1.0 - trend_proxy)
-            collapse_proxy = feat["compression_12h"].lt(-0.05).astype(float) * 0.5 + feat["toxicity_12h"].clip(lower=0.0).fillna(0.0) * 0.1
-            range_proxy = 1.0 + feat["compression_12h"].clip(upper=0.0).abs()
-            total = trend_proxy + expansion_proxy + collapse_proxy + range_proxy
-            fallback["p_regime_trend"] = (trend_proxy / total).fillna(0.25)
-            fallback["p_regime_expansion"] = (expansion_proxy / total).fillna(0.25)
-            fallback["p_regime_collapse"] = (collapse_proxy / total).fillna(0.25)
-            fallback["p_regime_range"] = (range_proxy / total).fillna(0.25)
-            fallback["regime_state"] = (
-                fallback[["p_regime_trend", "p_regime_range", "p_regime_expansion", "p_regime_collapse"]]
-                .idxmax(axis=1)
-                .str.replace("p_regime_", "", regex=False)
-            )
-            return fallback.reindex(reg_df.index).ffill().fillna(
-                {
-                    "p_regime_trend": 0.25,
-                    "p_regime_range": 0.25,
-                    "p_regime_expansion": 0.25,
-                    "p_regime_collapse": 0.25,
-                    "regime_state": "unknown",
-                }
-            )
+            return self._deterministic_regime_fallback(feat, reg_df.index)
 
-        # HDBSCAN clustering
-        clusterer = hdbscan.HDBSCAN(
-            min_cluster_size=self.min_cluster_size,
-            min_samples=self.min_samples,
-            allow_single_cluster=True,
-        )
-        cluster_labels = clusterer.fit_predict(feat.values)
-        feat = feat.assign(cluster=cluster_labels)
+        try:
+            # HDBSCAN clustering
+            clusterer = hdbscan.HDBSCAN(
+                min_cluster_size=self.min_cluster_size,
+                min_samples=self.min_samples,
+                allow_single_cluster=True,
+            )
+            cluster_labels = clusterer.fit_predict(feat.values)
+            feat = feat.assign(cluster=cluster_labels)
 
-        # HMM smoothing on feature vectors
-        n_states = max(2, min(self.hmm_states, len(feat) - 1))
-        hmm = GaussianHMM(
-            n_components=n_states,
-            covariance_type=self.hmm_covariance,
-            n_iter=50,
-            verbose=False,
-        )
-        hmm.fit(feat[feature_cols].values)
-        posterior = hmm.predict_proba(feat[feature_cols].values)
-        hidden_seq = hmm.predict(feat[feature_cols].values)
+            # HMM smoothing on feature vectors
+            n_states = max(2, min(self.hmm_states, len(feat) - 1))
+            hmm = GaussianHMM(
+                n_components=n_states,
+                covariance_type=self.hmm_covariance,
+                n_iter=50,
+                verbose=False,
+            )
+            hmm.fit(feat[feature_cols].values)
+            posterior = hmm.predict_proba(feat[feature_cols].values)
+            hidden_seq = hmm.predict(feat[feature_cols].values)
+        except Exception as exc:
+            LOG.warning(
+                "Regime block: model fit failed (%s); using deterministic fallback.",
+                exc,
+            )
+            return self._deterministic_regime_fallback(feat, reg_df.index)
 
         state_map = self._map_state_labels(feat.assign(hidden=hidden_seq), hidden_seq)
 

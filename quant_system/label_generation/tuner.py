@@ -6,6 +6,7 @@ from copy import deepcopy
 import json
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Tuple
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -16,6 +17,7 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.exceptions import ConvergenceWarning
 
 from quant_system.config.config_loader import ConfigLoader
 from quant_system.label_generation.profile_manager import LabelProfileManager
@@ -345,7 +347,7 @@ class LabelEmpiricalTuner:
         model = Pipeline(
             steps=[
                 ("pre", pre),
-                ("clf", LogisticRegression(max_iter=500, solver="lbfgs")),
+                ("clf", LogisticRegression(max_iter=2000, solver="lbfgs")),
             ]
         )
 
@@ -357,7 +359,9 @@ class LabelEmpiricalTuner:
             y_valid = y[va_idx]
             if np.unique(y_train).size < 2 or np.unique(y_valid).size < 2:
                 continue
-            model.fit(X.iloc[tr_idx], y_train)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=ConvergenceWarning)
+                model.fit(X.iloc[tr_idx], y_train)
             prob = model.predict_proba(X.iloc[va_idx])[:, 1]
             aps.append(float(average_precision_score(y_valid, prob)))
             aucs.append(float(roc_auc_score(y_valid, prob)))

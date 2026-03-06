@@ -1,15 +1,22 @@
 optimization:
   bayesian:
     enabled: true
+    sampler: "tpe"
+    multivariate: false
+    seed: 42
+    pruner_startup_trials: 8
+    pruner_warmup_steps: 0
     n_trials: 60
     timeout: 3600
 
   genetic:
     enabled: true
-    population_size: 40
-    generations: 8
-    crossover_rate: 0.7
-    mutation_rate: 0.1
+    # Keep this lean; trainer also applies hard caps to prevent runaway runtime.
+    population_size: 6
+    generations: 2
+    crossover_rate: 0.6
+    mutation_rate: 0.15
+    seed: 42
 
   search_spaces:
     lightgbm:

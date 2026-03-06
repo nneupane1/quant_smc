@@ -10,6 +10,7 @@ Implements:
 """
 
 from typing import Dict, List, Any, Tuple, Optional
+from copy import deepcopy
 from contextlib import contextmanager
 import time
 from pathlib import Path
@@ -24,11 +25,12 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, RobustScaler
 from sklearn.impute import SimpleImputer
 from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.exceptions import UndefinedMetricWarning
+from sklearn.exceptions import ConvergenceWarning, UndefinedMetricWarning
+from sklearn.base import BaseEstimator, TransformerMixin
 
 try:
     import optuna
@@ -82,6 +84,35 @@ class CalibratedProbabilityModel:
         return np.vstack([1 - p, p]).T
 
 
+class QuantileClipper(BaseEstimator, TransformerMixin):
+    """
+    Leak-safe numeric outlier clipping.
+    Learns per-feature quantile bounds on training folds only, then clips.
+    """
+
+    def __init__(self, lower_q: float = 0.005, upper_q: float = 0.995):
+        self.lower_q = float(lower_q)
+        self.upper_q = float(upper_q)
+        self.lower_: Optional[np.ndarray] = None
+        self.upper_: Optional[np.ndarray] = None
+
+    def fit(self, X, y=None):
+        arr = np.asarray(X, dtype=float)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        self.lower_ = np.nanquantile(arr, self.lower_q, axis=0)
+        self.upper_ = np.nanquantile(arr, self.upper_q, axis=0)
+        return self
+
+    def transform(self, X):
+        arr = np.asarray(X, dtype=float)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        if self.lower_ is None or self.upper_ is None:
+            return arr
+        return np.clip(arr, self.lower_, self.upper_)
+
+
 class ModelTrainer:
     """
     Full walk-forward trainer for all ML specialists across all assets.
@@ -110,7 +141,10 @@ class ModelTrainer:
 
     def __init__(self, config_loader: ConfigLoader, registry: ModelRegistry):
         self.cfg_loader = config_loader
-        self.model_cfg = config_loader.load_yaml("models.yaml")["models"]
+        models_yaml = config_loader.load_yaml("models.yaml")
+        self.model_cfg = models_yaml["models"]
+        self.preproc_cfg = models_yaml.get("training_preprocessing", {})
+        self.optim_cfg = config_loader.load_yaml("optimization.yaml").get("optimization", {})
         self.assets_cfg = config_loader.load_yaml("assets.yaml")
         self.labels_cfg = config_loader.load_yaml("labels.yaml")
         self.features_cfg = config_loader.load_yaml("features.yaml")
@@ -126,6 +160,7 @@ class ModelTrainer:
     def _suppress_low_signal_warnings():
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
+            warnings.filterwarnings("ignore", category=ConvergenceWarning)
             warnings.filterwarnings(
                 "ignore",
                 message="Skipping features without any observed values.*",
@@ -146,6 +181,11 @@ class ModelTrainer:
                 message="The least populated class in y has only.*",
                 category=UserWarning,
             )
+            if optuna is not None:
+                try:
+                    warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning)
+                except Exception:
+                    pass
             yield
 
     @staticmethod
@@ -248,6 +288,147 @@ class ModelTrainer:
             return params
         return {"C": ModelTrainer._midpoint(hpo_space.get("C", [0.01, 10.0]), float)}
 
+    def _make_study(self, direction: str, cfg: Dict[str, Any]):
+        if optuna is None:
+            return None
+        sampler_name = str(
+            cfg.get("hpo_sampler")
+            or (self.optim_cfg.get("bayesian", {}) or {}).get("sampler", "tpe")
+        ).lower()
+        bayes_cfg = self.optim_cfg.get("bayesian", {}) or {}
+        seed = int(bayes_cfg.get("seed", 42))
+
+        try:
+            if sampler_name == "random":
+                sampler = optuna.samplers.RandomSampler(seed=seed)
+            else:
+                sampler = optuna.samplers.TPESampler(
+                    seed=seed,
+                    multivariate=bool(bayes_cfg.get("multivariate", False)),
+                )
+            pruner = optuna.pruners.MedianPruner(
+                n_startup_trials=int(bayes_cfg.get("pruner_startup_trials", 5)),
+                n_warmup_steps=int(bayes_cfg.get("pruner_warmup_steps", 0)),
+            )
+            return optuna.create_study(direction=direction, sampler=sampler, pruner=pruner)
+        except Exception:
+            return optuna.create_study(direction=direction)
+
+    @staticmethod
+    def _is_int_param(value: Any, bounds: Any) -> bool:
+        if isinstance(value, (int, np.integer)):
+            return True
+        if isinstance(bounds, (list, tuple)) and len(bounds) >= 2:
+            lo, hi = bounds[0], bounds[1]
+            if isinstance(lo, (int, np.integer)) and isinstance(hi, (int, np.integer)):
+                return True
+        return False
+
+    @staticmethod
+    def _mutate_single_param(
+        key: str,
+        current: Any,
+        bounds: Any,
+        rng: np.random.Generator,
+    ) -> Any:
+        if not isinstance(bounds, (list, tuple)) or len(bounds) < 2:
+            return current
+        low, high = bounds[0], bounds[1]
+        if low == high:
+            return current
+
+        if ModelTrainer._is_int_param(current, bounds):
+            lo_i = int(low)
+            hi_i = int(high)
+            center = int(round(float(current)))
+            width = max(1, int(round((hi_i - lo_i) * 0.25)))
+            lo_local = max(lo_i, center - width)
+            hi_local = min(hi_i, center + width)
+            if lo_local > hi_local:
+                lo_local, hi_local = lo_i, hi_i
+            return int(rng.integers(lo_local, hi_local + 1))
+
+        lo_f = float(low)
+        hi_f = float(high)
+        center = float(current)
+        width = (hi_f - lo_f) * 0.25
+        lo_local = max(lo_f, center - width)
+        hi_local = min(hi_f, center + width)
+        if lo_local >= hi_local:
+            lo_local, hi_local = lo_f, hi_f
+        return float(rng.uniform(lo_local, hi_local))
+
+    def _evolutionary_refine(
+        self,
+        *,
+        name: str,
+        best_params: Dict[str, Any],
+        best_score: float,
+        score_fn,
+        hpo_space: Dict[str, Any],
+        cfg: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], float]:
+        gen_cfg = self.optim_cfg.get("genetic", {}) or {}
+        enabled = bool(cfg.get("hpo_genetic_enabled", gen_cfg.get("enabled", False)))
+        if not enabled or not best_params:
+            return best_params, best_score
+
+        pop_size = int(cfg.get("hpo_population_size", gen_cfg.get("population_size", 8)))
+        generations = int(cfg.get("hpo_generations", gen_cfg.get("generations", 2)))
+        mutation_rate = float(cfg.get("hpo_mutation_rate", gen_cfg.get("mutation_rate", 0.15)))
+
+        # Keep optimization pragmatic; avoid runaway search budgets.
+        pop_size = max(3, min(pop_size, 8))
+        generations = max(1, min(generations, 2))
+        mutation_rate = min(max(mutation_rate, 0.05), 0.8)
+
+        rng = np.random.default_rng(int(gen_cfg.get("seed", 42)))
+        current_best = deepcopy(best_params)
+        current_score = float(best_score)
+        console_stage(
+            f"{self._display_name(name)} evolutionary refine",
+            f"generations={generations} population={pop_size} mutation={mutation_rate:.2f}",
+            status="info",
+        )
+
+        for gen in range(1, generations + 1):
+            candidates: List[Dict[str, Any]] = [deepcopy(current_best)]
+            for _ in range(pop_size - 1):
+                cand = deepcopy(current_best)
+                mutated_any = False
+                for k, v in list(cand.items()):
+                    if k not in hpo_space:
+                        continue
+                    if rng.uniform() <= mutation_rate:
+                        cand[k] = self._mutate_single_param(k, v, hpo_space.get(k), rng)
+                        mutated_any = True
+                if not mutated_any:
+                    # Force at least one mutation to explore locally.
+                    keys = [k for k in cand.keys() if k in hpo_space]
+                    if keys:
+                        k = keys[int(rng.integers(0, len(keys)))]
+                        cand[k] = self._mutate_single_param(k, cand[k], hpo_space.get(k), rng)
+                candidates.append(cand)
+
+            gen_best_score = current_score
+            gen_best_params = deepcopy(current_best)
+            for cand in candidates:
+                score = float(score_fn(cand))
+                if score > gen_best_score:
+                    gen_best_score = score
+                    gen_best_params = cand
+
+            improved = gen_best_score > current_score
+            current_score = gen_best_score
+            current_best = gen_best_params
+            console_stage(
+                f"{self._display_name(name)} evolution g{gen}",
+                f"best_score={current_score:.4f} improved={improved}",
+                status="ok" if improved else "info",
+            )
+
+        return current_best, current_score
+
     @staticmethod
     def _resolve_classifier_algo(algo: str) -> str:
         if algo == "lightgbm" and lgb is None:
@@ -299,8 +480,8 @@ class ModelTrainer:
     # ------------------------------------------------------------------
     # Utility: class weights and single-class safety
     # ------------------------------------------------------------------
-    def _make_class_weight(self, y: np.ndarray, cfg: Dict[str, Any]) -> Tuple[Optional[Dict[int, float]], Optional[float]]:
-        """Compute class_weight dict and scale_pos_weight for tree models."""
+    def _make_class_weight(self, y: np.ndarray, cfg: Dict[str, Any]) -> Tuple[Optional[Any], Optional[float]]:
+        """Compute dynamic class_weight and scale_pos_weight for imbalance-aware training."""
         series = pd.Series(y)
         counts = series.value_counts()
         if counts.empty:
@@ -310,18 +491,122 @@ class ModelTrainer:
         if n_pos == 0 or n_neg == 0:
             return None, None
 
-        # explicit override from YAML wins
+        scale_pos = (n_neg / n_pos) if n_pos > 0 else None
+
+        # Explicit override from YAML wins.
+        # Supported values:
+        #   - "balanced"
+        #   - dict mapping class->weight
+        #   - "none" / false / null (disable weighting)
         cw_cfg = cfg.get("class_weight")
-        if cw_cfg:
-            return cw_cfg, (n_neg / n_pos if n_pos > 0 else None)
+        if isinstance(cw_cfg, str):
+            low = cw_cfg.strip().lower()
+            if low in {"none", "off", "false", "null"}:
+                return None, scale_pos
+            if low == "balanced":
+                return "balanced", scale_pos
+        elif isinstance(cw_cfg, dict):
+            return cw_cfg, scale_pos
+        elif cw_cfg is False:
+            return None, scale_pos
+
+        # Auto mode: only apply balancing when class skew is meaningfully imbalanced.
+        ratio = max(n_pos, n_neg) / max(1.0, min(n_pos, n_neg))
+        ratio_threshold = float(cfg.get("imbalance_ratio_threshold", 1.5))
+        if ratio < ratio_threshold:
+            return None, scale_pos
 
         total = n_pos + n_neg
         cw = {
             0: total / (2.0 * n_neg),
             1: total / (2.0 * n_pos),
         }
-        scale_pos = n_neg / n_pos
         return cw, scale_pos
+
+    def _candidate_algorithms(self, cfg: Dict[str, Any], default_algo: str = "logistic") -> List[str]:
+        base_algo_raw = str(cfg.get("algorithm", default_algo)).lower()
+        algos = [self._resolve_classifier_algo(base_algo_raw)]
+        if bool(cfg.get("challenger_enabled", False)):
+            for raw in cfg.get("challenger_algorithms", []) or []:
+                cand = self._resolve_classifier_algo(str(raw).lower())
+                if cand not in algos:
+                    algos.append(cand)
+        return algos
+
+    def _train_with_challengers(
+        self,
+        X_df: pd.DataFrame,
+        y: np.ndarray,
+        cfg: Dict[str, Any],
+        name: str,
+        num_cols: List[str],
+        cat_cols: List[str],
+        default_algo: str = "logistic",
+    ) -> Tuple[Any, Dict[str, Any]]:
+        algos = self._candidate_algorithms(cfg, default_algo=default_algo)
+        if len(algos) == 1:
+            single_cfg = deepcopy(cfg)
+            single_cfg["algorithm"] = algos[0]
+            model, metrics = self._train_classifier(X_df, y, single_cfg, name=name, num_cols=num_cols, cat_cols=cat_cols)
+            metrics = metrics or {}
+            metrics["selected_algorithm"] = algos[0]
+            metrics["challenger_scores"] = {algos[0]: metrics.get("cv_score")}
+            return model, metrics
+
+        challenger_trials = int(cfg.get("challenger_hpo_trials", max(1, int(cfg.get("hpo_trials", 20)) // 2)))
+        leaderboard: Dict[str, float] = {}
+        best_algo = algos[0]
+        best_score = -np.inf
+        best_model = None
+        best_metrics: Dict[str, Any] = {}
+
+        console_stage(
+            f"{self._display_name(name)} challenger run",
+            f"algorithms={', '.join(algos)}",
+            status="info",
+        )
+
+        for idx, algo in enumerate(algos):
+            cfg_algo = deepcopy(cfg)
+            cfg_algo["algorithm"] = algo
+            if idx > 0:
+                cfg_algo["hpo_trials"] = challenger_trials
+            model, metrics = self._train_classifier(
+                X_df,
+                y,
+                cfg_algo,
+                name=f"{name}_{algo}",
+                num_cols=num_cols,
+                cat_cols=cat_cols,
+            )
+            score = metrics.get("cv_score")
+            score = float(score) if score is not None else float("-inf")
+            leaderboard[algo] = score
+            if score > best_score:
+                best_score = score
+                best_algo = algo
+                best_model = model
+                best_metrics = metrics
+
+        console_stage(
+            f"{self._display_name(name)} champion selected",
+            f"algo={best_algo} cv_score={best_score:.4f}",
+            status="ok",
+        )
+
+        if best_model is None:
+            # Defensive fallback, should never happen.
+            fallback_cfg = deepcopy(cfg)
+            fallback_cfg["algorithm"] = algos[0]
+            best_model, best_metrics = self._train_classifier(
+                X_df, y, fallback_cfg, name=name, num_cols=num_cols, cat_cols=cat_cols
+            )
+            best_algo = algos[0]
+
+        best_metrics = best_metrics or {}
+        best_metrics["selected_algorithm"] = best_algo
+        best_metrics["challenger_scores"] = leaderboard
+        return best_model, best_metrics
 
     # ------------------------------------------------------------------
     # Public entry: train all models for an asset
@@ -757,11 +1042,37 @@ class ModelTrainer:
 
         return selected or cols
 
-    def _build_preprocessor(self, num_cols: List[str], cat_cols: List[str]) -> ColumnTransformer:
-        num_pipe = Pipeline(steps=[("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())])
+    def _build_preprocessor(self, num_cols: List[str], cat_cols: List[str], algo: Optional[str] = None) -> ColumnTransformer:
+        algo = (algo or "").lower()
+        num_imputer = str(self.preproc_cfg.get("num_imputer", "median")).lower()
+        cat_imputer = str(self.preproc_cfg.get("cat_imputer", "most_frequent")).lower()
+        scaler_mode = str(self.preproc_cfg.get("scaler", "standard")).lower()
+        scale_for_tree = bool(self.preproc_cfg.get("scale_for_tree_models", True))
+        clip_enabled = bool(self.preproc_cfg.get("outlier_clip", True))
+        clip_q = self.preproc_cfg.get("clip_quantiles", [0.005, 0.995])
+        try:
+            lower_q = float(clip_q[0])
+            upper_q = float(clip_q[1])
+        except Exception:
+            lower_q, upper_q = 0.005, 0.995
+        lower_q = min(max(lower_q, 0.0), 0.49)
+        upper_q = max(min(upper_q, 1.0), 0.51)
+
+        num_steps: List[Tuple[str, Any]] = [("imputer", SimpleImputer(strategy=num_imputer))]
+        if clip_enabled:
+            num_steps.append(("clip", QuantileClipper(lower_q=lower_q, upper_q=upper_q)))
+
+        is_tree = algo in {"lightgbm", "xgboost", "gbr"}
+        if scaler_mode != "none" and (scale_for_tree or not is_tree):
+            if scaler_mode == "robust":
+                num_steps.append(("scaler", RobustScaler()))
+            else:
+                num_steps.append(("scaler", StandardScaler()))
+
+        num_pipe = Pipeline(steps=num_steps)
         cat_pipe = Pipeline(
             steps=[
-                ("imputer", SimpleImputer(strategy="most_frequent")),
+                ("imputer", SimpleImputer(strategy=cat_imputer)),
                 ("ohe", OneHotEncoder(handle_unknown="ignore")),
             ]
         )
@@ -790,10 +1101,19 @@ class ModelTrainer:
         # handle imbalance & single-class upfront
         cw, scale_pos = self._make_class_weight(y, cfg)
         class_counts = pd.Series(y).value_counts().to_dict()
+        n_pos = float(class_counts.get(1, 0.0))
+        n_neg = float(class_counts.get(0, 0.0))
+        imbalance_ratio = (max(n_pos, n_neg) / max(1.0, min(n_pos, n_neg))) if (n_pos > 0 and n_neg > 0) else None
         if cw:
-            LOG.info(f"[ModelTrainer] {name} class_weight={cw} counts={class_counts}")
+            LOG.info(
+                f"[ModelTrainer] {name} class_weight={cw} scale_pos_weight={scale_pos} "
+                f"imbalance_ratio={imbalance_ratio} counts={class_counts}"
+            )
         else:
-            LOG.info(f"[ModelTrainer] {name} class counts={class_counts} (no weighting applied)")
+            LOG.info(
+                f"[ModelTrainer] {name} class counts={class_counts} "
+                f"(no weighting applied, imbalance_ratio={imbalance_ratio})"
+            )
         self._log_training_header(
             name=name,
             algo=algo,
@@ -810,7 +1130,7 @@ class ModelTrainer:
                 f"class={next(iter(class_counts.keys())) if class_counts else 'n/a'} -> DummyClassifier",
                 status="warn",
             )
-            pre = self._build_preprocessor(num_cols, cat_cols)
+            pre = self._build_preprocessor(num_cols, cat_cols, algo=algo)
             dummy = DummyClassifier(strategy="most_frequent")
             model = Pipeline([("pre", pre), ("clf", dummy)])
             with self._suppress_low_signal_warnings():
@@ -906,7 +1226,7 @@ class ModelTrainer:
 
         def ts_score(params: Dict[str, Any]) -> float:
             base_model = build_model(params)
-            pre = self._build_preprocessor(num_cols, cat_cols)
+            pre = self._build_preprocessor(num_cols, cat_cols, algo=algo)
             model = Pipeline([("pre", pre), ("clf", base_model)])
             tscv = self._make_tscv(len(X_df), cv_splits)
             if tscv is None:
@@ -960,7 +1280,21 @@ class ModelTrainer:
             best_params = {k: v for k, v in default_params.items() if v is not None}
             best_cv = ts_score(best_params)
         else:
-            study = optuna.create_study(direction="minimize")
+            study = self._make_study(direction="minimize", cfg=cfg)
+            if study is None:
+                best_params = {k: v for k, v in default_params.items() if v is not None}
+                best_cv = ts_score(best_params)
+                pre = self._build_preprocessor(num_cols, cat_cols, algo=algo)
+                final_model = Pipeline([("pre", pre), ("clf", build_model(best_params))])
+                with self._suppress_low_signal_warnings():
+                    final_model.fit(X_df, y)
+                metrics = {
+                    "cv_score": best_cv,
+                    "best_params": best_params,
+                    "hpo_trials": 0,
+                    "class_counts": class_counts,
+                }
+                return final_model, metrics
             with self._suppress_low_signal_warnings():
                 study.optimize(objective, n_trials=n_trials, show_progress_bar=False, callbacks=[_cb])
             best_params = study.best_params
@@ -972,7 +1306,16 @@ class ModelTrainer:
             self._log_hpo_summary(name, best_cv, best_params, hpo_t0)
             best_params = {k: v for k, v in best_params.items() if v is not None}
 
-        pre = self._build_preprocessor(num_cols, cat_cols)
+        best_params, best_cv = self._evolutionary_refine(
+            name=name,
+            best_params=best_params,
+            best_score=best_cv,
+            score_fn=ts_score,
+            hpo_space=hpo_space,
+            cfg=cfg,
+        )
+
+        pre = self._build_preprocessor(num_cols, cat_cols, algo=algo)
         final_model = Pipeline([("pre", pre), ("clf", build_model(best_params))])
         with self._suppress_low_signal_warnings():
             final_model.fit(X_df, y)
@@ -1019,17 +1362,16 @@ class ModelTrainer:
     # ------------------------------------------------------------------
     def _train_stack(self, df: pd.DataFrame, specialists: Dict[str, Dict[str, Any]], cfg: Dict[str, Any], target_key: str):
         inputs = cfg.get("specialist_inputs", list(specialists.keys()))
-        hpo_space = cfg.get("hpo_space", {})
-        n_trials = int(cfg.get("hpo_trials", 10))
         cv_splits = int(cfg.get("cv_splits", 3))
-        default_params = self._default_params_for_algo("logistic", hpo_space)
+        y_meta = df[target_key].astype(int).values if target_key in df else df["label_liq_flow"].astype(int).values
+
         self._log_training_header(
             name=f"{target_key}_stack",
-            algo="logistic_stack",
+            algo=f"{cfg.get('algorithm', 'logistic')}_stack",
             rows=len(df),
             features=len(inputs),
-            class_counts=pd.Series(df[target_key].astype(int).values if target_key in df else df["label_liq_flow"].astype(int).values).value_counts().to_dict(),
-            trials=n_trials,
+            class_counts=pd.Series(y_meta).value_counts().to_dict(),
+            trials=int(cfg.get("hpo_trials", 10)),
         )
 
         base_cols = []
@@ -1039,7 +1381,6 @@ class ModelTrainer:
             base_cols.append((key, model, cols))
 
         X_meta_parts = []
-        y_meta = df[target_key].astype(int).values if target_key in df else df["label_liq_flow"].astype(int).values
         tscv = self._make_tscv(len(df), cv_splits)
         if tscv is None:
             full_idx = np.arange(len(df))
@@ -1050,7 +1391,7 @@ class ModelTrainer:
                 fold_preds.append(prob)
             X_meta_parts.append((full_idx, np.vstack(fold_preds).T))
         else:
-            for train_idx, val_idx in tscv.split(df):
+            for _, val_idx in tscv.split(df):
                 fold_preds = []
                 for _, model, cols in base_cols:
                     X_fold = df.iloc[val_idx][cols]
@@ -1059,106 +1400,43 @@ class ModelTrainer:
                 X_fold_mat = np.vstack(fold_preds).T
                 X_meta_parts.append((val_idx, X_fold_mat))
 
+        meta_columns = [f"p_{key}" for key, _, _ in base_cols]
         meta_mat = np.zeros((len(df), len(base_cols)))
         filled_mask = np.zeros(len(df), dtype=bool)
         for val_idx, mat in X_meta_parts:
             meta_mat[val_idx, :] = mat
             filled_mask[val_idx] = True
+
         valid_mask = filled_mask.copy()
         if not valid_mask.any():
             valid_mask = np.ones(len(df), dtype=bool)
-        meta_train = meta_mat[valid_mask]
+
+        X_meta_df = pd.DataFrame(meta_mat, columns=meta_columns)
+        X_train_df = X_meta_df.loc[valid_mask].reset_index(drop=True)
         y_train = y_meta[valid_mask]
 
-        def build_meta(params: Dict[str, Any]):
-            return LogisticRegression(
-                C=float(params.get("C", 1.0)),
-                max_iter=500,
-                penalty="l2",
-                solver="lbfgs",
-            )
+        stack_model, stack_metrics = self._train_with_challengers(
+            X_df=X_train_df,
+            y=y_train,
+            cfg=cfg,
+            name=f"{target_key}_stack",
+            num_cols=list(X_train_df.columns),
+            cat_cols=[],
+            default_algo="logistic",
+        )
 
-        def param_space(trial) -> Dict[str, Any]:
-            return {
-                "C": trial.suggest_float(
-                    "C", float(hpo_space.get("C", [0.01, 5.0])[0]),
-                    float(hpo_space.get("C", [0.01, 5.0])[1]),
-                    log=True,
-                )
-            }
-
-        def meta_score(params: Dict[str, Any]) -> float:
-            if np.unique(y_train).size < 2:
-                return 0.5
-            model = build_meta(params)
-            meta_tscv = self._make_tscv(len(meta_train), cv_splits)
-            if meta_tscv is None:
-                with self._suppress_low_signal_warnings():
-                    model.fit(meta_train, y_train)
-                    prob = self._positive_class_proba(model, meta_train)
-                    return float(average_precision_score(y_train, prob))
-            scores = []
-            for tr_idx, va_idx in meta_tscv.split(meta_train):
-                Xt, Xv = meta_train[tr_idx], meta_train[va_idx]
-                yt, yv = y_train[tr_idx], y_train[va_idx]
-                with self._suppress_low_signal_warnings():
-                    model.fit(Xt, yt)
-                    prob = self._positive_class_proba(model, Xv)
-                    pr = average_precision_score(yv, prob)
-                scores.append(pr)
-            return float(np.mean(scores))
-
-        def objective(trial):
-            return -meta_score(param_space(trial))
-
-        if optuna is None or n_trials <= 0:
-            LOG.warning("[ModelTrainer] Optuna unavailable for stacking; using default params=%s", default_params)
-            best_params = default_params
-            hpo_t0 = time.perf_counter()
-            self._log_hpo_summary(
-                f"{target_key}_stack",
-                meta_score(best_params),
-                best_params,
-                hpo_t0,
-                extra={"mode": "default_params"},
-            )
-        else:
-            study = optuna.create_study(direction="minimize")
-            hpo_t0 = time.perf_counter()
-
-            def _cb(study, trial):
-                if trial.value is None:
-                    return
-                should_log = (
-                    trial.number == 0
-                    or (trial.number + 1) == n_trials
-                    or ((trial.number + 1) % max(1, min(5, n_trials // 4 or 1)) == 0)
-                )
-                if should_log:
-                    self._log_hpo_progress(
-                        name=f"{target_key}_stack",
-                        trial_number=trial.number + 1,
-                        total_trials=n_trials,
-                        trial_value=float(trial.value),
-                        best_value=float(study.best_value),
-                        started_at=hpo_t0,
-                    )
-
-            with self._suppress_low_signal_warnings():
-                study.optimize(objective, n_trials=n_trials, show_progress_bar=False, callbacks=[_cb])
-            best_params = study.best_params
-            self._log_hpo_summary(f"{target_key}_stack", -study.best_value, best_params, hpo_t0)
-
-        if np.unique(y_train).size < 2:
-            final_meta = DummyClassifier(strategy="most_frequent")
-            with self._suppress_low_signal_warnings():
-                final_meta.fit(meta_train, y_train)
-        else:
-            final_meta = build_meta(best_params)
-            with self._suppress_low_signal_warnings():
-                final_meta.fit(meta_train, y_train)
-        LOG.info(f"[ModelTrainer] Stacking model trained with params={best_params}")
-        return final_meta, {"stack_inputs": inputs}
+        LOG.info(
+            "[ModelTrainer] Stacking model trained algo=%s metrics=%s",
+            stack_metrics.get("selected_algorithm"),
+            {k: v for k, v in stack_metrics.items() if k in {"cv_score", "best_params", "selected_algorithm"}},
+        )
+        return stack_model, {
+            "stack_inputs": inputs,
+            "meta_feature_cols": meta_columns,
+            "selected_algorithm": stack_metrics.get("selected_algorithm"),
+            "challenger_scores": stack_metrics.get("challenger_scores", {}),
+            "training_metrics": {k: v for k, v in stack_metrics.items() if k not in {"challenger_scores"}},
+        }
 
     # ------------------------------------------------------------------
     # Hazard model (per-bin logistic)
@@ -1168,7 +1446,8 @@ class ModelTrainer:
         hpo_trials = int(cfg.get("hpo", {}).get("trials_per_bin", 5))
         cv_splits = int(cfg.get("cv_splits", 3))
         hpo_space = cfg.get("hpo_space", {"C": [0.01, 10.0]})
-        default_params = self._default_params_for_algo("logistic", hpo_space)
+        base_algo = self._resolve_classifier_algo(str(cfg.get("algorithm", "logistic")).lower())
+        selected_algo = base_algo
 
         X_all, feature_cols, num_cols, cat_cols = self._prepare_features(
             df,
@@ -1183,9 +1462,45 @@ class ModelTrainer:
                 "features": fmt_num(len(feature_cols)),
                 "horizon_bins": fmt_num(horizon),
                 "trials_per_bin": fmt_num(hpo_trials),
+                "base_algo": base_algo,
             },
             style="yellow",
         )
+
+        # Optional challenger selection on a representative probe bin,
+        # then reuse the winner for all hazard bins to control runtime.
+        if bool(cfg.get("challenger_enabled", False)):
+            probe_bin = int(cfg.get("challenger_probe_bin", min(12, horizon)))
+            y_probe = ((event == 1) & (tte <= probe_bin)).astype(int)
+            if np.unique(y_probe).size >= 2:
+                probe_cfg = deepcopy(cfg)
+                probe_cfg["algorithm"] = base_algo
+                probe_cfg["hpo_trials"] = int(cfg.get("challenger_hpo_trials", max(2, hpo_trials)))
+                _, probe_metrics = self._train_with_challengers(
+                    X_df=X_all,
+                    y=y_probe,
+                    cfg=probe_cfg,
+                    name=f"hazard_probe_b{probe_bin}",
+                    num_cols=num_cols,
+                    cat_cols=cat_cols,
+                    default_algo=base_algo,
+                )
+                selected_algo = self._resolve_classifier_algo(
+                    str(probe_metrics.get("selected_algorithm", base_algo)).lower()
+                )
+                console_stage(
+                    "Hazard champion selected",
+                    f"probe_bin={probe_bin} algo={selected_algo}",
+                    status="ok",
+                )
+            else:
+                console_stage(
+                    "Hazard challenger skipped",
+                    f"probe_bin={probe_bin} had single-class target",
+                    status="warn",
+                )
+
+        default_params = self._default_params_for_algo(selected_algo, hpo_space)
 
         for b in range(1, horizon + 1):
             y_bin = ((event == 1) & (tte <= b)).astype(int)
@@ -1197,8 +1512,47 @@ class ModelTrainer:
                     f"event_rate={y_bin.mean():.4f}",
                     status="info",
                 )
+            cw_bin, scale_pos_bin = self._make_class_weight(y_bin, cfg)
 
             def param_space(trial):
+                if selected_algo in ("lightgbm", "xgboost"):
+                    params = {
+                        "n_estimators": trial.suggest_int(
+                            "n_estimators", int(hpo_space.get("n_estimators", [150, 400])[0]),
+                            int(hpo_space.get("n_estimators", [150, 400])[1]),
+                        ),
+                        "max_depth": trial.suggest_int(
+                            "max_depth", int(hpo_space.get("max_depth", [3, 10])[0]),
+                            int(hpo_space.get("max_depth", [3, 10])[1]),
+                        ),
+                        "learning_rate": trial.suggest_float(
+                            "learning_rate", float(hpo_space.get("learning_rate", [0.005, 0.12])[0]),
+                            float(hpo_space.get("learning_rate", [0.005, 0.12])[1]),
+                            log=True,
+                        ),
+                        "subsample": trial.suggest_float(
+                            "subsample", float(hpo_space.get("subsample", [0.6, 1.0])[0]),
+                            float(hpo_space.get("subsample", [0.6, 1.0])[1]),
+                        ),
+                        "colsample_bytree": trial.suggest_float(
+                            "colsample_bytree", float(hpo_space.get("colsample_bytree", [0.6, 1.0])[0]),
+                            float(hpo_space.get("colsample_bytree", [0.6, 1.0])[1]),
+                        ),
+                        "reg_alpha": trial.suggest_float(
+                            "reg_alpha", float(hpo_space.get("reg_alpha", [0.0, 5.0])[0]),
+                            float(hpo_space.get("reg_alpha", [0.0, 5.0])[1]),
+                        ),
+                        "reg_lambda": trial.suggest_float(
+                            "reg_lambda", float(hpo_space.get("reg_lambda", [0.0, 5.0])[0]),
+                            float(hpo_space.get("reg_lambda", [0.0, 5.0])[1]),
+                        ),
+                    }
+                    if selected_algo == "lightgbm":
+                        params["num_leaves"] = trial.suggest_int(
+                            "num_leaves", int(hpo_space.get("num_leaves", [15, 127])[0]),
+                            int(hpo_space.get("num_leaves", [15, 127])[1]),
+                        )
+                    return params
                 return {
                     "C": trial.suggest_float(
                         "C", float(hpo_space.get("C", [0.01, 10.0])[0]),
@@ -1207,10 +1561,46 @@ class ModelTrainer:
                     )
                 }
 
+            def build_estimator(params: Dict[str, Any]):
+                if selected_algo == "lightgbm":
+                    return lgb.LGBMClassifier(
+                        n_estimators=int(params["n_estimators"]),
+                        num_leaves=int(params["num_leaves"]),
+                        max_depth=int(params["max_depth"]),
+                        learning_rate=float(params["learning_rate"]),
+                        subsample=float(params.get("subsample", 1.0)),
+                        colsample_bytree=float(params.get("colsample_bytree", 1.0)),
+                        reg_alpha=float(params.get("reg_alpha", 0.0)),
+                        reg_lambda=float(params.get("reg_lambda", 0.0)),
+                        objective="binary",
+                        class_weight=cw_bin,
+                    )
+                if selected_algo == "xgboost":
+                    return xgb.XGBClassifier(
+                        n_estimators=int(params["n_estimators"]),
+                        max_depth=int(params["max_depth"]),
+                        learning_rate=float(params["learning_rate"]),
+                        subsample=float(params.get("subsample", 1.0)),
+                        colsample_bytree=float(params.get("colsample_bytree", 1.0)),
+                        reg_alpha=float(params.get("reg_alpha", 0.0)),
+                        reg_lambda=float(params.get("reg_lambda", 0.0)),
+                        eval_metric="logloss",
+                        tree_method="hist",
+                        objective="binary:logistic",
+                        scale_pos_weight=scale_pos_bin,
+                    )
+                return LogisticRegression(
+                    C=float(params["C"]),
+                    max_iter=400,
+                    penalty="l2",
+                    solver="lbfgs",
+                    class_weight=cw_bin,
+                )
+
             def objective(trial):
                 params = param_space(trial)
-                base = LogisticRegression(C=float(params["C"]), max_iter=300, penalty="l2", solver="lbfgs")
-                pre = self._build_preprocessor(num_cols, cat_cols)
+                base = build_estimator(params)
+                pre = self._build_preprocessor(num_cols, cat_cols, algo=selected_algo)
                 model = Pipeline([("pre", pre), ("clf", base)])
                 tscv = self._make_tscv(len(X_all), cv_splits)
                 if tscv is None:
@@ -1230,22 +1620,29 @@ class ModelTrainer:
                 return -float(np.mean(scores))
 
             if cfg.get("hpo", {}).get("enabled", True) and optuna is not None and hpo_trials > 0:
-                study = optuna.create_study(direction="minimize")
-                with self._suppress_low_signal_warnings():
-                    study.optimize(objective, n_trials=hpo_trials, show_progress_bar=False)
-                best_C = study.best_params["C"]
+                study = self._make_study(direction="minimize", cfg=cfg)
+                if study is not None:
+                    with self._suppress_low_signal_warnings():
+                        study.optimize(objective, n_trials=hpo_trials, show_progress_bar=False)
+                    best_params = study.best_params
+                else:
+                    best_params = default_params
             else:
-                best_C = float(default_params["C"])
+                best_params = default_params
 
-            clf = LogisticRegression(C=float(best_C), max_iter=400, penalty="l2", solver="lbfgs")
-            pre = self._build_preprocessor(num_cols, cat_cols)
+            clf = build_estimator(best_params)
+            pre = self._build_preprocessor(num_cols, cat_cols, algo=selected_algo)
             pipe = Pipeline([("pre", pre), ("clf", clf)])
             with self._suppress_low_signal_warnings():
                 pipe.fit(X_all, y_bin)
             models[b] = pipe
 
         LOG.info(f"[ModelTrainer] Hazard model trained with {len(models)} bins.")
-        return models, {"horizon_bars": horizon, "feature_cols": feature_cols}
+        return models, {
+            "horizon_bars": horizon,
+            "feature_cols": feature_cols,
+            "selected_algorithm": selected_algo,
+        }
 
     # ------------------------------------------------------------------
     # Quantile forecaster (LightGBM regressor)
@@ -1353,7 +1750,7 @@ class ModelTrainer:
             def objective(trial):
                 params = param_space(trial)
                 base_model = build_quantile_model(params)
-                pre = self._build_preprocessor(num_cols, cat_cols)
+                pre = self._build_preprocessor(num_cols, cat_cols, algo=algo)
                 model = Pipeline([("pre", pre), ("reg", base_model)])
                 tscv = self._make_tscv(len(X_all), cv_splits)
                 if tscv is None:
@@ -1383,7 +1780,21 @@ class ModelTrainer:
                     status="warn",
                 )
             else:
-                study = optuna.create_study(direction="minimize")
+                study = self._make_study(direction="minimize", cfg=cfg)
+                if study is None:
+                    best_params = default_params
+                    base_final = build_quantile_model(best_params)
+                    pre = self._build_preprocessor(num_cols, cat_cols, algo=algo)
+                    pipe = Pipeline([("pre", pre), ("reg", base_final)])
+                    with self._suppress_low_signal_warnings():
+                        pipe.fit(X_all, returns)
+                    models[f"q_{q}"] = pipe
+                    console_stage(
+                        f"Quantile q={q} ready",
+                        f"elapsed={fmt_seconds(time.perf_counter() - q_t0)}",
+                        status="success",
+                    )
+                    continue
                 def _cb(study, trial):
                     if trial.value is None:
                         return
@@ -1417,7 +1828,7 @@ class ModelTrainer:
                 )
 
             base_final = build_quantile_model(best_params)
-            pre = self._build_preprocessor(num_cols, cat_cols)
+            pre = self._build_preprocessor(num_cols, cat_cols, algo=algo)
             pipe = Pipeline([("pre", pre), ("reg", base_final)])
             with self._suppress_low_signal_warnings():
                 pipe.fit(X_all, returns)

@@ -66,8 +66,13 @@ def read_frame(path: str) -> pd.DataFrame:
         raise FileNotFoundError(path)
 
     header = pd.read_csv(path_obj, nrows=0)
-    parse_dates = [c for c in ("dt", "timestamp", "entry_ts", "exit_ts") if c in header.columns]
-    df = pd.read_csv(path_obj, parse_dates=parse_dates if parse_dates else None)
+    # Avoid parsing numeric epoch columns as datetime strings (noise + slow path).
+    parse_dates = [c for c in ("dt", "entry_ts", "exit_ts") if c in header.columns]
+    df = pd.read_csv(
+        path_obj,
+        parse_dates=parse_dates if parse_dates else None,
+        low_memory=False,
+    )
     if "dt" in df.columns:
         df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
     elif "timestamp" in df.columns:
