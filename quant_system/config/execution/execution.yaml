@@ -159,6 +159,8 @@ execution:
   # (10h → 6h → 1h → 15m equivalent)
   # =======================================================
   gates:
+    strict_mode: true
+
     regime_12h:
       trend_prob_min: 0.45
       tox_max: 0.35

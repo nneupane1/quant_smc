@@ -21,6 +21,7 @@ class GateEvaluator:
     def __init__(self, config: Union[Dict[str, Any], Any]):
         cfg = _as_dict(config)
         self.gates = cfg.get("execution", {}).get("gates", {})
+        self.strict_mode = bool(self.gates.get("strict_mode", False))
 
         # Sensible defaults if not provided
         self.ocean_cfg = self.gates.get(
@@ -48,8 +49,12 @@ class GateEvaluator:
             "flow_1h",
             {"trend_prob_min": 0.45, "tox_max": 0.35},
         )
-        if "trend_prob_min" in self.flow_cfg:
-            self.flow_cfg = {"displacement_body_pct_min": 0.60, "volume_z_min": 0.80, "freshness_bars": 4}
+        if "trend_prob_min" in self.flow_cfg and "displacement_body_pct_min" not in self.flow_cfg:
+            self.flow_cfg = {
+                "displacement_body_pct_min": 0.60,
+                "volume_z_min": 0.80,
+                "freshness_bars": 4,
+            }
 
     @staticmethod
     def _get(row: pd.Series, keys, default=None):
@@ -59,9 +64,18 @@ class GateEvaluator:
         return default
 
     def _ocean_ok(self, row: pd.Series, side: str, reasons: list) -> bool:
-        trend_up = self._get(row, ["p_trend_up_12h", "p_trend_up", "p_regime_trend"], 0.0)
-        trend_down = self._get(row, ["p_trend_down_12h", "p_trend_down", "p_regime_collapse"], 0.0)
-        tox = self._get(row, ["toxicity_12h", "tox_12h"], 0.0)
+        trend_up = self._get(row, ["p_trend_up_12h", "p_trend_up", "p_regime_trend"], None)
+        trend_down = self._get(row, ["p_trend_down_12h", "p_trend_down", "p_regime_collapse"], None)
+        tox = self._get(row, ["toxicity_12h", "tox_12h"], None)
+
+        if trend_up is None or trend_down is None:
+            reasons.append("ocean_trend_missing")
+            return not self.strict_mode
+        if tox is None:
+            reasons.append("ocean_tox_missing")
+            if self.strict_mode:
+                return False
+            tox = 0.0
 
         if side == "long":
             if trend_up < self.ocean_cfg["trend_prob_min"]:
@@ -82,9 +96,10 @@ class GateEvaluator:
         bias = self._get(row, ["structural_bias_6h", "structure_bias_6h", "bias_6h", "structure_bias"])
         zone_score = self._get(row, ["zone_score_6h", "zone_score"], None)
 
-        # Allow if we lack the feature
+        # Optional in permissive mode, required in strict mode.
         if bias is None and zone_score is None:
-            return True
+            reasons.append("waves_missing")
+            return not self.strict_mode
 
         if bias:
             if side == "long" and str(bias).lower() not in {"up", "bull", "bullish"}:
@@ -115,6 +130,9 @@ class GateEvaluator:
 
         # If we can't compute, allow but note
         if body is None or vol_z is None or age is None:
+            reasons.append("flow_missing")
+            if self.strict_mode:
+                return False
             if flow_prob is not None and ml_prob_min is not None and flow_prob < ml_prob_min:
                 reasons.append("flow_ml_low")
                 return False

@@ -263,8 +263,29 @@ class Backtester:
                     locked_profit += max(lock_delta, 0.0)
                     free_capital = max(free_capital - max(lock_delta, 0.0), 0.0)
 
-                pos_size_usd = capital_out["ticket_usd"]
                 risk_perc = capital_out["risk_mode"]
+                if risk_perc is None:
+                    risk_perc = float(np.clip(float(capital_out.get("ticket_usd", 0.0)) / max(equity, 1e-9), 0.0, 1.0))
+
+                # Stop from EVR if available
+                stop_price = evr_result.get("stop_price", row_enriched.get("stop_price", row_enriched["close"]))
+                sizing = self.position_sizer.size_position(
+                    row=row_enriched,
+                    equity=max(equity, 0.0),
+                    side=side,
+                    stop_price=float(stop_price),
+                    risk_mode=float(risk_perc),
+                    hedge_ratio=float(capital_out.get("hedge_ratio", 0.0)),
+                )
+                pos_size_usd = min(
+                    float(capital_out["ticket_usd"]),
+                    float(sizing.get("value", 0.0)),
+                    float(free_capital),
+                )
+                row_enriched["sizer_value_usd"] = float(sizing.get("value", 0.0))
+                row_enriched["sizer_qty"] = float(sizing.get("qty", 0.0))
+                row_enriched["sizer_risk_dollars"] = float(sizing.get("risk_dollars", 0.0))
+                row_enriched["position_notional_usd"] = float(pos_size_usd)
                 if pos_size_usd <= 0 or pos_size_usd > free_capital:
                     continue
 
@@ -272,9 +293,6 @@ class Backtester:
                 runner_split = self.exec_cfg.get("runner_split", {})
                 core_frac = runner_split.get("core_frac", 0.7)
                 runner_frac = 1.0 - core_frac
-
-                # Stop from EVR if available
-                stop_price = evr_result.get("stop_price", row_enriched.get("stop_price", row_enriched["close"]))
 
                 entry_price = row_enriched["close"]
 

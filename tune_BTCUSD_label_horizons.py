@@ -4,7 +4,10 @@ from python_bootstrap import ensure_runtime
 
 ensure_runtime(("pandas", "sklearn"))
 
+import warnings
 from pathlib import Path
+
+from pandas.errors import DtypeWarning
 
 from quant_system.cli.common import load_or_build_features
 from quant_system.config.config_loader import ConfigLoader
@@ -21,6 +24,12 @@ MIN_IMPROVEMENT = 0.01
 
 
 def main() -> None:
+    warnings.filterwarnings("ignore", category=DtypeWarning)
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Could not infer format, so each element will be parsed individually.*",
+        category=UserWarning,
+    )
     loader = ConfigLoader(CONFIG_DIR)
     features_df = load_or_build_features(
         loader,

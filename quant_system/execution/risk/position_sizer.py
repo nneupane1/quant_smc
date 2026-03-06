@@ -41,6 +41,14 @@ class PositionSizer:
         return max(qty, 0.0)
 
     def _compute_qty(self, equity: float, risk_mode: float, stop_dist: float, px: float) -> float:
+        if not np.isfinite(equity) or equity <= 0:
+            return 0.0
+        if not np.isfinite(risk_mode):
+            risk_mode = 0.0
+        if not np.isfinite(stop_dist) or stop_dist <= 0:
+            return 0.0
+        if not np.isfinite(px) or px <= 0:
+            return 0.0
         position_value = equity * risk_mode
         raw_qty = position_value / stop_dist
 
@@ -61,8 +69,9 @@ class PositionSizer:
         hedge_ratio: float,
     ) -> Dict[str, Any]:
         px = float(row["close"])
+        stop_price = float(stop_price)
         stop_dist = abs(px - stop_price)
-        if stop_dist <= 0:
+        if (not np.isfinite(px)) or (not np.isfinite(stop_price)) or (not np.isfinite(stop_dist)) or stop_dist <= 0:
             return {"qty": 0.0, "hedge_qty": 0.0, "value": 0.0, "risk_dollars": 0.0, "leverage_estimate": 0.0}
 
         qty = self._compute_qty(equity, risk_mode, stop_dist, px)

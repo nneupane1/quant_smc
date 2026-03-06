@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, Optional
 
+import numpy as np
 import pandas as pd
 
 from quant_system.config.config_loader import ConfigLoader
@@ -23,6 +24,9 @@ from quant_system.execution.risk.position_sizer import PositionSizer
 from quant_system.forward_test.forward_reasoning_attach import ReasoningAttach
 from quant_system.live.kraken_live_client import KrakenLiveClient
 from quant_system.live.live_executor import LiveExecutor
+from quant_system.live_data.live_feature_enricher import LiveFeatureEnricher
+from quant_system.live_data.quote_state import QuoteState
+from quant_system.live_data.tf_builder import TFBuilder
 from quant_system.ml.predict.model_predictor import ModelPredictor
 from quant_system.ml.registry.model_registry import ModelRegistry
 from quant_system.utils.logger import get_logger
@@ -56,6 +60,15 @@ class LiveOrchestrator:
 
         self.feed = KrakenLiveClient(config_loader)
         self.executor = LiveExecutor(config_loader, dashboard_adapter=dashboard_adapter)
+        self.assets_cfg = self.cfg.get("assets", {})
+        self.assets_meta = self.assets_cfg.get("metadata", {})
+        self.default_asset = self.cfg.get("default_asset") or (next(iter(self.assets_meta)) if self.assets_meta else "BTCUSD")
+        assets = list(self.assets_meta.keys()) or [self.default_asset]
+        self.quote_state = {asset: QuoteState() for asset in assets}
+        self.tf_builder = {asset: TFBuilder() for asset in assets}
+        self.live_enricher = LiveFeatureEnricher(config_loader)
+        self.strict_gate_mode = bool(self.exec_cfg.get("gates", {}).get("strict_mode", False))
+        self.pair_aliases = self._build_pair_aliases()
 
         self.buffers = {"1m": []}
         self.bar_index = 0
@@ -82,13 +95,30 @@ class LiveOrchestrator:
             self.load_models()
 
         for c1 in self.feed.run_stream():
-            self.buffers["1m"].append(c1)
-            if not self._ready_bar():
+            if c1 is None:
                 continue
-            bar = self._agg_15m()
-            if bar is None:
-                continue
-            self.on_bar(bar.get("asset", "BTCUSD"), bar)
+            candle_1m = dict(c1)
+            asset = self._resolve_asset(str(candle_1m.get("asset", ""))) or self.default_asset
+            if asset not in self.quote_state:
+                self.quote_state[asset] = QuoteState()
+            if asset not in self.tf_builder:
+                self.tf_builder[asset] = TFBuilder()
+            candle_1m["asset"] = asset
+            if "dt" not in candle_1m:
+                candle_1m["dt"] = datetime.utcfromtimestamp(int(candle_1m["timestamp"]))
+
+            self.quote_state[asset].push_1m(candle_1m)
+            emits = self.tf_builder[asset].push_1m(candle_1m)
+            for tf, bar in emits.items():
+                bar["asset"] = asset
+                self.quote_state[asset].push_tf(tf, bar)
+                if tf != "15m":
+                    continue
+                enriched = self.live_enricher.enrich(self.quote_state[asset], asset, bar)
+                if enriched is None and self.strict_gate_mode:
+                    LOG.info("[LiveOrchestrator] strict_mode drop %s 15m bar due to missing HTF context", asset)
+                    continue
+                self.on_bar(asset, enriched or bar)
 
     def run_rows(self, asset: str, rows: pd.DataFrame):
         if not self.models_loaded:
@@ -185,7 +215,10 @@ class LiveOrchestrator:
             row=enriched.to_dict(),
             mpc_manager=self.mpc,
         )
-        self.current_risk_mode = capital_out["risk_mode"]
+        risk_mode = capital_out["risk_mode"]
+        if risk_mode is None:
+            risk_mode = float(np.clip(float(capital_out.get("ticket_usd", 0.0)) / max(self.executor.equity, 1e-9), 0.0, 1.0))
+        self.current_risk_mode = risk_mode
         self.current_hedge_ratio = capital_out["hedge_ratio"]
 
         if capital_out["lock_fraction"] > 0:
@@ -194,7 +227,23 @@ class LiveOrchestrator:
             self.executor.locked_profit += lock_delta
             self.executor.free_capital -= lock_delta
 
-        pos_usd = capital_out["ticket_usd"]
+        sizing = self.position_sizer.size_position(
+            row=enriched,
+            equity=max(self.executor.equity, 0.0),
+            side=side,
+            stop_price=float(enriched.get("stop_price", enriched["close"])),
+            risk_mode=float(risk_mode),
+            hedge_ratio=float(capital_out.get("hedge_ratio", 0.0)),
+        )
+        pos_usd = min(
+            float(capital_out["ticket_usd"]),
+            float(sizing.get("value", 0.0)),
+            float(self.executor.free_capital),
+        )
+        enriched["sizer_value_usd"] = float(sizing.get("value", 0.0))
+        enriched["sizer_qty"] = float(sizing.get("qty", 0.0))
+        enriched["sizer_risk_dollars"] = float(sizing.get("risk_dollars", 0.0))
+        enriched["position_notional_usd"] = float(pos_usd)
         if pos_usd <= 0 or pos_usd > self.executor.free_capital:
             self._refresh_equity(dt, enriched)
             return
@@ -344,6 +393,28 @@ class LiveOrchestrator:
         except Exception as exc:
             LOG.warning("[LiveOrchestrator] predictor failed: %s", exc)
         return enriched
+
+    def _build_pair_aliases(self) -> Dict[str, str]:
+        mapping: Dict[str, str] = {}
+        for asset, meta in self.assets_meta.items():
+            variants = {
+                asset,
+                meta.get("symbol", ""),
+                meta.get("kraken_pair", ""),
+                f"{meta.get('base', '')}/{meta.get('quote', '')}" if meta.get("base") and meta.get("quote") else "",
+                f"X{meta.get('base', '')}Z{meta.get('quote', '')}" if meta.get("base") and meta.get("quote") else "",
+                f"XXBTZUSD" if meta.get("kraken_pair", "").startswith("XBT") and meta.get("quote") == "USD" else "",
+            }
+            for v in variants:
+                if v:
+                    mapping[v.upper()] = asset
+                    mapping[v.replace("/", "").upper()] = asset
+        return mapping
+
+    def _resolve_asset(self, pair: str) -> Optional[str]:
+        if not pair:
+            return None
+        return self.pair_aliases.get(pair.upper()) or self.pair_aliases.get(pair.replace("/", "").upper())
 
     def _update_dashboard(self, row: pd.Series, conf: float, evr: Dict[str, Any]):
         if not self.dashboard:

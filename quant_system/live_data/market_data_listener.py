@@ -12,6 +12,7 @@ import websockets
 
 from quant_system.config.config_loader import ConfigLoader
 from quant_system.live.kraken_live_client import KrakenLiveClient
+from quant_system.live_data.live_feature_enricher import LiveFeatureEnricher
 from quant_system.live_data.quote_state import QuoteState
 from quant_system.live_data.tf_builder import TFBuilder
 from quant_system.utils.logger import get_logger
@@ -34,6 +35,8 @@ class MarketDataListener:
 
         self.state = {sym: QuoteState() for sym in self.symbols}
         self.tf = {sym: TFBuilder() for sym in self.symbols}
+        self.enricher = LiveFeatureEnricher(cfg)
+        self.strict_gate_mode = bool(self.cfg.get("execution", {}).get("gates", {}).get("strict_mode", False))
         self.running_1m: Dict[str, Optional[dict]] = {sym: None for sym in self.symbols}
         self.rest_clients = self._build_rest_clients()
 
@@ -183,7 +186,11 @@ class MarketDataListener:
         for tf, bar in emits.items():
             self.state[asset].push_tf(tf, bar)
             if tf == "15m" and self.forward:
-                self.forward.on_bar(asset, bar)
+                enriched = self.enricher.enrich(self.state[asset], asset, bar)
+                if enriched is None and self.strict_gate_mode:
+                    LOG.info("[MarketData] strict_mode drop %s 15m bar due to missing HTF context", asset)
+                else:
+                    self.forward.on_bar(asset, enriched or bar)
             if self.dashboard and hasattr(self.dashboard, "update_tf_bar"):
                 self.dashboard.update_tf_bar(asset, tf, bar)
             elif self.dashboard:

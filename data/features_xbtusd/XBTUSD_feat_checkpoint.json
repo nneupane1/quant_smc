@@ -1,6 +1,0 @@
-{
-  "asset": "XBTUSD",
-  "input_dir": "data/kraken_xbtusd_direct",
-  "out_path": "data\\features_xbtusd\\XBTUSD_features.csv",
-  "last_stage": 4
-}

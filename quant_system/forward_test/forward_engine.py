@@ -16,6 +16,7 @@ This engine is the live mirror of the backtester.
 """
 
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 
@@ -225,6 +226,9 @@ class ForwardEngine:
         risk = capital_out["risk_mode"]
         hedge_ratio = capital_out["hedge_ratio"]
         lock_fraction = capital_out["lock_fraction"]
+        base_ticket = float(capital_out.get("ticket_usd", 0.0))
+        if risk is None:
+            risk = float(np.clip(base_ticket / max(self.equity, 1e-9), 0.0, 1.0))
         self.current_risk_mode = risk
         self.current_hedge_ratio = hedge_ratio
 
@@ -232,8 +236,20 @@ class ForwardEngine:
         if lock_fraction > 0:
             self._lock_profit(lock_fraction)
 
-        # Determine position size
-        pos_usd = capital_out["ticket_usd"]
+        # Determine position size (allocator ticket capped by dynamic position-sizer value).
+        sizing = self.position_sizer.size_position(
+            row=pd.Series(enriched_row),
+            equity=max(self.equity, 0.0),
+            side=side,
+            stop_price=float(enriched_row.get("stop_price", row["close"])),
+            risk_mode=float(risk),
+            hedge_ratio=float(hedge_ratio),
+        )
+        pos_usd = min(float(capital_out["ticket_usd"]), float(sizing.get("value", 0.0)), float(self.free_capital))
+        enriched_row["sizer_value_usd"] = float(sizing.get("value", 0.0))
+        enriched_row["sizer_qty"] = float(sizing.get("qty", 0.0))
+        enriched_row["sizer_risk_dollars"] = float(sizing.get("risk_dollars", 0.0))
+        enriched_row["position_notional_usd"] = float(pos_usd)
         if pos_usd <= 0 or pos_usd > self.free_capital:
             self._update_equity(dt, enriched_row)
             return
