@@ -55,10 +55,21 @@ export type SignalCandidate = {
 export type AuditTrade = {
   tradeId: string;
   asset: string;
+  side?: "long" | "short";
   leg: string;
   tier: string;
   pnl: number;
   r: number;
+  entryPrice?: number;
+  exitPrice?: number;
+  qty?: number;
+  notional?: number;
+  riskUsd?: number;
+  fees?: number;
+  slippageBps?: number;
+  holdMinutes?: number;
+  status?: "open" | "closed";
+  model?: string;
   reason: string;
   entryTs: string;
   exitTs?: string;
@@ -68,6 +79,82 @@ export type AuditEvent = {
   timestamp: string;
   type: string;
   detail: string;
+};
+
+export type PerformanceKpi = {
+  label: string;
+  value: string;
+  tone: MetricTile["tone"];
+  delta?: string;
+};
+
+export type PerformancePeriod = {
+  label: string;
+  pnl: number;
+  trades: number;
+  winRate: number;
+  avgR: number;
+};
+
+export type PerformanceBucket = {
+  label: string;
+  pnl: number;
+  trades: number;
+  winRate: number;
+};
+
+export type MarketCandle = {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+};
+
+export type MarketMarker = {
+  time: number;
+  position: "aboveBar" | "belowBar" | "inBar";
+  color: string;
+  shape: "arrowUp" | "arrowDown" | "circle" | "square";
+  text: string;
+};
+
+export type MarketStat = {
+  label: string;
+  value: string;
+  tone: MetricTile["tone"];
+  detail?: string;
+};
+
+export type MarketZone = {
+  kind: "ob" | "fvg" | "liquidity";
+  side: "bullish" | "bearish" | "neutral";
+  start: number;
+  end: number;
+  top: number;
+  bottom: number;
+  label: string;
+  score?: number;
+};
+
+export type MarketTimeframes = {
+  m15: MarketCandle[];
+  h1: MarketCandle[];
+  h6: MarketCandle[];
+  h12: MarketCandle[];
+};
+
+export type MarketSnapshot = {
+  symbol: string;
+  timeframe: string;
+  summary: string;
+  candles: MarketCandle[];
+  markers: MarketMarker[];
+  zones: MarketZone[];
+  timeframes: MarketTimeframes;
+  stats: MarketStat[];
+  activeTrades: AuditTrade[];
 };
 
 export type TerminalSnapshot = {
@@ -106,6 +193,15 @@ export type TerminalSnapshot = {
     exposure: number;
     guardrails: Guardrail[];
   };
+  performance: {
+    summary: string;
+    kpis: PerformanceKpi[];
+    periods: PerformancePeriod[];
+    byAsset: PerformanceBucket[];
+    byTier: PerformanceBucket[];
+    tradeTable: AuditTrade[];
+  };
+  market: MarketSnapshot;
   audit: {
     summary: string;
     trades: AuditTrade[];

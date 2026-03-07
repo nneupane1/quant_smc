@@ -12,11 +12,12 @@ import pandas as pd
 
 from quant_system.models.narx.narx_gbm import NARXGBM, NARXGBMConfig
 from quant_system.models.narx.targets import add_forward_targets
-from quant_system.utils.logger import get_logger
+from quant_system.utils.logger import get_logger, runtime_logged
 
 LOG = get_logger("train_return_forecaster")
 
 
+@runtime_logged("Train return forecaster runtime")
 def main():
     ap = argparse.ArgumentParser(description="Train NARX GBM return forecaster.")
     ap.add_argument("--in", dest="inp", required=True, help="Input 15m features CSV (must include dt, close).")

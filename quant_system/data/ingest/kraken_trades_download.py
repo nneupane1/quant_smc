@@ -16,6 +16,7 @@ import os
 import pandas as pd
 
 from quant_system.data.ingest.kraken_trades import KrakenTradesDownloader
+from quant_system.utils.logger import runtime_logged
 
 
 def parse_date(s: str) -> float:
@@ -65,6 +66,7 @@ def resample_1m(trades_csv: str, ohlcv_out: str, start_ts: int, end_ts: int):
     print(f"Resampled 1m OHLCV written to {ohlcv_out} ({len(ohlcv)} rows)")
 
 
+@runtime_logged("Kraken trades download runtime")
 def main():
     ap = argparse.ArgumentParser(description="Download Kraken trades and resample to 1m")
     ap.add_argument("--pair", default="XBTUSD", help="Kraken altname, e.g. XBTUSD, XBTUSDT")

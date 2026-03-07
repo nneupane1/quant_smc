@@ -81,6 +81,7 @@ class LiveOrchestrator:
         self.closed_trades: Dict[str, Dict[str, Any]] = {}
         self.last_prices: Dict[str, float] = {}
         self.last_timestamp = None
+        self.entry_reason_by_trade: Dict[str, Dict[str, Any]] = {}
 
         LOG.info("[LiveOrchestrator] Initialized.")
 
@@ -283,11 +284,35 @@ class LiveOrchestrator:
                 self._register_exposure(pos_runner)
 
         reason = self.reason.build(asset, enriched.to_dict(), conf, evr_pack, tier.get("tier"), self.current_risk_mode, self.current_hedge_ratio)
+        reason["decision_path"] = {
+            "gates": gate,
+            "danger": danger,
+            "cooling_gate": cooling_gate,
+            "tiering": tier,
+            "capital": {
+                "ticket_usd": float(capital_out.get("ticket_usd", 0.0) or 0.0),
+                "risk_mode": risk_mode,
+                "hedge_ratio": self.current_hedge_ratio,
+                "lock_fraction": float(capital_out.get("lock_fraction", 0.0) or 0.0),
+            },
+            "position_sizer": {
+                "value_usd": float(sizing.get("value", 0.0) or 0.0),
+                "qty": float(sizing.get("qty", 0.0) or 0.0),
+                "risk_dollars": float(sizing.get("risk_dollars", 0.0) or 0.0),
+                "final_notional_usd": float(pos_usd),
+            },
+        }
         reason["timestamp"] = dt
+        if pos_core:
+            self.entry_reason_by_trade[pos_core.trade_id] = dict(reason)
+        runner_reason = None
+        if pos_runner:
+            runner_reason = {**reason, "leg": "runner"}
+            self.entry_reason_by_trade[pos_runner.trade_id] = dict(runner_reason)
         if self.dashboard and pos_core:
             self.dashboard.log_event("entry", pos_core.trade_id, reason)
-            if pos_runner:
-                self.dashboard.log_event("entry", pos_runner.trade_id, {**reason, "leg": "runner"})
+            if pos_runner and runner_reason is not None:
+                self.dashboard.log_event("entry", pos_runner.trade_id, runner_reason)
 
         self._refresh_equity(dt, enriched)
 
@@ -469,7 +494,13 @@ class LiveOrchestrator:
             "reason": reason,
             "source": source,
             "timestamp": res.get("exit_ts"),
+            "bars_in_trade": getattr(pos, "bars_in_trade", None),
+            "highest_r": getattr(pos, "highest_r", None),
+            "r_mult_at_exit": getattr(pos, "r_mult", None),
         }
+        entry_reason = self.entry_reason_by_trade.pop(trade_id, None)
+        if entry_reason:
+            payload["entry_reasoning"] = entry_reason
         self.closed_trades[trade_id] = payload
         if self.dashboard:
             self.dashboard.log_event("exit", trade_id, payload)

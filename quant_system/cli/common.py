@@ -118,7 +118,15 @@ def load_or_build_labels(
     if labels_csv:
         return read_frame(labels_csv)
     labeler = LabelBuilder(loader)
-    df = labeler.apply(features_df)
+    checkpoint_path = None
+    if labels_out:
+        out_path = Path(labels_out)
+        checkpoint_path = str(out_path.with_suffix(out_path.suffix + ".partial.csv"))
+    df = labeler.apply(
+        features_df,
+        checkpoint_path=checkpoint_path,
+        resume=True,
+    )
     if labels_out:
         out_path = Path(labels_out)
         out_path.parent.mkdir(parents=True, exist_ok=True)

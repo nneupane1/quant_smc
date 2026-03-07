@@ -6,6 +6,7 @@ Use `--stream` to poll Kraken 1m data and aggregate live.
 """
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -25,7 +26,7 @@ from quant_system.config.config_loader import ConfigLoader
 from quant_system.forward_test.forward_dashboard_adapter import ForwardDashboardAdapter
 from quant_system.live.live_orchestrator import LiveOrchestrator
 from quant_system.telemetry.runtime import start_terminal_server
-from quant_system.utils.logger import get_logger
+from quant_system.utils.logger import get_logger, runtime_logged
 
 LOG = get_logger("live_cli")
 
@@ -48,7 +49,9 @@ def parse_args():
     return parser.parse_args()
 
 
+@runtime_logged("Live CLI runtime")
 def main():
+    os.environ.setdefault("QUANT_RUNTIME_LOGS", "0")
     args = parse_args()
     conf_dir = resolve_conf_dir(args.config_dir)
     LOG.info("Loading configuration from %s ...", conf_dir)

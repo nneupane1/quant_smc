@@ -21,7 +21,7 @@ from quant_system.cli.common import (
 from quant_system.config.config_loader import ConfigLoader
 from quant_system.forward_test.forward_dashboard_adapter import ForwardDashboardAdapter
 from quant_system.telemetry.runtime import start_terminal_server
-from quant_system.utils.logger import get_logger
+from quant_system.utils.logger import get_logger, runtime_logged
 
 LOG = get_logger("backtest_cli")
 
@@ -42,6 +42,7 @@ def parse_args():
     return parser.parse_args()
 
 
+@runtime_logged("Backtest CLI runtime")
 def main():
     args = parse_args()
     conf_dir = resolve_conf_dir(args.config_dir)

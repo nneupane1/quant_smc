@@ -4,7 +4,18 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import Papa from "papaparse";
 
-import type { AuditEvent, AuditTrade, Guardrail, MetricTile, ReasoningTree, SignalCandidate, TerminalSnapshot } from "@/lib/terminal-types";
+import type {
+  AuditEvent,
+  AuditTrade,
+  Guardrail,
+  MarketCandle,
+  MarketTimeframes,
+  MarketZone,
+  MetricTile,
+  ReasoningTree,
+  SignalCandidate,
+  TerminalSnapshot,
+} from "@/lib/terminal-types";
 
 const REPO_ROOT = process.env.QUANT_SMC_ROOT
   ? path.resolve(process.env.QUANT_SMC_ROOT)
@@ -57,15 +68,326 @@ function fmtPct(value: number) {
   return `${value.toFixed(1)}%`;
 }
 
+function fmtR(value: number) {
+  return `${value.toFixed(2)}R`;
+}
+
 function num(value: unknown, fallback = 0) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function toUnix(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value > 10_000_000_000 ? Math.floor(value / 1000) : Math.floor(value);
+  }
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? Math.floor(parsed / 1000) : null;
 }
 
 function toneFromGuardrail(status: Guardrail["status"]): MetricTile["tone"] {
   if (status === "pass") return "teal";
   if (status === "warn") return "amber";
   return "rose";
+}
+
+function demoCandles(anchor = 100_000, bars = 520): TerminalSnapshot["market"]["candles"] {
+  const now = Math.floor(Date.now() / 1000);
+  const step = 15 * 60;
+  const rows: TerminalSnapshot["market"]["candles"] = [];
+  let prev = anchor;
+  for (let i = bars - 1; i >= 0; i -= 1) {
+    const time = now - i * step;
+    const drift = 0.00015 * ((bars - i) / bars);
+    const wave = 0.0026 * Math.sin((bars - i) / 11);
+    const shock = 0.001 * Math.cos((bars - i) / 7);
+    const ret = drift + wave + shock;
+    const close = Math.max(1, prev * (1 + ret));
+    const open = prev;
+    const high = Math.max(open, close) * 1.0014;
+    const low = Math.min(open, close) * 0.9986;
+    const volume = 120 + Math.abs(ret) * 85_000;
+    rows.push({ time, open, high, low, close, volume });
+    prev = close;
+  }
+  return rows;
+}
+
+function parseCandlePayload(data: unknown): TerminalSnapshot["market"]["candles"] {
+  let rows: Record<string, unknown>[] = [];
+  if (Array.isArray(data)) {
+    rows = data as Record<string, unknown>[];
+  } else if (data && typeof data === "object") {
+    const payload = data as Record<string, unknown>;
+    if (Array.isArray(payload.candles)) {
+      rows = payload.candles as Record<string, unknown>[];
+    } else if (Array.isArray(payload.records)) {
+      rows = payload.records as Record<string, unknown>[];
+    }
+  }
+  const mapped = rows
+    .map((row) => {
+      const time = toUnix(row.time ?? row.timestamp ?? row.ts ?? row.dt);
+      if (!time) return null;
+      const open = num(row.open ?? row.o, NaN);
+      const high = num(row.high ?? row.h, NaN);
+      const low = num(row.low ?? row.l, NaN);
+      const close = num(row.close ?? row.c, NaN);
+      const volume = num(row.volume ?? row.v, 0);
+      if (![open, high, low, close].every(Number.isFinite)) return null;
+      return { time, open, high, low, close, volume };
+    })
+    .filter((row): row is TerminalSnapshot["market"]["candles"][number] => row !== null)
+    .sort((a, b) => a.time - b.time);
+
+  const deduped: TerminalSnapshot["market"]["candles"] = [];
+  let prevTime = -1;
+  for (const candle of mapped) {
+    if (candle.time === prevTime) {
+      deduped[deduped.length - 1] = candle;
+    } else {
+      deduped.push(candle);
+      prevTime = candle.time;
+    }
+  }
+  return deduped.slice(-1200);
+}
+
+function aggregateCandles(source: MarketCandle[], barsPerCandle: number, limit = 500): MarketCandle[] {
+  if (!source.length) return [];
+  if (barsPerCandle <= 1) return source.slice(-limit);
+
+  const out: MarketCandle[] = [];
+  const offset = source.length % barsPerCandle;
+  for (let i = offset; i < source.length; i += barsPerCandle) {
+    const group = source.slice(i, i + barsPerCandle);
+    if (!group.length) continue;
+    const first = group[0];
+    const last = group[group.length - 1];
+    let high = first.high;
+    let low = first.low;
+    let volume = 0;
+    for (const row of group) {
+      high = Math.max(high, row.high);
+      low = Math.min(low, row.low);
+      volume += row.volume;
+    }
+    out.push({
+      time: last.time,
+      open: first.open,
+      high,
+      low,
+      close: last.close,
+      volume,
+    });
+  }
+
+  return (out.length ? out : source).slice(-limit);
+}
+
+function buildTimeframes(candles: MarketCandle[]): MarketTimeframes {
+  const m15 = candles.length ? candles.slice(-1200) : demoCandles();
+  return {
+    m15,
+    h1: aggregateCandles(m15, 4, 900),
+    h6: aggregateCandles(m15, 24, 700),
+    h12: aggregateCandles(m15, 48, 520),
+  };
+}
+
+function parseTimeframesPayload(data: unknown, fallbackCandles: MarketCandle[]): MarketTimeframes | null {
+  if (!data || typeof data !== "object") return null;
+  const payload = data as Record<string, unknown>;
+  const m15 = parseCandlePayload(payload.m15 ?? payload["15m"] ?? payload.candles);
+  const base = m15.length ? m15 : fallbackCandles;
+  if (!base.length) return null;
+
+  const h1 = parseCandlePayload(payload.h1 ?? payload["1h"]);
+  const h6 = parseCandlePayload(payload.h6 ?? payload["6h"]);
+  const h12 = parseCandlePayload(payload.h12 ?? payload["12h"]);
+  return {
+    m15: base.slice(-1200),
+    h1: (h1.length ? h1 : aggregateCandles(base, 4, 900)).slice(-900),
+    h6: (h6.length ? h6 : aggregateCandles(base, 24, 700)).slice(-700),
+    h12: (h12.length ? h12 : aggregateCandles(base, 48, 520)).slice(-520),
+  };
+}
+
+function deriveZones(candles: MarketCandle[], signals: SignalCandidate[]): MarketZone[] {
+  if (candles.length < 40) return [];
+
+  const tail = candles.slice(-260);
+  const anchor = tail[tail.length - 1];
+  const ranges = tail.slice(-72).map((row) => Math.max(0, row.high - row.low));
+  const avgRange = ranges.length ? ranges.reduce((acc, value) => acc + value, 0) / ranges.length : anchor.close * 0.004;
+  const zoneRange = Math.max(avgRange * 1.4, anchor.close * 0.0025);
+  const start = tail[Math.max(0, tail.length - 160)]?.time ?? tail[0].time;
+  const end = anchor.time + 15 * 60 * 28;
+
+  let pivotHigh = tail[0];
+  let pivotLow = tail[0];
+  for (const row of tail) {
+    if (row.high > pivotHigh.high) pivotHigh = row;
+    if (row.low < pivotLow.low) pivotLow = row;
+  }
+
+  let bullishGap: { start: number; end: number; top: number; bottom: number } | null = null;
+  let bearishGap: { start: number; end: number; top: number; bottom: number } | null = null;
+  let bullGapSize = 0;
+  let bearGapSize = 0;
+  for (let i = 2; i < tail.length; i += 1) {
+    const prev = tail[i - 2];
+    const curr = tail[i];
+    if (curr.low > prev.high) {
+      const gap = curr.low - prev.high;
+      if (gap > bullGapSize) {
+        bullGapSize = gap;
+        bullishGap = {
+          start: tail[i - 1]?.time ?? curr.time,
+          end: curr.time + 15 * 60 * 32,
+          top: curr.low,
+          bottom: prev.high,
+        };
+      }
+    }
+    if (curr.high < prev.low) {
+      const gap = prev.low - curr.high;
+      if (gap > bearGapSize) {
+        bearGapSize = gap;
+        bearishGap = {
+          start: tail[i - 1]?.time ?? curr.time,
+          end: curr.time + 15 * 60 * 32,
+          top: prev.low,
+          bottom: curr.high,
+        };
+      }
+    }
+  }
+
+  const leading = signals[0];
+  const bullishBias = !leading || leading.side === "long";
+  const zones: MarketZone[] = [
+    {
+      kind: "ob",
+      side: "bullish",
+      start,
+      end,
+      top: anchor.close - zoneRange * 0.3,
+      bottom: anchor.close - zoneRange * 1.3,
+      label: "Bullish OB",
+      score: bullishBias ? 0.84 : 0.66,
+    },
+    {
+      kind: "ob",
+      side: "bearish",
+      start,
+      end,
+      top: anchor.close + zoneRange * 1.3,
+      bottom: anchor.close + zoneRange * 0.3,
+      label: "Bearish OB",
+      score: bullishBias ? 0.62 : 0.83,
+    },
+    {
+      kind: "liquidity",
+      side: "bearish",
+      start: Math.max(start, pivotHigh.time - 15 * 60 * 16),
+      end: pivotHigh.time + 15 * 60 * 40,
+      top: pivotHigh.high + zoneRange * 0.25,
+      bottom: pivotHigh.high - zoneRange * 0.25,
+      label: "Buy-side Liquidity",
+      score: 0.74,
+    },
+    {
+      kind: "liquidity",
+      side: "bullish",
+      start: Math.max(start, pivotLow.time - 15 * 60 * 16),
+      end: pivotLow.time + 15 * 60 * 40,
+      top: pivotLow.low + zoneRange * 0.25,
+      bottom: pivotLow.low - zoneRange * 0.25,
+      label: "Sell-side Liquidity",
+      score: 0.73,
+    },
+  ];
+
+  if (bullishGap) {
+    zones.push({
+      kind: "fvg",
+      side: "bullish",
+      start: bullishGap.start,
+      end: bullishGap.end,
+      top: bullishGap.top,
+      bottom: bullishGap.bottom,
+      label: "Bullish FVG",
+      score: 0.69,
+    });
+  }
+  if (bearishGap) {
+    zones.push({
+      kind: "fvg",
+      side: "bearish",
+      start: bearishGap.start,
+      end: bearishGap.end,
+      top: bearishGap.top,
+      bottom: bearishGap.bottom,
+      label: "Bearish FVG",
+      score: 0.67,
+    });
+  }
+  return zones;
+}
+
+function parseZonesPayload(data: unknown, candles: MarketCandle[], signals: SignalCandidate[]): MarketZone[] {
+  const base = candles.length ? candles : demoCandles();
+  const derived = deriveZones(base, signals);
+  if (!Array.isArray(data)) return derived;
+
+  const fallbackStart = base[Math.max(0, base.length - 120)]?.time ?? base[0]?.time ?? Math.floor(Date.now() / 1000) - 15 * 60 * 120;
+  const fallbackEnd = base[base.length - 1]?.time
+    ? base[base.length - 1].time + 15 * 60 * 28
+    : Math.floor(Date.now() / 1000);
+
+  const parsed = data
+    .map((row): MarketZone | null => {
+      if (!row || typeof row !== "object") return null;
+      const input = row as Record<string, unknown>;
+      const kindRaw = String(input.kind ?? input.type ?? "ob").toLowerCase();
+      const kind: MarketZone["kind"] = kindRaw.includes("liq")
+        ? "liquidity"
+        : kindRaw.includes("fvg")
+          ? "fvg"
+          : "ob";
+      const sideRaw = String(input.side ?? input.direction ?? "neutral").toLowerCase();
+      const side: MarketZone["side"] = sideRaw.includes("bull")
+        ? "bullish"
+        : sideRaw.includes("bear")
+          ? "bearish"
+          : "neutral";
+      const start = toUnix(input.start ?? input.start_time ?? input.startTs ?? input.ts_start ?? input.time) ?? fallbackStart;
+      const end = toUnix(input.end ?? input.end_time ?? input.endTs ?? input.ts_end) ?? fallbackEnd;
+      const topRaw = num(input.top ?? input.high ?? input.price_high, NaN);
+      const bottomRaw = num(input.bottom ?? input.low ?? input.price_low, NaN);
+      if (!Number.isFinite(topRaw) || !Number.isFinite(bottomRaw)) return null;
+      const top = Math.max(topRaw, bottomRaw);
+      const bottom = Math.min(topRaw, bottomRaw);
+      const zone: MarketZone = {
+        kind,
+        side,
+        start,
+        end: end < start ? start + 15 * 60 * 20 : end,
+        top,
+        bottom,
+        label: String(input.label ?? `${side} ${kind}`),
+      };
+      const parsedScore = num(input.score, NaN);
+      if (Number.isFinite(parsedScore)) {
+        zone.score = parsedScore;
+      }
+      return zone;
+    })
+    .filter((zone): zone is MarketZone => zone !== null);
+
+  return parsed.length ? parsed.slice(-24) : derived;
 }
 
 function buildReasoningEnvelope(payload: Record<string, unknown>, event: Record<string, unknown> = {}): ReasoningTree {
@@ -188,6 +510,74 @@ function makeDemoSnapshot(): TerminalSnapshot {
       reasoning: buildReasoningEnvelope({ asset: "XRPUSD", tier: "B", confluence: 0.68, evr: 1.6, flow_1h: 0.56, hazard: 0.29, regime: "compression", reason: "Structure valid but opportunity surface still compressed" }),
     },
   ];
+  const demoTrades: AuditTrade[] = [
+    {
+      tradeId: "TR-3112",
+      asset: "BTCUSD",
+      side: "long",
+      leg: "core",
+      tier: "A+",
+      pnl: 840,
+      r: 3.0,
+      entryPrice: 62110,
+      exitPrice: 62890,
+      qty: 0.32,
+      notional: 20000,
+      riskUsd: 280,
+      fees: 14,
+      slippageBps: 1.8,
+      holdMinutes: 150,
+      status: "closed",
+      model: "confluence_model",
+      reason: "core_tp_3.0R",
+      entryTs: "2026-03-03T10:30:00Z",
+      exitTs: "2026-03-03T13:00:00Z",
+    },
+    {
+      tradeId: "TR-3113",
+      asset: "BTCUSD",
+      side: "long",
+      leg: "runner",
+      tier: "A+",
+      pnl: 1560,
+      r: 7.2,
+      entryPrice: 62110,
+      exitPrice: 63640,
+      qty: 0.16,
+      notional: 10000,
+      riskUsd: 140,
+      fees: 11,
+      slippageBps: 2.2,
+      holdMinutes: 315,
+      status: "closed",
+      model: "confluence_model",
+      reason: "runner_tp_7.2R",
+      entryTs: "2026-03-03T10:30:00Z",
+      exitTs: "2026-03-03T15:45:00Z",
+    },
+    {
+      tradeId: "TR-3118",
+      asset: "ETHUSD",
+      side: "long",
+      leg: "core",
+      tier: "A",
+      pnl: 420,
+      r: 2.0,
+      entryPrice: 3412,
+      exitPrice: 3471,
+      qty: 2.9,
+      notional: 9894,
+      riskUsd: 210,
+      fees: 9,
+      slippageBps: 2.9,
+      holdMinutes: 90,
+      status: "closed",
+      model: "meta_model",
+      reason: "core_tp_2.0R",
+      entryTs: "2026-03-03T12:00:00Z",
+      exitTs: "2026-03-03T13:30:00Z",
+    },
+  ];
 
   return {
     meta: {
@@ -246,13 +636,11 @@ function makeDemoSnapshot(): TerminalSnapshot {
         { label: "Cooling Logic", status: "pass", detail: "Compounding cycle remains active; no vault reset required." },
       ],
     },
+    performance: buildPerformance(demoTrades),
+    market: buildMarket(demoTrades, demoSignals),
     audit: {
       summary: "Every state shown here is meant to map cleanly back to the same deterministic feature graph used in research and execution.",
-      trades: [
-        { tradeId: "TR-3112", asset: "BTCUSD", leg: "core", tier: "A+", pnl: 840, r: 3.0, reason: "core_tp_3.0R", entryTs: "2026-03-03T10:30:00Z", exitTs: "2026-03-03T13:00:00Z" },
-        { tradeId: "TR-3113", asset: "BTCUSD", leg: "runner", tier: "A+", pnl: 1560, r: 7.2, reason: "runner_tp_7.2R", entryTs: "2026-03-03T10:30:00Z", exitTs: "2026-03-03T15:45:00Z" },
-        { tradeId: "TR-3118", asset: "ETHUSD", leg: "core", tier: "A", pnl: 420, r: 2.0, reason: "core_tp_2.0R", entryTs: "2026-03-03T12:00:00Z", exitTs: "2026-03-03T13:30:00Z" },
-      ],
+      trades: demoTrades,
       events: [
         { timestamp: "2026-03-03T10:15:00Z", type: "scanner", detail: "BTCUSD ranked A+ with confluence 0.88 and EVR 2.7." },
         { timestamp: "2026-03-03T10:30:00Z", type: "entry", detail: "Core and runner legs opened with base cycle capital sizing." },
@@ -306,17 +694,39 @@ function buildSignalsFromEvents(events: Record<string, string>[]): SignalCandida
 }
 
 function buildTrades(rows: Record<string, string>[]): AuditTrade[] {
-  return rows.slice(-6).reverse().map((row, idx) => ({
-    tradeId: String(row.trade_id || `TR-${idx + 1}`),
-    asset: String(row.asset || "XBTUSD"),
-    leg: String(row.leg || "core"),
-    tier: String(row.tier || "unranked"),
-    pnl: num(row.pnl),
-    r: num(row.r),
-    reason: String(row.reason || row.result || "closed"),
-    entryTs: String(row.entry_ts || row.entry_time || row.timestamp || ""),
-    exitTs: String(row.exit_ts || row.exit_time || ""),
-  }));
+  return rows.slice(-120).reverse().map((row, idx) => {
+    const entryTs = String(row.entry_ts || row.entry_time || row.timestamp || "");
+    const exitTs = String(row.exit_ts || row.exit_time || "");
+    const entryMs = entryTs ? Date.parse(entryTs) : NaN;
+    const exitMs = exitTs ? Date.parse(exitTs) : NaN;
+    const holdMinutes = Number.isFinite(entryMs) && Number.isFinite(exitMs)
+      ? Math.max(0, Math.round((exitMs - entryMs) / 60000))
+      : num(row.hold_minutes, 0);
+    const side = String(row.side || row.direction || "long").toLowerCase() === "short" ? "short" : "long";
+    const status = exitTs ? "closed" : "open";
+    return {
+      tradeId: String(row.trade_id || `TR-${idx + 1}`),
+      asset: String(row.asset || "XBTUSD"),
+      side,
+      leg: String(row.leg || "core"),
+      tier: String(row.tier || "unranked"),
+      pnl: num(row.pnl),
+      r: num(row.r),
+      entryPrice: num(row.entry_price),
+      exitPrice: num(row.exit_price),
+      qty: num(row.qty || row.quantity),
+      notional: num(row.notional || row.notional_usd || row.position_notional),
+      riskUsd: num(row.risk_usd || row.risk),
+      fees: num(row.fees || row.fee_usd || row.total_fees),
+      slippageBps: num(row.slippage_bps || row.slip_bps),
+      holdMinutes,
+      status,
+      model: String(row.model || row.model_name || row.tier || "multi"),
+      reason: String(row.reason || row.result || "closed"),
+      entryTs,
+      exitTs,
+    };
+  });
 }
 
 function buildEvents(rows: Record<string, string>[]): AuditEvent[] {
@@ -327,12 +737,230 @@ function buildEvents(rows: Record<string, string>[]): AuditEvent[] {
   }));
 }
 
+function buildPerformance(trades: AuditTrade[]): TerminalSnapshot["performance"] {
+  const closedTrades = trades.filter((trade) => trade.status !== "open");
+  const scope = closedTrades.length ? closedTrades : trades;
+  const netPnl = scope.reduce((acc, trade) => acc + num(trade.pnl), 0);
+  const grossProfit = scope.reduce((acc, trade) => acc + Math.max(0, num(trade.pnl)), 0);
+  const grossLoss = scope.reduce((acc, trade) => acc + Math.min(0, num(trade.pnl)), 0);
+  const wins = scope.filter((trade) => num(trade.pnl) > 0).length;
+  const winRate = scope.length ? (wins / scope.length) * 100 : 0;
+  const avgR = scope.length ? scope.reduce((acc, trade) => acc + num(trade.r), 0) / scope.length : 0;
+  const avgHold = scope.length
+    ? scope.reduce((acc, trade) => acc + num(trade.holdMinutes), 0) / scope.length
+    : 0;
+  const feesTotal = scope.reduce((acc, trade) => acc + Math.max(0, num(trade.fees)), 0);
+  const avgSlippage = scope.length
+    ? scope.reduce((acc, trade) => acc + Math.max(0, num(trade.slippageBps)), 0) / scope.length
+    : 0;
+  const profitFactor = grossLoss < 0 ? grossProfit / Math.abs(grossLoss) : grossProfit > 0 ? 99 : 0;
+  const maxLoss = scope.reduce((acc, trade) => Math.min(acc, num(trade.pnl)), 0);
+
+  const periodDefs = [
+    { label: "Daily", ms: 24 * 60 * 60 * 1000 },
+    { label: "Weekly", ms: 7 * 24 * 60 * 60 * 1000 },
+    { label: "Monthly", ms: 30 * 24 * 60 * 60 * 1000 },
+  ] as const;
+  const nowMs = Date.now();
+  const periods = periodDefs.map((period) => {
+    const filtered = scope.filter((trade) => {
+      const ts = trade.exitTs || trade.entryTs;
+      const parsed = ts ? Date.parse(ts) : NaN;
+      return Number.isFinite(parsed) && parsed >= nowMs - period.ms;
+    });
+    const pnl = filtered.reduce((acc, trade) => acc + num(trade.pnl), 0);
+    const wr = filtered.length ? (filtered.filter((trade) => num(trade.pnl) > 0).length / filtered.length) * 100 : 0;
+    const periodAvgR = filtered.length ? filtered.reduce((acc, trade) => acc + num(trade.r), 0) / filtered.length : 0;
+    return {
+      label: period.label,
+      pnl,
+      trades: filtered.length,
+      winRate: wr,
+      avgR: periodAvgR,
+    };
+  });
+
+  const bucket = (selector: (trade: AuditTrade) => string): TerminalSnapshot["performance"]["byAsset"] => {
+    const map = new Map<string, { pnl: number; trades: number; wins: number }>();
+    for (const trade of scope) {
+      const key = selector(trade) || "unknown";
+      const prev = map.get(key) ?? { pnl: 0, trades: 0, wins: 0 };
+      prev.pnl += num(trade.pnl);
+      prev.trades += 1;
+      if (num(trade.pnl) > 0) prev.wins += 1;
+      map.set(key, prev);
+    }
+    return [...map.entries()]
+      .map(([label, stat]) => ({
+        label,
+        pnl: stat.pnl,
+        trades: stat.trades,
+        winRate: stat.trades ? (stat.wins / stat.trades) * 100 : 0,
+      }))
+      .sort((a, b) => b.pnl - a.pnl)
+      .slice(0, 8);
+  };
+
+  return {
+    summary: "Performance intelligence is synchronized with the same trade ledger used by runtime and audit views.",
+    kpis: [
+      { label: "Net PnL", value: fmtMoney(netPnl), tone: netPnl >= 0 ? "teal" : "rose", delta: `${scope.length} closed trades` },
+      { label: "Win Rate", value: fmtPct(winRate), tone: winRate >= 55 ? "teal" : winRate >= 45 ? "amber" : "rose", delta: `${wins}/${scope.length || 0}` },
+      { label: "Avg R", value: fmtR(avgR), tone: avgR >= 0 ? "cyan" : "rose", delta: "per trade" },
+      { label: "Profit Factor", value: profitFactor >= 99 ? "N/A" : profitFactor.toFixed(2), tone: profitFactor >= 1.3 ? "teal" : profitFactor >= 1.0 ? "amber" : "rose", delta: "gross win / gross loss" },
+      { label: "Max Loss", value: fmtMoney(maxLoss), tone: "rose", delta: "single trade" },
+      { label: "Avg Hold", value: `${Math.round(avgHold)}m`, tone: "slate", delta: "duration" },
+      { label: "Fees", value: fmtMoney(feesTotal), tone: "amber", delta: `avg slip ${avgSlippage.toFixed(2)} bps` },
+    ],
+    periods,
+    byAsset: bucket((trade) => trade.asset),
+    byTier: bucket((trade) => trade.tier),
+    tradeTable: trades.slice(0, 40),
+  };
+}
+
+function buildMarket(
+  trades: AuditTrade[],
+  signals: SignalCandidate[],
+  candlePayload?: unknown,
+): TerminalSnapshot["market"] {
+  const payloadRecord = candlePayload && typeof candlePayload === "object"
+    ? (candlePayload as Record<string, unknown>)
+    : null;
+  const candles = (() => {
+    const parsed = parseCandlePayload(payloadRecord?.candles ?? payloadRecord?.m15 ?? payloadRecord?.["15m"] ?? candlePayload);
+    if (parsed.length) return parsed;
+    const anchor = trades[0]?.exitPrice || trades[0]?.entryPrice || 100_000;
+    return demoCandles(anchor);
+  })();
+  const timeframes = parseTimeframesPayload(payloadRecord?.timeframes ?? payloadRecord, candles) ?? buildTimeframes(candles);
+  const primary = timeframes.m15.length ? timeframes.m15 : candles;
+
+  const markers: TerminalSnapshot["market"]["markers"] = [];
+  for (const trade of trades.slice(0, 80)) {
+    const side = trade.side === "short" ? "short" : "long";
+    const entry = toUnix(trade.entryTs);
+    if (entry) {
+      markers.push({
+        time: entry,
+        position: side === "long" ? "belowBar" : "aboveBar",
+        color: side === "long" ? "#2ae6b8" : "#ff6b88",
+        shape: side === "long" ? "arrowUp" : "arrowDown",
+        text: `entry ${trade.tier}`,
+      });
+    }
+    const exit = toUnix(trade.exitTs);
+    if (exit) {
+      markers.push({
+        time: exit,
+        position: side === "long" ? "aboveBar" : "belowBar",
+        color: trade.pnl >= 0 ? "#2ae6b8" : "#ff6b88",
+        shape: "circle",
+        text: `exit ${trade.pnl >= 0 ? "+" : ""}${trade.pnl.toFixed(0)}`,
+      });
+    }
+  }
+  for (const signal of signals.slice(0, 6)) {
+    const ts = toUnix(
+      (signal.reasoning as Record<string, unknown> | undefined)?.event
+        ? String(((signal.reasoning as Record<string, unknown>).event as Record<string, unknown>).timestamp || "")
+        : "",
+    );
+    if (!ts) continue;
+    markers.push({
+      time: ts,
+      position: "inBar",
+      color: "#f6b63c",
+      shape: "square",
+      text: `signal ${signal.tier}`,
+    });
+  }
+  const zones = parseZonesPayload(payloadRecord?.zones, primary, signals);
+
+  const last = primary[primary.length - 1];
+  const lookback = primary.slice(-96);
+  const first = lookback[0] ?? last;
+  const changePct = first?.close ? ((last.close / first.close - 1) * 100) : 0;
+  const high = lookback.reduce((acc, row) => Math.max(acc, row.high), Number.NEGATIVE_INFINITY);
+  const low = lookback.reduce((acc, row) => Math.min(acc, row.low), Number.POSITIVE_INFINITY);
+  const rangePct = Number.isFinite(high) && Number.isFinite(low) && last?.close
+    ? ((high - low) / last.close) * 100
+    : 0;
+  const returns = primary.slice(1).map((row, idx) => row.close / primary[idx].close - 1);
+  const mean = returns.length ? returns.reduce((acc, row) => acc + row, 0) / returns.length : 0;
+  const variance = returns.length
+    ? returns.reduce((acc, row) => acc + (row - mean) ** 2, 0) / returns.length
+    : 0;
+  const vol = Math.sqrt(Math.max(0, variance)) * 100;
+  const vol24 = lookback.reduce((acc, row) => acc + row.volume, 0);
+
+  const activeTrades = trades.filter((trade) => trade.status === "open");
+
+  return {
+    symbol: signals[0]?.asset || trades[0]?.asset || "BTCUSD",
+    timeframe: "15m",
+    summary: "Unified TradingView-style canvas with synchronized 12h/6h/1h/15m context, SMC overlays, and replay-ready trade lifecycle markers.",
+    candles: primary,
+    markers: markers.slice(-220),
+    zones,
+    timeframes,
+    stats: [
+      { label: "Last Price", value: fmtMoney(last?.close ?? 0), tone: "cyan", detail: "latest 15m close" },
+      { label: "24h Change", value: `${changePct >= 0 ? "+" : ""}${changePct.toFixed(2)}%`, tone: changePct >= 0 ? "teal" : "rose", detail: "96 bars lookback" },
+      { label: "24h Range", value: `${rangePct.toFixed(2)}%`, tone: "amber", detail: "high-low span" },
+      { label: "Realized Vol", value: vol.toFixed(3), tone: "amber", detail: "std(ret) %" },
+      { label: "24h Volume", value: vol24.toFixed(0), tone: "teal", detail: "sum(volume)" },
+      { label: "Markers", value: String(markers.slice(-220).length), tone: "slate", detail: "entry/exit/signal" },
+      { label: "Zones", value: String(zones.length), tone: "cyan", detail: "OB/FVG/liquidity overlays" },
+    ],
+    activeTrades: (activeTrades.length ? activeTrades : trades).slice(0, 12),
+  };
+}
+
+function withPerformance(snapshot: TerminalSnapshot): TerminalSnapshot {
+  if (snapshot.performance) {
+    return snapshot;
+  }
+  const trades = snapshot.audit?.trades ?? [];
+  return {
+    ...snapshot,
+    performance: buildPerformance(trades),
+  };
+}
+
+function withMarket(snapshot: TerminalSnapshot): TerminalSnapshot {
+  const trades = snapshot.audit?.trades ?? [];
+  const signals = snapshot.signals?.candidates ?? [];
+  if (snapshot.market && snapshot.market.candles.length) {
+    const refreshed = buildMarket(trades, signals, snapshot.market);
+    return {
+      ...snapshot,
+      market: {
+        ...refreshed,
+        ...snapshot.market,
+        candles: snapshot.market.candles?.length ? snapshot.market.candles : refreshed.candles,
+        markers: snapshot.market.markers?.length ? snapshot.market.markers : refreshed.markers,
+        zones: snapshot.market.zones?.length ? snapshot.market.zones : refreshed.zones,
+        timeframes: snapshot.market.timeframes?.m15?.length
+          ? snapshot.market.timeframes
+          : refreshed.timeframes,
+        stats: snapshot.market.stats?.length ? snapshot.market.stats : refreshed.stats,
+        activeTrades: snapshot.market.activeTrades?.length ? snapshot.market.activeTrades : refreshed.activeTrades,
+      },
+    };
+  }
+  return {
+    ...snapshot,
+    market: buildMarket(trades, signals),
+  };
+}
+
 export async function loadTerminalSnapshot(): Promise<TerminalSnapshot> {
   if (BACKEND_API_URL) {
     try {
       const response = await fetch(BACKEND_API_URL, { cache: "no-store" });
       if (response.ok) {
-        return (await response.json()) as TerminalSnapshot;
+        return withMarket(withPerformance((await response.json()) as TerminalSnapshot));
       }
     } catch {
       // fall back to local artifact loader
@@ -371,8 +999,16 @@ export async function loadTerminalSnapshot(): Promise<TerminalSnapshot> {
   const winRate = num(summary?.win_rate, 0.57) * (num(summary?.win_rate) <= 1 ? 100 : 1);
   const maxDrawdown = Math.abs(num(summary?.max_drawdown, num(state.max_drawdown, 0)));
   const signals = buildSignalsFromEvents(events);
+  const trades = buildTrades(ledger);
+  const performance = buildPerformance(trades);
+  const market = buildMarket(
+    trades,
+    signals,
+    (snapshot as Record<string, unknown> | undefined)?.market
+      ?? (snapshot as Record<string, unknown> | undefined)?.candles,
+  );
 
-  return {
+  return withMarket(withPerformance({
     meta: {
       source: "artifacts",
       lastUpdated: new Date().toISOString(),
@@ -426,10 +1062,12 @@ export async function loadTerminalSnapshot(): Promise<TerminalSnapshot> {
       exposure: Math.min(100, Math.round((openPositions / 5) * 100)),
       guardrails,
     },
+    performance,
+    market,
     audit: {
       summary: "Audit rows come from persisted ledgers and event exports.",
-      trades: buildTrades(ledger),
+      trades,
       events: buildEvents(events),
     },
-  };
+  }));
 }

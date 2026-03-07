@@ -27,6 +27,7 @@ ensure_runtime(("pandas",))
 from datetime import datetime, time, timedelta, timezone
 import json
 from pathlib import Path
+import time
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -37,7 +38,7 @@ from quant_system.data.ingest.builder import TimeframeBuilder
 from quant_system.data.ingest.kraken_trades import KrakenTradesDownloader
 from quant_system.data.ingest.kraken_trades_download import resample_1m
 from quant_system.data_orchestrator import DataOrchestrator
-from quant_system.utils.logger import console_kv, console_rule, console_stage, fmt_ts
+from quant_system.utils.logger import console_kv, console_rule, console_stage, fmt_seconds, fmt_ts
 
 
 ASSET = "BTCUSD"
@@ -267,15 +268,24 @@ def run() -> dict:
 
 
 def main() -> None:
-    manifest = run()
-    console_stage(
-        "Fetch complete",
-        (
-            f"asset={manifest['asset']} raw_1m={manifest.get('raw_1m', 'data/raw_1m/BTCUSD_1m.csv')} "
-            f"tf_dir={manifest.get('tf_dir', 'data/tf')}"
-        ),
-        status="ok",
-    )
+    started_at = time.perf_counter()
+    manifest = None
+    try:
+        manifest = run()
+        console_stage(
+            "Fetch complete",
+            (
+                f"asset={manifest['asset']} raw_1m={manifest.get('raw_1m', 'data/raw_1m/BTCUSD_1m.csv')} "
+                f"tf_dir={manifest.get('tf_dir', 'data/tf')}"
+            ),
+            status="ok",
+        )
+    finally:
+        console_stage(
+            "Fetch runtime",
+            f"elapsed={fmt_seconds(time.perf_counter() - started_at)}",
+            status="ok" if manifest is not None else "warn",
+        )
 
 
 if __name__ == "__main__":

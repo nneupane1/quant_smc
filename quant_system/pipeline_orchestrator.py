@@ -30,7 +30,13 @@ from quant_system.config.config_loader import ConfigLoader
 from quant_system.data.ingest.ingestion import DataIngestion
 from quant_system.ml.predict.model_predictor import ModelPredictor
 from quant_system.train_orchestrator import TrainOrchestrator
-from quant_system.utils.logger import get_logger
+from quant_system.utils.logger import (
+    console_kv,
+    console_rule,
+    console_stage,
+    get_logger,
+    runtime_logged,
+)
 
 LOG = get_logger("pipeline_orchestrator")
 
@@ -73,6 +79,19 @@ class PipelineOrchestrator:
             or self.cfg.get("metadata")
             or {}
         )
+
+    @staticmethod
+    def _read_json(path: Path) -> Dict[str, Any]:
+        if not path.exists():
+            return {}
+        try:
+            import json
+
+            with path.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
 
     def _asset_meta(self, asset: str) -> Dict[str, Any]:
         if asset not in self.assets_meta:
@@ -127,10 +146,13 @@ class PipelineOrchestrator:
         batch_sleep: float = 1.2,
         interval: int = 1,
         resume_ingestion: bool = True,
+        resume_pipeline: bool = True,
         models: Optional[list[str]] = None,
         skip_ingestion: bool = False,
         skip_training: bool = False,
         skip_validation: bool = False,
+        force_pipeline_restart: bool = False,
+        pipeline_checkpoint_out: Optional[str] = None,
     ) -> Dict[str, Any]:
         asset = default_asset(self.cfg, asset)
         asset_meta = self._asset_meta(asset)
@@ -144,6 +166,10 @@ class PipelineOrchestrator:
         merged_out = str(merged_out or path_defaults["merged_out"])
         train_manifest_out = str(train_manifest_out or path_defaults["train_manifest_out"])
         pipeline_manifest_out = str(pipeline_manifest_out or path_defaults["pipeline_manifest_out"])
+        pipeline_checkpoint_out = str(
+            pipeline_checkpoint_out
+            or (Path(pipeline_manifest_out).parent / "pipeline_checkpoint.json")
+        )
 
         manifest: Dict[str, Any] = {
             "asset": asset,
@@ -157,17 +183,97 @@ class PipelineOrchestrator:
                 "merged_out": merged_out,
                 "train_manifest_out": train_manifest_out,
                 "pipeline_manifest_out": pipeline_manifest_out,
+                "pipeline_checkpoint_out": pipeline_checkpoint_out,
                 "model_registry": self.registry.base_dir,
             },
             "steps": {},
         }
 
+        console_rule(f"Pipeline Room | {asset}", style="cyan")
+        console_kv(
+            "Pipeline Plan",
+            {
+                "asset": asset,
+                "window": f"{bounds['start_date']} -> {bounds['end_date']}",
+                "resume_ingestion": bool(resume_ingestion),
+                "resume_pipeline": bool(resume_pipeline and not force_pipeline_restart),
+                "raw_1m": raw_out,
+                "tf_dir": tf_dir,
+                "pipeline_manifest": pipeline_manifest_out,
+                "pipeline_checkpoint": pipeline_checkpoint_out,
+            },
+            style="cyan",
+        )
+
+        checkpoint_path = Path(pipeline_checkpoint_out)
+
+        def _persist_checkpoint(*, completed: bool = False) -> None:
+            payload = {
+                "asset": asset,
+                "window": bounds,
+                "paths": manifest["paths"],
+                "manifest": manifest,
+                "completed": bool(completed),
+            }
+            save_json(checkpoint_path, payload)
+
+        if resume_pipeline and not force_pipeline_restart:
+            checkpoint_payload = self._read_json(checkpoint_path)
+            cached_paths = checkpoint_payload.get("paths", {}) if isinstance(checkpoint_payload, dict) else {}
+            paths_match = (
+                isinstance(cached_paths, dict)
+                and cached_paths.get("raw_1m") == raw_out
+                and cached_paths.get("tf_dir") == tf_dir
+                and cached_paths.get("merged_out") == merged_out
+                and cached_paths.get("train_manifest_out") == train_manifest_out
+                and cached_paths.get("pipeline_manifest_out") == pipeline_manifest_out
+            )
+            if (
+                checkpoint_payload.get("asset") == asset
+                and checkpoint_payload.get("window") == bounds
+                and paths_match
+            ):
+                cached_manifest = checkpoint_payload.get("manifest", {})
+                if isinstance(cached_manifest, dict):
+                    cached_steps = cached_manifest.get("steps", {})
+                    if isinstance(cached_steps, dict):
+                        manifest["steps"].update(cached_steps)
+                if bool(checkpoint_payload.get("completed")) and Path(pipeline_manifest_out).exists():
+                    final_manifest = self._read_json(Path(pipeline_manifest_out))
+                    if isinstance(final_manifest, dict) and final_manifest.get("steps", {}).get("validation", {}).get("status") in {"completed", "skipped"}:
+                        console_stage(
+                            "Pipeline resume hit",
+                            f"manifest={pipeline_manifest_out}",
+                            status="ok",
+                        )
+                        return final_manifest
+
+        cached_ingestion = manifest["steps"].get("ingestion", {})
+        ingestion_reusable = (
+            isinstance(cached_ingestion, dict)
+            and cached_ingestion.get("status") == "completed"
+            and Path(raw_out).exists()
+            and all((Path(tf_dir) / f"{asset}_{tf}.csv").exists() for tf in ("15m", "1h", "6h", "12h"))
+        )
         if skip_ingestion:
             manifest["steps"]["ingestion"] = {
                 "status": "skipped",
                 "raw_1m_path": raw_out,
                 "tf_dir": tf_dir,
             }
+            _persist_checkpoint()
+        elif resume_pipeline and ingestion_reusable:
+            manifest["steps"]["ingestion"] = {
+                **cached_ingestion,
+                "status": "completed",
+                "resumed": True,
+            }
+            console_stage(
+                "Ingestion checkpoint hit",
+                f"raw={raw_out} tf_dir={tf_dir}",
+                status="ok",
+            )
+            _persist_checkpoint()
         else:
             LOG.info(
                 "[Pipeline] Ingestion start asset=%s kraken_pair=%s %s -> %s",
@@ -192,13 +298,42 @@ class PipelineOrchestrator:
                 "status": "completed",
                 **ingestion.run(),
             }
+            _persist_checkpoint()
 
         train_manifest: Dict[str, Any] = {}
+        cached_training = manifest["steps"].get("training", {})
+        training_reusable = (
+            isinstance(cached_training, dict)
+            and cached_training.get("status") == "completed"
+            and Path(train_manifest_out).exists()
+            and Path(merged_out).exists()
+        )
         if skip_training:
             manifest["steps"]["training"] = {
                 "status": "skipped",
                 "merged_out": merged_out,
             }
+            _persist_checkpoint()
+        elif resume_pipeline and training_reusable:
+            train_manifest = self._read_json(Path(train_manifest_out))
+            if train_manifest:
+                manifest["steps"]["training"] = {
+                    "status": "completed",
+                    **train_manifest,
+                    "resumed": True,
+                }
+            else:
+                manifest["steps"]["training"] = {
+                    **cached_training,
+                    "status": "completed",
+                    "resumed": True,
+                }
+            console_stage(
+                "Training checkpoint hit",
+                f"manifest={train_manifest_out}",
+                status="ok",
+            )
+            _persist_checkpoint()
         else:
             LOG.info("[Pipeline] Training start asset=%s tf_dir=%s", asset, tf_dir)
             train_manifest = self.train_orchestrator.run_asset(
@@ -209,14 +344,37 @@ class PipelineOrchestrator:
                 merged_out=merged_out,
                 manifest_out=train_manifest_out,
                 models=models,
+                resume=resume_pipeline,
+                force_retrain=force_pipeline_restart,
+                force_rebuild_frame=force_pipeline_restart,
             )
             manifest["steps"]["training"] = {
                 "status": "completed",
                 **train_manifest,
             }
+            _persist_checkpoint()
 
+        cached_validation = manifest["steps"].get("validation", {})
+        validation_reusable = (
+            isinstance(cached_validation, dict)
+            and cached_validation.get("status") == "completed"
+            and Path(merged_out).exists()
+        )
         if skip_validation:
             manifest["steps"]["validation"] = {"status": "skipped"}
+            _persist_checkpoint()
+        elif resume_pipeline and validation_reusable:
+            manifest["steps"]["validation"] = {
+                **cached_validation,
+                "status": "completed",
+                "resumed": True,
+            }
+            console_stage(
+                "Validation checkpoint hit",
+                f"merged_out={merged_out}",
+                status="ok",
+            )
+            _persist_checkpoint()
         else:
             LOG.info("[Pipeline] Validation start asset=%s", asset)
             validation = self._validate(asset=asset, merged_out=merged_out)
@@ -224,8 +382,10 @@ class PipelineOrchestrator:
                 "status": "completed",
                 **validation,
             }
+            _persist_checkpoint()
 
         save_json(pipeline_manifest_out, manifest)
+        _persist_checkpoint(completed=True)
         return manifest
 
     def _validate(self, *, asset: str, merged_out: str) -> Dict[str, Any]:
@@ -297,12 +457,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--interval", default=1, type=int, help="Kraken OHLC interval in minutes.")
     parser.add_argument("--models", default=None, help="Optional comma-separated model list for training.")
     parser.add_argument("--no-resume-ingestion", action="store_true", help="Disable raw 1m checkpoint resume logic.")
+    parser.add_argument("--no-resume-pipeline", action="store_true", help="Disable pipeline checkpoint resume logic.")
+    parser.add_argument("--force-pipeline-restart", action="store_true", help="Ignore pipeline checkpoints and rerun all enabled stages.")
+    parser.add_argument("--pipeline-checkpoint-out", default=None, help="Optional pipeline checkpoint output override.")
     parser.add_argument("--skip-ingestion", action="store_true")
     parser.add_argument("--skip-training", action="store_true")
     parser.add_argument("--skip-validation", action="store_true")
     return parser.parse_args()
 
 
+@runtime_logged("Pipeline orchestrator runtime")
 def main() -> None:
     args = parse_args()
     orchestrator = PipelineOrchestrator(
@@ -325,10 +489,13 @@ def main() -> None:
         batch_sleep=args.batch_sleep,
         interval=args.interval,
         resume_ingestion=not args.no_resume_ingestion,
+        resume_pipeline=not args.no_resume_pipeline,
         models=[m.strip() for m in args.models.split(",")] if args.models else None,
         skip_ingestion=args.skip_ingestion,
         skip_training=args.skip_training,
         skip_validation=args.skip_validation,
+        force_pipeline_restart=args.force_pipeline_restart,
+        pipeline_checkpoint_out=args.pipeline_checkpoint_out,
     )
     LOG.info(
         "[Pipeline] Complete asset=%s training=%s validation=%s manifest=%s",

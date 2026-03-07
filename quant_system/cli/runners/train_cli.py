@@ -18,7 +18,7 @@ from quant_system.cli.common import (
 )
 from quant_system.config.config_loader import ConfigLoader
 from quant_system.ml.training.model_trainer import ModelTrainer
-from quant_system.utils.logger import get_logger
+from quant_system.utils.logger import get_logger, runtime_logged
 
 LOG = get_logger("train_cli")
 
@@ -47,6 +47,7 @@ def _merge_training_frame(features_df: pd.DataFrame, labels_df: pd.DataFrame) ->
     return labels_df
 
 
+@runtime_logged("Train CLI runtime")
 def main():
     args = parse_args()
     conf_dir = resolve_conf_dir(args.config_dir)

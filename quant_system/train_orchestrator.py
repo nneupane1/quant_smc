@@ -23,13 +23,21 @@ from quant_system.cli.common import (
     load_or_build_features,
     load_or_build_labels,
     load_registry,
+    read_frame,
     resolve_conf_dir,
     save_json,
 )
 from quant_system.config.config_loader import ConfigLoader
 from quant_system.ml.registry.model_registry import ModelRegistry
 from quant_system.ml.training.model_trainer import ModelTrainer
-from quant_system.utils.logger import console_kv, console_rule, console_stage, fmt_num, get_logger
+from quant_system.utils.logger import (
+    console_kv,
+    console_rule,
+    console_stage,
+    fmt_num,
+    get_logger,
+    runtime_logged,
+)
 
 LOG = get_logger("train_orchestrator")
 
@@ -61,6 +69,51 @@ class TrainOrchestrator:
         self.artifact_root = Path(artifact_root)
         self.artifact_root.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _read_json(path: Path) -> Dict[str, Any]:
+        if not path.exists():
+            return {}
+        try:
+            import json
+
+            with path.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _mtime(path: Path) -> Optional[float]:
+        try:
+            return path.stat().st_mtime
+        except Exception:
+            return None
+
+    @classmethod
+    def _is_up_to_date(cls, target: Path, sources: List[Path]) -> bool:
+        if not target.exists():
+            return False
+        t_mtime = cls._mtime(target)
+        if t_mtime is None:
+            return False
+        for src in sources:
+            s_mtime = cls._mtime(src)
+            if s_mtime is not None and s_mtime > t_mtime:
+                return False
+        return True
+
+    @staticmethod
+    def _requested_registry_models(asset: str, requested_models: List[str]) -> List[str]:
+        names: List[str] = []
+        for model in requested_models:
+            if model == "meta_model":
+                names.append(f"{asset}_meta")
+            elif model == "confluence_model":
+                names.append(f"{asset}_confluence")
+            else:
+                names.append(f"{asset}_{model}")
+        return names
+
     def build_training_frame(
         self,
         *,
@@ -71,18 +124,76 @@ class TrainOrchestrator:
         features_out: Optional[str] = None,
         labels_out: Optional[str] = None,
         merged_out: Optional[str] = None,
+        resume: bool = True,
+        force_rebuild: bool = False,
     ) -> pd.DataFrame:
+        merged_path = Path(merged_out) if merged_out else None
+        if (
+            resume
+            and not force_rebuild
+            and merged_path is not None
+            and merged_path.exists()
+        ):
+            source_paths: List[Path] = []
+            if features_csv:
+                source_paths.append(Path(features_csv))
+            elif features_out:
+                source_paths.append(Path(features_out))
+            elif tf_dir:
+                source_paths.extend(
+                    [
+                        Path(tf_dir) / f"{asset}_{tf}.csv"
+                        for tf in ("15m", "1h", "6h", "12h")
+                    ]
+                )
+            if labels_csv:
+                source_paths.append(Path(labels_csv))
+            elif labels_out:
+                source_paths.append(Path(labels_out))
+
+            if self._is_up_to_date(merged_path, source_paths):
+                console_stage(
+                    "Training frame cache hit",
+                    f"path={merged_path}",
+                    status="ok",
+                )
+                return read_frame(str(merged_path))
+
+        effective_features_csv = features_csv
+        if (
+            resume
+            and not force_rebuild
+            and effective_features_csv is None
+            and features_out
+            and Path(features_out).exists()
+        ):
+            effective_features_csv = features_out
+
         features_df = load_or_build_features(
             self.cfg_loader,
             asset=asset,
-            features_csv=features_csv,
+            features_csv=effective_features_csv,
             tf_dir=tf_dir,
             features_out=features_out,
         )
+
+        effective_labels_csv = labels_csv
+        if (
+            resume
+            and not force_rebuild
+            and effective_labels_csv is None
+            and labels_out
+            and Path(labels_out).exists()
+        ):
+            features_stamp_path = Path(effective_features_csv) if effective_features_csv else (Path(features_out) if features_out else None)
+            labels_path = Path(labels_out)
+            if features_stamp_path is None or self._is_up_to_date(labels_path, [features_stamp_path]):
+                effective_labels_csv = labels_out
+
         labels_df = load_or_build_labels(
             self.cfg_loader,
             features_df=features_df,
-            labels_csv=labels_csv,
+            labels_csv=effective_labels_csv,
             labels_out=labels_out,
         )
         train_df = _merge_training_frame(features_df, labels_df)
@@ -106,12 +217,57 @@ class TrainOrchestrator:
         manifest_out: Optional[str] = None,
         model_state_out: Optional[str] = None,
         models: Optional[List[str]] = None,
+        resume: bool = True,
+        force_retrain: bool = False,
+        force_rebuild_frame: bool = False,
     ) -> Dict[str, Any]:
         merged_out = merged_out or str(self.artifact_root / asset / "training_frame.csv")
         manifest_out = manifest_out or str(self.artifact_root / asset / "train_manifest.json")
         model_state_out = model_state_out or str(self.artifact_root / asset / "model_state.json")
 
         requested_models = ModelTrainer._normalize_requested_models(models)
+        merged_path = Path(merged_out)
+        manifest_path = Path(manifest_out)
+        model_state_path = Path(model_state_out)
+
+        frame_sources: List[Path] = []
+        if features_csv:
+            frame_sources.append(Path(features_csv))
+        elif features_out:
+            frame_sources.append(Path(features_out))
+        elif tf_dir:
+            frame_sources.extend([Path(tf_dir) / f"{asset}_{tf}.csv" for tf in ("15m", "1h", "6h", "12h")])
+        if labels_csv:
+            frame_sources.append(Path(labels_csv))
+        elif labels_out:
+            frame_sources.append(Path(labels_out))
+
+        if resume and not force_retrain:
+            cached_manifest = self._read_json(manifest_path)
+            if (
+                cached_manifest.get("asset") == asset
+                and merged_path.exists()
+                and model_state_path.exists()
+                and self._is_up_to_date(merged_path, frame_sources)
+                and self._is_up_to_date(manifest_path, [merged_path])
+            ):
+                cached_models = set(cached_manifest.get("trained_models", []) or []) | set(
+                    cached_manifest.get("dependency_models", []) or []
+                )
+                requested_set = set(requested_models)
+                version = str(cached_manifest.get("version") or "")
+                registry_names = self._requested_registry_models(asset, requested_models)
+                registry_ok = bool(version) and all(
+                    (Path(self.registry.base_dir) / name / version).exists() for name in registry_names
+                )
+                if requested_set.issubset(cached_models) and registry_ok:
+                    console_stage(
+                        "Training resume hit",
+                        f"version={version} manifest={manifest_path}",
+                        status="ok",
+                    )
+                    return cached_manifest
+
         console_rule(f"Training Room | {asset}", style="green")
         console_kv(
             "Training Plan",
@@ -122,6 +278,7 @@ class TrainOrchestrator:
                 "labels_csv": labels_csv or "-",
                 "requested_models": ", ".join(requested_models),
                 "registry": self.registry.base_dir,
+                "resume": bool(resume and not force_retrain),
             },
             style="green",
         )
@@ -135,6 +292,8 @@ class TrainOrchestrator:
             features_out=features_out,
             labels_out=labels_out,
             merged_out=merged_out,
+            resume=resume,
+            force_rebuild=force_rebuild_frame,
         )
         console_stage(
             "Training frame ready",
@@ -246,6 +405,9 @@ class TrainOrchestrator:
                 manifest_out=payload.get("manifest_out"),
                 model_state_out=payload.get("model_state_out"),
                 models=payload.get("models"),
+                resume=bool(payload.get("resume", True)),
+                force_retrain=bool(payload.get("force_retrain", False)),
+                force_rebuild_frame=bool(payload.get("force_rebuild_frame", False)),
             )
         return results
 
@@ -302,9 +464,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--models", default=None, help="Comma-separated model list, e.g. liq_flow,flow_1h,meta_model")
     parser.add_argument("--model-registry", default=None, help="Override model registry directory")
     parser.add_argument("--artifact-root", default="artifacts/train/latest", help="Default artifact root for orchestrator outputs")
+    parser.add_argument("--no-resume", action="store_true", help="Disable checkpoint/manifest resume logic.")
+    parser.add_argument("--force-retrain", action="store_true", help="Force model retraining even if manifest is reusable.")
+    parser.add_argument("--force-rebuild-frame", action="store_true", help="Force rebuilding merged training frame from features/labels.")
     return parser.parse_args()
 
 
+@runtime_logged("Training orchestrator runtime")
 def main() -> None:
     args = parse_args()
     orchestrator = TrainOrchestrator(
@@ -324,6 +490,9 @@ def main() -> None:
         manifest_out=args.manifest_out,
         model_state_out=args.model_state_out,
         models=[m.strip() for m in args.models.split(",")] if args.models else None,
+        resume=not args.no_resume,
+        force_retrain=args.force_retrain,
+        force_rebuild_frame=args.force_rebuild_frame,
     )
     console_stage(
         "Training complete",

@@ -18,7 +18,14 @@ import pandas as pd
 from quant_system.cli.common import default_asset, default_conf_dir, save_json
 from quant_system.config.config_loader import ConfigLoader
 from quant_system.data.ingest.ingestion import DataIngestion
-from quant_system.utils.logger import console_kv, console_rule, console_stage, fmt_ts, get_logger
+from quant_system.utils.logger import (
+    console_kv,
+    console_rule,
+    console_stage,
+    fmt_ts,
+    get_logger,
+    runtime_logged,
+)
 
 LOG = get_logger("data_orchestrator")
 
@@ -131,6 +138,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+@runtime_logged("Data orchestrator runtime")
 def main() -> None:
     args = parse_args()
     orchestrator = DataOrchestrator(conf_dir=args.config_dir, artifact_root=args.artifact_root)

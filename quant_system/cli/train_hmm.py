@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import pandas as pd
+from quant_system.utils.logger import runtime_logged
 
 
 def _parse_features(arg: Optional[str]) -> List[str]:
@@ -23,6 +24,7 @@ def _parse_features(arg: Optional[str]) -> List[str]:
     return [c.strip() for c in arg.split(",") if c.strip()]
 
 
+@runtime_logged("Train HMM runtime")
 def main():
     ap = argparse.ArgumentParser(description="Train an unsupervised Gaussian HMM for regimes.")
     ap.add_argument("--input", required=True, help="CSV with regime features (dt + columns).")

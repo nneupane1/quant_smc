@@ -7,8 +7,10 @@ import streamlit as st
 from quant_system.dashboard.data_access import build_context
 from quant_system.dashboard.pages.apps.forward_test import render_forward_test
 from quant_system.forward_test.forward_dashboard_adapter import ForwardDashboardAdapter
+from quant_system.utils.logger import runtime_logged
 
 
+@runtime_logged("Forward dashboard page runtime")
 def main() -> None:
     st.set_page_config(page_title="Forward Test Cockpit", layout="wide")
     if "dashboard_adapter" not in st.session_state:

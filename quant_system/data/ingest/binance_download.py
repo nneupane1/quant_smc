@@ -13,8 +13,10 @@ import argparse
 import os
 import pandas as pd
 from quant_system.data.ingest.binance_client import BinanceClient
+from quant_system.utils.logger import runtime_logged
 
 
+@runtime_logged("Binance download runtime")
 def main():
     parser = argparse.ArgumentParser(description="Download Binance 1m OHLCV to CSV")
     parser.add_argument("--pair", default="BTC/USDT", help="Trading pair, e.g., BTC/USDT")

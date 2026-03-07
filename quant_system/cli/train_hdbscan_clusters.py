@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import RobustScaler
+from quant_system.utils.logger import runtime_logged
 
 try:
     import hdbscan
@@ -89,6 +90,7 @@ def train_hdbscan(
     }
 
 
+@runtime_logged("Train HDBSCAN clusters runtime")
 def main():
     ap = argparse.ArgumentParser(description="Train HDBSCAN clusters on liquidity/vol features.")
     ap.add_argument("--input", required=True, help="Input CSV with dt, timestamp, and feature columns.")

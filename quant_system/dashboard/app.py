@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -12,6 +13,7 @@ from quant_system.forward_test.forward_dashboard_adapter import ForwardDashboard
 from quant_system.utils.logger import get_logger
 
 LOG = get_logger("dashboard_app")
+LOGO_PATH = Path(__file__).resolve().parent / "logo" / "bull_bear.png"
 
 st.set_page_config(
     page_title="Quant System Terminal",
@@ -30,6 +32,8 @@ PAGE_REGISTRY = {
     "Insights": ("quant_system.dashboard.pages.apps.insights", "render_insights"),
     "Regime Briefings": ("quant_system.dashboard.pages.apps.regime_briefings", "render_regime_briefings"),
     "Signal Intelligence": ("quant_system.dashboard.pages.apps.signal_intelligence", "render_signal_intelligence"),
+    "Decision Trace": ("quant_system.dashboard.pages.apps.decision_trace", "render_decision_trace"),
+    "Performance Intelligence": ("quant_system.dashboard.pages.apps.trade_log", "render_trade_log"),
     "Risk Radar": ("quant_system.dashboard.pages.apps.risk_radar", "render_risk_radar"),
     "Research & Audit": ("quant_system.dashboard.pages.apps.research_audit", "render_research_audit"),
     "Settings": (None, None),
@@ -54,6 +58,8 @@ DOMAIN_CAPTIONS = {
     "Insights": "Causal trace, feature graph, structural state, execution eligibility",
     "Regime Briefings": "12h state, persistence, transition risk, structural stability",
     "Signal Intelligence": "Comparative ranking, confluence vectors, candidate coherence",
+    "Decision Trace": "Per-alert causal chain, entry/exit rationale, lifecycle reconstruction",
+    "Performance Intelligence": "Per-trade ledger, PnL decomposition, win-rate and ML attribution surfaces",
     "Risk Radar": "Stress gates, fragility, liquidity degradation, readiness control",
     "Research & Audit": "Backtest, replay, trade ledger, reasoning reconstruction",
 }
@@ -102,6 +108,8 @@ def _render_domain_dock() -> None:
 
 
 with st.sidebar:
+    if LOGO_PATH.exists():
+        st.image(str(LOGO_PATH), use_container_width=True)
     st.title("Quant Terminal")
     theme_choice = st.selectbox("Theme", ["bloomberg", "dark", "minimal", "high_contrast"], index=0)
     theme_manager.apply_theme(theme_choice)
@@ -138,6 +146,11 @@ st.session_state["dashboard_context"] = context
 selected_page = _active_page()
 
 LOG.info("Dashboard initialized page=%s theme=%s", selected_page, theme_choice)
+
+if LOGO_PATH.exists():
+    logo_col, _ = st.columns([1.2, 8.8])
+    with logo_col:
+        st.image(str(LOGO_PATH), width=140)
 
 status_col1, status_col2, status_col3 = st.columns([1.3, 1.2, 2.5])
 with status_col1:

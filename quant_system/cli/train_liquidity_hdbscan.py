@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+from quant_system.utils.logger import runtime_logged
 
 
 def _parse_feature_cols(raw: Optional[str]):
@@ -23,6 +24,7 @@ def _parse_feature_cols(raw: Optional[str]):
     return [c.strip() for c in raw.split(",") if c.strip()]
 
 
+@runtime_logged("Train liquidity HDBSCAN runtime")
 def main():
     ap = argparse.ArgumentParser(
         description="Train HDBSCAN liquidity/microstructure clusters (15m or 1h)."

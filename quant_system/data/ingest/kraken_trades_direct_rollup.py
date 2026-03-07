@@ -25,6 +25,7 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 from quant_system.config.config_loader import ConfigLoader
+from quant_system.utils.logger import runtime_logged
 
 # Silence pandas future warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -583,6 +584,7 @@ class KrakenDirectDownloader:
 
 
 # --------------------------- CLI --------------------------- #
+@runtime_logged("Kraken direct rollup runtime")
 def main():
     ap = argparse.ArgumentParser(description="Kraken trades -> DIRECT 15m/1h/6h/12h CSVs (checkpointed, no 1m persisted).")
     ap.add_argument("--pair", default="XBTUSD", help="Kraken altname (default XBTUSD)")

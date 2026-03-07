@@ -15,9 +15,9 @@ Features:
 
 import os
 import csv
-import math
 import time
-from typing import Dict, List, Iterable
+import json
+from typing import Dict, List, Iterable, Optional
 from datetime import datetime
 
 from quant_system.utils.logger import log
@@ -63,23 +63,97 @@ class TimeframeBuilder:
         "12h": 60 * 60 * 12,
     }
 
-    def __init__(self, input_csv: str, output_dir: str, pair: str = "BTCUSD"):
+    def __init__(
+        self,
+        input_csv: str,
+        output_dir: str,
+        pair: str = "BTCUSD",
+        checkpoint_path: Optional[str] = None,
+        resume: bool = True,
+    ):
         self.input_csv = input_csv
         self.output_dir = output_dir
         self.pair = pair
+        self.resume = bool(resume)
+        self.checkpoint_path = checkpoint_path or os.path.join(self.output_dir, f"{self.pair}_tf_checkpoint.json")
 
         log(f"TimeframeBuilder initialized for {input_csv}")
 
     # ------------------------------------------------------------
-    def _setup_writers(self) -> Dict[str, CSVWriter]:
+    def _setup_writers(self, *, append: bool) -> Dict[str, CSVWriter]:
         """Create CSV writers for each timeframe."""
         writers = {}
         for tf in self.TF_MAP:
             path = os.path.join(self.output_dir, f"{self.pair}_{tf}.csv")
-            w = CSVWriter(path, append=False)
-            w.write_header()
+            w = CSVWriter(path, append=append)
+            if not append:
+                w.write_header()
             writers[tf] = w
         return writers
+
+    # ------------------------------------------------------------
+    def _outputs_exist(self) -> bool:
+        for tf in self.TF_MAP:
+            path = os.path.join(self.output_dir, f"{self.pair}_{tf}.csv")
+            if not os.path.exists(path) or os.path.getsize(path) == 0:
+                return False
+        return True
+
+    # ------------------------------------------------------------
+    def _load_checkpoint(self) -> Dict[str, object]:
+        if not self.resume or not self.checkpoint_path or not os.path.exists(self.checkpoint_path):
+            return {}
+        try:
+            with open(self.checkpoint_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict):
+                return {}
+            if str(payload.get("pair")) != str(self.pair):
+                return {}
+            if str(payload.get("input_csv")) != str(self.input_csv):
+                return {}
+            if str(payload.get("output_dir")) != str(self.output_dir):
+                return {}
+            return payload
+        except Exception as exc:
+            log(f"Warning: failed to load timeframe checkpoint {self.checkpoint_path}: {exc}")
+            return {}
+
+    # ------------------------------------------------------------
+    def _save_checkpoint(
+        self,
+        *,
+        last_offset: int,
+        total_rows: int,
+        bars: Dict[str, Dict[str, float]],
+        completed: bool,
+    ) -> None:
+        if not self.checkpoint_path:
+            return
+        os.makedirs(os.path.dirname(self.checkpoint_path) or ".", exist_ok=True)
+        payload = {
+            "pair": self.pair,
+            "input_csv": self.input_csv,
+            "output_dir": self.output_dir,
+            "last_offset": int(last_offset),
+            "total_rows": int(total_rows),
+            "bars": bars,
+            "completed": bool(completed),
+            "updated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        with open(self.checkpoint_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+    # ------------------------------------------------------------
+    @staticmethod
+    def _parse_row(line: str, header_cols: List[str]) -> Optional[Dict[str, str]]:
+        raw = line.strip()
+        if not raw:
+            return None
+        fields = next(csv.reader([raw]))
+        if not fields or len(fields) < len(header_cols):
+            return None
+        return {k: fields[i] for i, k in enumerate(header_cols)}
 
     # ------------------------------------------------------------
     def _new_bar(self, ts: int, price: float, volume: float) -> Dict[str, float]:
@@ -127,31 +201,89 @@ class TimeframeBuilder:
 
         t0 = time.time()
         log("Starting timeframe build (CSV-only).")
+        os.makedirs(self.output_dir, exist_ok=True)
 
-        writers = self._setup_writers()
+        file_size = os.path.getsize(self.input_csv) if os.path.exists(self.input_csv) else 0
+        ckpt = self._load_checkpoint()
+        resume_ready = False
+        start_offset = 0
+        total_rows = 0
 
         # Active bar per TF
         bars: Dict[str, Dict[str, float]] = {tf: None for tf in self.TF_MAP}
+        if ckpt:
+            ckpt_offset = int(ckpt.get("last_offset", 0) or 0)
+            ckpt_rows = int(ckpt.get("total_rows", 0) or 0)
+            ckpt_bars = ckpt.get("bars", {})
+            if isinstance(ckpt_bars, dict):
+                for tf in self.TF_MAP:
+                    bar = ckpt_bars.get(tf)
+                    bars[tf] = bar if isinstance(bar, dict) else None
+
+            if bool(ckpt.get("completed")) and ckpt_offset >= file_size and self._outputs_exist():
+                log("Timeframe outputs already current for this raw file. Skipping rebuild.")
+                return
+
+            if self._outputs_exist() and ckpt_offset > 0 and ckpt_offset <= file_size:
+                start_offset = ckpt_offset
+                total_rows = ckpt_rows
+                resume_ready = True
+                log(
+                    f"Resuming timeframe build from checkpoint offset={start_offset:,} "
+                    f"rows={total_rows:,}"
+                )
+            elif ckpt_offset > file_size:
+                log("Checkpoint offset exceeded raw file size; restarting timeframe build from scratch.")
+
+        writers = self._setup_writers(append=resume_ready)
         intervals = self.TF_MAP
 
-        total_rows = 0
-
         with open(self.input_csv, "r") as f:
-            reader = csv.DictReader(f)
+            header_line = f.readline()
+            if not header_line:
+                raise ValueError(f"Input CSV is empty: {self.input_csv}")
+            header_cols = next(csv.reader([header_line.strip()]))
+            data_start_offset = f.tell()
+            if "timestamp" not in header_cols or "close" not in header_cols or "volume" not in header_cols:
+                raise ValueError(
+                    "Input CSV is missing required columns: timestamp, close, volume"
+                )
+            if start_offset < data_start_offset:
+                start_offset = data_start_offset
+            if start_offset > 0:
+                f.seek(start_offset)
 
             chunk = []
-            for row in reader:
+            while True:
+                line = f.readline()
+                if not line:
+                    break
+                row = self._parse_row(line, header_cols)
+                if row is None:
+                    continue
                 chunk.append(row)
                 if len(chunk) >= chunk_size:
                     self._process_chunk(chunk, bars, writers, intervals)
                     total_rows += len(chunk)
                     log(f"Processed {total_rows:,} rows.")
+                    self._save_checkpoint(
+                        last_offset=f.tell(),
+                        total_rows=total_rows,
+                        bars=bars,
+                        completed=False,
+                    )
                     chunk = []
 
             if chunk:
                 self._process_chunk(chunk, bars, writers, intervals)
                 total_rows += len(chunk)
                 log(f"Processed final rows, total={total_rows:,}.")
+                self._save_checkpoint(
+                    last_offset=f.tell(),
+                    total_rows=total_rows,
+                    bars=bars,
+                    completed=False,
+                )
 
         if include_final_partial:
             log("Writing remaining bars at end of file.")
@@ -161,6 +293,12 @@ class TimeframeBuilder:
         else:
             log("Skipping remaining open bars at EOF to avoid partial HTF candles.")
 
+        self._save_checkpoint(
+            last_offset=file_size,
+            total_rows=total_rows,
+            bars=bars,
+            completed=True,
+        )
         dt = time.time() - t0
         log(f"Timeframe build completed in {dt:.2f} seconds.")
 

@@ -17,7 +17,7 @@ import pandas as pd
 from quant_system.config.config_loader import ConfigLoader
 from quant_system.ml.training.model_trainer import ModelTrainer
 from quant_system.ml.registry.model_registry import ModelRegistry
-from quant_system.utils.logger import get_logger
+from quant_system.utils.logger import get_logger, runtime_logged
 
 LOG = get_logger("train_models_cli")
 
@@ -46,6 +46,7 @@ def load_data(feat_path: str, lbl_path: str) -> pd.DataFrame:
     return df
 
 
+@runtime_logged("Train models utility runtime")
 def main():
     args = parse_args()
     cfg = ConfigLoader(args.config)

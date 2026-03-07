@@ -332,12 +332,16 @@ class DataIngestion:
             raise ValueError("No candles returned for requested window and no existing raw CSV found.")
 
         tf_paths: Dict[str, str] = {}
+        tf_checkpoint_path: Optional[str] = None
         if self.build_timeframes:
             console_stage("Timeframe rebuild", f"source={self.output_path} -> {self.tf_output_dir}", status="info")
+            tf_checkpoint_path = os.path.join(self.tf_output_dir, f"{self.asset}_tf_checkpoint.json")
             builder = TimeframeBuilder(
                 input_csv=self.output_path,
                 output_dir=self.tf_output_dir,
                 pair=self.asset,
+                checkpoint_path=tf_checkpoint_path,
+                resume=self.resume,
             )
             builder.build()
             tf_paths = {
@@ -375,6 +379,7 @@ class DataIngestion:
             "last_processed_ts": last_processed_ts,
             "resumed_from_ts": resumed_from_ts,
             "checkpoint_path": self.checkpoint_path,
+            "tf_checkpoint_path": tf_checkpoint_path,
             "completed": completed,
             "raw_1m_path": self.output_path,
             "tf_paths": tf_paths,

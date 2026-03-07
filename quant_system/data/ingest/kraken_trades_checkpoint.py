@@ -31,6 +31,7 @@ import requests
 from dotenv import load_dotenv
 
 from quant_system.config.config_loader import ConfigLoader
+from quant_system.utils.logger import runtime_logged
 
 KRAKEN_REST = "https://api.kraken.com"
 
@@ -378,6 +379,7 @@ class KrakenDownloader:
 
 
 # --------------------------- CLI --------------------------- #
+@runtime_logged("Kraken trades checkpoint runtime")
 def main():
     ap = argparse.ArgumentParser(description="Kraken trades -> 1m/15m/1h/6h/12h CSV (checkpointed).")
     ap.add_argument("--pair", default="XBTUSD", help="Kraken altname (default XBTUSD)")

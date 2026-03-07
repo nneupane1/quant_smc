@@ -15,7 +15,7 @@ Also emits an HTF SMC audit table (unpruned, unlagged) for dashboards.
 
 import pandas as pd
 import numpy as np
-from typing import Dict, Optional, List
+from typing import Any, Dict, Optional, List
 import argparse
 import time
 from pathlib import Path
@@ -40,7 +40,7 @@ from quant_system.features.absorption_features import (
 )
 
 from quant_system.utils.time_utils import SessionClassifier as SessionTimeFeature  # placeholder
-from quant_system.utils.logger import get_logger
+from quant_system.utils.logger import get_logger, runtime_logged
 
 LOG = get_logger("feature_builder")
 
@@ -151,7 +151,37 @@ class FeatureBuilder:
             "audit": base / f"{asset}_htf_audit.csv",
         }
 
-    def _load_checkpoint(self, ckpt_path: Path) -> Dict[str, any]:
+    def _source_signature(self, input_dir: str, asset: str) -> Dict[str, Dict[str, Any]]:
+        base = Path(input_dir)
+        sig: Dict[str, Dict[str, Any]] = {}
+        for tf in ("15m", "1h", "6h", "12h"):
+            path = base / f"{asset}_{tf}.csv"
+            st = path.stat()
+            sig[tf] = {
+                "path": str(path.resolve()),
+                "size": int(st.st_size),
+                "mtime_ns": int(st.st_mtime_ns),
+            }
+        return sig
+
+    @staticmethod
+    def _source_signature_match(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+        if not isinstance(a, dict) or not isinstance(b, dict):
+            return False
+        for tf in ("15m", "1h", "6h", "12h"):
+            av = a.get(tf) if isinstance(a, dict) else None
+            bv = b.get(tf) if isinstance(b, dict) else None
+            if not isinstance(av, dict) or not isinstance(bv, dict):
+                return False
+            if str(av.get("path")) != str(bv.get("path")):
+                return False
+            if int(av.get("size", -1)) != int(bv.get("size", -2)):
+                return False
+            if int(av.get("mtime_ns", -1)) != int(bv.get("mtime_ns", -2)):
+                return False
+        return True
+
+    def _load_checkpoint(self, ckpt_path: Path) -> Dict[str, Any]:
         if ckpt_path.exists():
             try:
                 return json.loads(ckpt_path.read_text())
@@ -159,14 +189,29 @@ class FeatureBuilder:
                 return {}
         return {}
 
-    def _save_checkpoint(self, ckpt_path: Path, asset: str, input_dir: str, out_path: Path, stage: int):
+    def _save_checkpoint(
+        self,
+        ckpt_path: Path,
+        asset: str,
+        input_dir: str,
+        out_path: Path,
+        stage: int,
+        source_sig: Optional[Dict[str, Dict[str, Any]]] = None,
+    ):
         ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-        ckpt_path.write_text(json.dumps({
-            "asset": asset,
-            "input_dir": str(input_dir),
-            "out_path": str(out_path),
-            "last_stage": stage,
-        }, indent=2))
+        ckpt_path.write_text(
+            json.dumps(
+                {
+                    "asset": asset,
+                    "input_dir": str(input_dir),
+                    "out_path": str(out_path),
+                    "last_stage": stage,
+                    "source_signature": source_sig or {},
+                    "updated_at_utc": pd.Timestamp.utcnow().isoformat(),
+                },
+                indent=2,
+            )
+        )
 
     def _load_from_dir(self, input_dir: str, asset: str) -> Dict[str, pd.DataFrame]:
         base = Path(input_dir)
@@ -180,10 +225,22 @@ class FeatureBuilder:
 
     def build_from_dir(self, input_dir: str, asset: str, out_path: Optional[str] = None) -> pd.DataFrame:
         paths: Dict[str, Path] = {}
-        ckpt = {}
+        ckpt: Dict[str, Any] = {}
+        source_sig: Dict[str, Dict[str, Any]] = self._source_signature(input_dir, asset)
         if out_path:
             paths = self._paths(Path(out_path), asset)
             ckpt = self._load_checkpoint(paths["checkpoint"])
+            ckpt_sig = ckpt.get("source_signature", {}) if isinstance(ckpt, dict) else {}
+            if ckpt and not self._source_signature_match(ckpt_sig, source_sig):
+                LOG.info("[FeatureBuilder] Checkpoint invalidated (source TF files changed). Rebuilding stages.")
+                ckpt = {}
+            if (
+                ckpt.get("last_stage", 0) >= 4
+                and Path(out_path).exists()
+                and self._source_signature_match(ckpt.get("source_signature", {}), source_sig)
+            ):
+                LOG.info(f"[FeatureBuilder] Stage 4 cache hit -> {out_path}")
+                return self._normalize_df(pd.read_csv(Path(out_path)), path_hint=str(out_path))
 
         dfs = self._load_from_dir(input_dir, asset)
         df15 = dfs["15m"].copy()
@@ -207,7 +264,14 @@ class FeatureBuilder:
             df15 = self._add_helper_flags(df15)
             if paths.get("stage1"):
                 df15.to_csv(paths["stage1"], index=False)
-                self._save_checkpoint(paths["checkpoint"], asset, input_dir, Path(out_path) if out_path else Path(), 1)
+                self._save_checkpoint(
+                    paths["checkpoint"],
+                    asset,
+                    input_dir,
+                    Path(out_path) if out_path else Path(),
+                    1,
+                    source_sig=source_sig,
+                )
             LOG.info(f"[FeatureBuilder] Stage 1 done in {time.perf_counter() - t0:.2f}s")
 
         # Normalize HTFs (always needed downstream)
@@ -246,7 +310,14 @@ class FeatureBuilder:
                 df15.to_csv(paths["stage2"], index=False)
                 if self.audit_table is not None and not self.audit_table.empty:
                     self.audit_table.to_csv(paths["audit"], index=False)
-                self._save_checkpoint(paths["checkpoint"], asset, input_dir, Path(out_path) if out_path else Path(), 2)
+                self._save_checkpoint(
+                    paths["checkpoint"],
+                    asset,
+                    input_dir,
+                    Path(out_path) if out_path else Path(),
+                    2,
+                    source_sig=source_sig,
+                )
             LOG.info(f"[FeatureBuilder] Stage 2 done in {time.perf_counter() - t0:.2f}s")
 
         # Stage 3: EMA/Liq/Vol/Absorption/Regime
@@ -267,7 +338,14 @@ class FeatureBuilder:
             df15 = self.reg_block.apply(df15, df6h, df12, asset)
             if paths.get("stage3"):
                 df15.to_csv(paths["stage3"], index=False)
-                self._save_checkpoint(paths["checkpoint"], asset, input_dir, Path(out_path) if out_path else Path(), 3)
+                self._save_checkpoint(
+                    paths["checkpoint"],
+                    asset,
+                    input_dir,
+                    Path(out_path) if out_path else Path(),
+                    3,
+                    source_sig=source_sig,
+                )
             LOG.info(f"[FeatureBuilder] Stage 3 done in {time.perf_counter() - t0:.2f}s")
 
         # Stage 4: Session, lagging, rolling, cleanup
@@ -280,8 +358,19 @@ class FeatureBuilder:
         core_subset = [c for c in ["dt", "timestamp", "open", "high", "low", "close"] if c in df15.columns]
         df15 = df15.dropna(subset=core_subset).reset_index(drop=True)
 
+        if out_path:
+            out_final = Path(out_path)
+            out_final.parent.mkdir(parents=True, exist_ok=True)
+            df15.to_csv(out_final, index=False)
         if paths.get("checkpoint"):
-            self._save_checkpoint(paths["checkpoint"], asset, input_dir, Path(out_path) if out_path else Path(), 4)
+            self._save_checkpoint(
+                paths["checkpoint"],
+                asset,
+                input_dir,
+                Path(out_path) if out_path else Path(),
+                4,
+                source_sig=source_sig,
+            )
         LOG.info(f"[FeatureBuilder] Stage 4 done in {time.perf_counter() - t0:.2f}s")
 
         LOG.info(f"[FeatureBuilder] Feature build complete rows={len(df15)} for asset={asset}")
@@ -652,6 +741,7 @@ class FeatureBuilder:
         return out
 
 
+@runtime_logged("Feature builder CLI runtime")
 def _cli():
     parser = argparse.ArgumentParser(description="Build features from TF CSVs.")
     parser.add_argument("--config", default="quant_system/config", help="Config directory")

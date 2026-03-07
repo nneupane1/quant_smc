@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import pandas as pd
+from quant_system.utils.logger import runtime_logged
 
 
 def _parse_features(val: Optional[str]) -> Optional[List[str]]:
@@ -21,6 +22,7 @@ def _parse_features(val: Optional[str]) -> Optional[List[str]]:
     return [c.strip() for c in val.split(",") if c.strip()]
 
 
+@runtime_logged("Train HDBSCAN runtime")
 def main():
     ap = argparse.ArgumentParser(
         description="Train HDBSCAN liquidity-state model (unsupervised)."

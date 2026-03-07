@@ -564,6 +564,30 @@ These are the human-friendly top-level scripts that make the pipeline explicit:
 - `train_BTCUSD_quantile_model.py`
 - `tune_BTCUSD_label_horizons.py`
 
+### One-Command Live-Style Rooms
+
+If you want simple launch commands (no long CLI flags), use:
+
+```bash
+python run_BTCUSD_backtest_live_room.py
+python run_BTCUSD_forward_live_room.py
+python run_BTCUSD_paper_live_room.py
+```
+
+These wrappers automatically:
+
+- start the React operator terminal (`Next.js`) by default
+- fallback to Streamlit automatically if React frontend cannot boot
+- start the FastAPI + WebSocket telemetry backend
+- run the selected engine mode with BTCUSD defaults
+- route telemetry through `http://127.0.0.1:8100` (`/snapshot` + `/ws/terminal`)
+
+UI selection can be controlled with:
+
+- `QUANT_UI_SURFACE=next` (default): React terminal, Streamlit fallback
+- `QUANT_UI_SURFACE=streamlit`: Streamlit only
+- `QUANT_UI_SURFACE=both`: React + Streamlit together
+
 ## 16. BTCUSD Sequential Runbook
 
 ### Overview

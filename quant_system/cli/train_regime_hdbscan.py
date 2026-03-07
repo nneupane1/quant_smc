@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+from quant_system.utils.logger import runtime_logged
 
 from quant_system.ml.regime.hdbscan_clustering import (
     HDBSCANConfig,
@@ -23,6 +24,7 @@ from quant_system.ml.regime.hdbscan_clustering import (
 )
 
 
+@runtime_logged("Train regime HDBSCAN runtime")
 def main():
     ap = argparse.ArgumentParser(description="Train HDBSCAN regime/cluster model on a TF CSV.")
     ap.add_argument("--input", required=True, help="Input directory containing {asset}_{tf}.csv")

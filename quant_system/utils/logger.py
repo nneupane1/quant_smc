@@ -1,6 +1,9 @@
 import logging
+import functools
+import os
+import time
 from datetime import datetime, timezone
-from typing import Mapping, Optional
+from typing import Callable, Mapping, Optional, TypeVar
 
 try:  # pragma: no cover - optional pretty console
     from rich.console import Console
@@ -10,6 +13,7 @@ except Exception:  # pragma: no cover
     Table = None
 
 _CONSOLE = Console() if Console is not None else None
+F = TypeVar("F", bound=Callable)
 
 
 def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
@@ -107,3 +111,37 @@ def console_kv(title: str, items: Mapping[str, object], *, style: str = "cyan"):
         print(title)
         for key, value in items.items():
             print(f"  {key}: {value}")
+
+
+def runtime_logged(label: str, *, ok_status: str = "ok", fail_status: str = "warn") -> Callable[[F], F]:
+    """
+    Decorator for executable entrypoints that prints standardized elapsed runtime.
+    """
+
+    def outer(fn: F) -> F:
+        @functools.wraps(fn)
+        def inner(*args, **kwargs):
+            started_at = time.perf_counter()
+            completed = False
+            try:
+                result = fn(*args, **kwargs)
+                completed = True
+                return result
+            finally:
+                runtime_logs_enabled = os.getenv("QUANT_RUNTIME_LOGS", "1").strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+                if not runtime_logs_enabled:
+                    return
+                console_stage(
+                    label,
+                    f"elapsed={fmt_seconds(time.perf_counter() - started_at)}",
+                    status=ok_status if completed else fail_status,
+                )
+
+        return inner  # type: ignore[return-value]
+
+    return outer

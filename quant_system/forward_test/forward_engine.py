@@ -100,6 +100,7 @@ class ForwardEngine:
         self.open_positions = {}
         self.closed_trades: Dict[str, Dict[str, Any]] = {}
         self.trade_log = []
+        self.entry_reason_by_trade: Dict[str, Dict[str, Any]] = {}
 
         LOG.info("[ForwardEngine] Initialized with multi-asset support")
 
@@ -301,13 +302,36 @@ class ForwardEngine:
 
         # Reasoning logging
         reason = self.reason.build(asset, enriched_row, conf, evr, tier_result.get("tier"), risk, hedge_ratio)
+        reason["decision_path"] = {
+            "gates": gate,
+            "danger": danger,
+            "cooling_gate": cooling_gate,
+            "tiering": tier_result,
+            "capital": {
+                "ticket_usd": float(capital_out.get("ticket_usd", 0.0) or 0.0),
+                "risk_mode": risk,
+                "hedge_ratio": hedge_ratio,
+                "lock_fraction": float(capital_out.get("lock_fraction", 0.0) or 0.0),
+            },
+            "position_sizer": {
+                "value_usd": float(sizing.get("value", 0.0) or 0.0),
+                "qty": float(sizing.get("qty", 0.0) or 0.0),
+                "risk_dollars": float(sizing.get("risk_dollars", 0.0) or 0.0),
+                "final_notional_usd": float(pos_usd),
+            },
+        }
         reason["timestamp"] = dt
         self.trade_log.append({"open": pos_core, "reason": reason})
 
+        self.entry_reason_by_trade[pos_core.trade_id] = dict(reason)
+        runner_reason = None
+        if runner_notional > 0:
+            runner_reason = {**reason, "leg": "runner"}
+            self.entry_reason_by_trade[pos_runner.trade_id] = dict(runner_reason)
         if self.dashboard:
             self.dashboard.log_event("entry", pos_core.trade_id, reason)
-            if runner_notional > 0:
-                self.dashboard.log_event("entry", pos_runner.trade_id, {**reason, "leg": "runner"})
+            if runner_reason is not None:
+                self.dashboard.log_event("entry", pos_runner.trade_id, runner_reason)
 
         self._update_equity(dt, enriched_row)
 
@@ -534,7 +558,13 @@ class ForwardEngine:
             "reason": reason,
             "source": source,
             "timestamp": res.get("exit_ts"),
+            "bars_in_trade": getattr(pos, "bars_in_trade", None),
+            "highest_r": getattr(pos, "highest_r", None),
+            "r_mult_at_exit": getattr(pos, "r_mult", None),
         }
+        entry_reason = self.entry_reason_by_trade.pop(trade_id, None)
+        if entry_reason:
+            payload["entry_reasoning"] = entry_reason
         self.closed_trades[trade_id] = payload
         self.open_positions.pop(trade_id, None)
         if self.dashboard:

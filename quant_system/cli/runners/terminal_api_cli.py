@@ -3,6 +3,7 @@ import argparse
 import uvicorn
 
 from quant_system.telemetry.server import create_app
+from quant_system.utils.logger import runtime_logged
 
 
 def parse_args():
@@ -14,6 +15,7 @@ def parse_args():
     return parser.parse_args()
 
 
+@runtime_logged("Terminal API runtime")
 def main():
     args = parse_args()
     app = create_app(repo_root=args.repo_root)

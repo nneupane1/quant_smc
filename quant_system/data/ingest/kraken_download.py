@@ -14,6 +14,7 @@ import os
 
 from quant_system.config.config_loader import ConfigLoader
 from quant_system.data.ingest.kraken_client import KrakenClient
+from quant_system.utils.logger import runtime_logged
 
 
 def _tail_timestamp(path: str) -> int:
@@ -43,6 +44,7 @@ def _tail_timestamp(path: str) -> int:
     return None
 
 
+@runtime_logged("Kraken OHLC download runtime")
 def main():
     parser = argparse.ArgumentParser(description="Download Kraken OHLCV to CSV")
     parser.add_argument("--asset", default=None, help="Asset key from assets.yaml (e.g., BTCUSD)")

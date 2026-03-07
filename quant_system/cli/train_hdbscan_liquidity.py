@@ -29,6 +29,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
+from quant_system.utils.logger import runtime_logged
 
 try:
     import hdbscan
@@ -109,6 +110,7 @@ def summarize_labels(labels: np.ndarray) -> Dict:
     }
 
 
+@runtime_logged("Train HDBSCAN liquidity runtime")
 def main():
     ap = argparse.ArgumentParser(description="Train HDBSCAN liquidity/chop clustering.")
     ap.add_argument("--input", required=True, help="Input CSV (15m or 1h bars with dt, ohlcv)")

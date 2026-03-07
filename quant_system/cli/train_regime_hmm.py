@@ -8,8 +8,10 @@ import json
 from pathlib import Path
 
 import pandas as pd
+from quant_system.utils.logger import runtime_logged
 
 
+@runtime_logged("Train regime HMM runtime")
 def main():
     ap = argparse.ArgumentParser(description="Train Gaussian HMM regime model (6h/12h).")
     ap.add_argument("--input", required=True, help="Input CSV with dt and either OHLCV or regime feature columns.")
