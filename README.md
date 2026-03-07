@@ -507,6 +507,7 @@ Important variables:
 
 - `KRAKEN_API_KEY`
 - `KRAKEN_API_SECRET`
+- `KRAKEN_OTP` (optional, only if Kraken account requires OTP for private endpoints)
 - `QS_ENV=DEV`
 
 Frontend env template:
@@ -515,6 +516,20 @@ Frontend env template:
 - `NEXT_PUBLIC_TERMINAL_WS_URL=ws://127.0.0.1:8100/ws/terminal`
 
 Do not commit exchange credentials. The config-local `secrets.env` is a sensitive file and should not be treated as safe for source control.
+
+Live order routing is API-driven. The system does not require UI scraping or Kraken web-interface layout knowledge for automated execution.
+
+### Live Leverage Guardrails
+
+The live orchestrator can automatically step from `1x` to `2x` leverage only when a setup is marked high-confidence. This is controlled in `quant_system/config/execution/execution.yaml` under `live_trading.leverage`:
+
+- `enabled`: global leverage switch
+- `default`: baseline leverage (normally `1`)
+- `high_conf_leverage`: target leverage when confidence policy passes (set to `2`)
+- `high_conf_tiers`: tier allowlist (default `["A+"]`)
+- `high_conf_min_conf`, `high_conf_min_evr`, `high_conf_max_hazard`, `high_conf_min_bos_cont`: quality thresholds
+
+If thresholds fail, the trade stays on default leverage.
 
 ### Configuration Model
 

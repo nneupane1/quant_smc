@@ -63,6 +63,7 @@ class LiveOrchestrator:
         self.assets_cfg = self.cfg.get("assets", {})
         self.assets_meta = self.assets_cfg.get("metadata", {})
         self.default_asset = self.cfg.get("default_asset") or (next(iter(self.assets_meta)) if self.assets_meta else "BTCUSD")
+        self.leverage_cfg = self.cfg.get("live_trading", {}).get("leverage", {})
         assets = list(self.assets_meta.keys()) or [self.default_asset]
         self.quote_state = {asset: QuoteState() for asset in assets}
         self.tf_builder = {asset: TFBuilder() for asset in assets}
@@ -253,6 +254,15 @@ class LiveOrchestrator:
         core_frac = float(split.get("core_frac", 0.7))
         runner_frac = 1.0 - core_frac
         entry = float(enriched["close"])
+        leverage_plan = self._resolve_entry_leverage(
+            asset=asset,
+            row=enriched,
+            tier=tier,
+            conf=float(conf),
+            evr_pack=evr_pack,
+            hazard=float(danger["metrics"]["hazard"] or 0.0),
+        )
+        entry_leverage = int(leverage_plan["leverage"])
 
         def _meta(leg: str) -> Dict[str, Any]:
             return {
@@ -265,6 +275,8 @@ class LiveOrchestrator:
                 "p_bos_cont": enriched.get("p_bos_cont", enriched.get("prob_bos_cont", 0.0)),
                 "initial_stop": enriched["stop_price"],
                 "reason": tier.get("reason"),
+                "leverage": entry_leverage,
+                "leverage_reason": leverage_plan["reason"],
             }
 
         pos_core = None
@@ -301,6 +313,7 @@ class LiveOrchestrator:
                 "risk_dollars": float(sizing.get("risk_dollars", 0.0) or 0.0),
                 "final_notional_usd": float(pos_usd),
             },
+            "leverage": leverage_plan,
         }
         reason["timestamp"] = dt
         if pos_core:
@@ -513,6 +526,57 @@ class LiveOrchestrator:
         if evr.get("evr", 0.0) >= 3.0 and p_bos_cont >= 0.40:
             return True
         return False
+
+    def _resolve_entry_leverage(
+        self,
+        *,
+        asset: str,
+        row: pd.Series,
+        tier: Dict[str, Any],
+        conf: float,
+        evr_pack: Dict[str, Any],
+        hazard: float,
+    ) -> Dict[str, Any]:
+        lev_cfg = self.leverage_cfg or {}
+        if not bool(lev_cfg.get("enabled", False)):
+            return {"leverage": 1, "reason": "leverage_disabled"}
+
+        asset_meta = self.assets_meta.get(asset, {})
+        if not bool(asset_meta.get("leverage_allowed", False)):
+            return {"leverage": 1, "reason": "asset_not_leverageable"}
+
+        max_lev = int(lev_cfg.get("max", 1))
+        min_lev = int(lev_cfg.get("min", 1))
+        default_lev = int(np.clip(int(lev_cfg.get("default", 1)), min_lev, max_lev))
+        high_conf_lev = int(np.clip(int(lev_cfg.get("high_conf_leverage", 2)), min_lev, max_lev))
+
+        tier_name = str(tier.get("tier", "")).strip()
+        allowed_tiers = {str(t).strip() for t in lev_cfg.get("high_conf_tiers", ["A+"])}
+        min_conf = float(lev_cfg.get("high_conf_min_conf", 0.82))
+        min_evr = float(lev_cfg.get("high_conf_min_evr", 1.8))
+        max_hazard = float(lev_cfg.get("high_conf_max_hazard", 0.25))
+        min_bos = float(lev_cfg.get("high_conf_min_bos_cont", 0.55))
+        p_bos_cont = float(row.get("p_bos_cont", row.get("prob_bos_cont", 0.0)) or 0.0)
+
+        high_conf = (
+            tier_name in allowed_tiers
+            and conf >= min_conf
+            and float(evr_pack.get("evr", 0.0) or 0.0) >= min_evr
+            and hazard <= max_hazard
+            and p_bos_cont >= min_bos
+        )
+        if not high_conf:
+            return {"leverage": default_lev, "reason": "default_profile"}
+
+        return {
+            "leverage": high_conf_lev,
+            "reason": "high_confidence",
+            "tier": tier_name,
+            "conf": conf,
+            "evr": float(evr_pack.get("evr", 0.0) or 0.0),
+            "hazard": hazard,
+            "p_bos_cont": p_bos_cont,
+        }
 
     def state_snapshot(self) -> Dict[str, Any]:
         return {

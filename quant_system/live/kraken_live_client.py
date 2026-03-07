@@ -4,12 +4,13 @@ Kraken live market-data client with a safe paper-order fallback.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import os
 import time
 import urllib.parse
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 import requests
 from dotenv import load_dotenv
@@ -34,8 +35,9 @@ class KrakenLiveClient:
         cfg = _as_dict(config)
         self.cfg = cfg
 
-        self.base_url = "https://api.kraken.com/0/public/OHLC"
-        self.private_base_url = "https://api.kraken.com/0/private/AddOrder"
+        self.api_url = cfg.get("api", {}).get("kraken", {}).get("url", "https://api.kraken.com")
+        self.base_url = f"{self.api_url}/0/public/OHLC"
+        self.private_base_url = f"{self.api_url}/0/private"
         self.pair = (
             cfg.get("live_trading", {}).get("venue", {}).get("pair")
             or cfg.get("data", {}).get("pair")
@@ -44,10 +46,10 @@ class KrakenLiveClient:
 
         self.interval = 1
         self.last_ts = None
+        self._last_nonce = 0
 
         self.sleep = float(cfg.get("live", {}).get("update_interval_sec", 60))
         self.live_enabled = bool(cfg.get("live_trading", {}).get("enabled", False))
-        self.api_url = cfg.get("api", {}).get("kraken", {}).get("url", "https://api.kraken.com")
         self.api_key = (
             cfg.get("api", {}).get("kraken", {}).get("key")
             or os.getenv("KRAKEN_API_KEY")
@@ -56,7 +58,16 @@ class KrakenLiveClient:
             cfg.get("api", {}).get("kraken", {}).get("secret")
             or os.getenv("KRAKEN_API_SECRET")
         )
-        LOG.info("KrakenLiveClient initialized for pair=%s live_enabled=%s", self.pair, self.live_enabled)
+        self.api_otp = (
+            cfg.get("api", {}).get("kraken", {}).get("otp")
+            or os.getenv("KRAKEN_OTP")
+        )
+        LOG.info(
+            "KrakenLiveClient initialized for pair=%s live_enabled=%s otp_enabled=%s",
+            self.pair,
+            self.live_enabled,
+            bool(self.api_otp),
+        )
 
     # ---------------------------------------------------------------
     @retry
@@ -128,6 +139,39 @@ class KrakenLiveClient:
                 LOG.error("Stream error: %s", e)
                 time.sleep(self.sleep)
 
+    def _next_nonce(self) -> str:
+        now = int(time.time() * 1000)
+        if now <= self._last_nonce:
+            now = self._last_nonce + 1
+        self._last_nonce = now
+        return str(now)
+
+    @retry
+    def _private_request(self, endpoint: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        if not self.api_key or not self.api_secret:
+            raise RuntimeError("Kraken private endpoint requested without API key/secret configured.")
+
+        nonce = self._next_nonce()
+        body = dict(payload or {})
+        body["nonce"] = nonce
+        if self.api_otp:
+            body["otp"] = self.api_otp
+
+        encoded = urllib.parse.urlencode(body)
+        path = f"/0/private/{endpoint}"
+        signature = self._sign(path, nonce, encoded)
+        headers = {
+            "API-Key": self.api_key,
+            "API-Sign": signature,
+        }
+
+        response = requests.post(f"{self.private_base_url}/{endpoint}", data=body, headers=headers, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("error"):
+            raise RuntimeError(f"Kraken private {endpoint} error: {data['error']}")
+        return data.get("result", {})
+
     def submit_order(
         self,
         *,
@@ -154,12 +198,7 @@ class KrakenLiveClient:
             )
             return {"txid": txid, "paper": True}
 
-        if not self.api_key or not self.api_secret:
-            raise RuntimeError("Live trading enabled but Kraken API credentials are missing.")
-
-        nonce = str(int(time.time() * 1000))
         payload = {
-            "nonce": nonce,
             "pair": pair,
             "type": side,
             "ordertype": ordertype,
@@ -170,27 +209,44 @@ class KrakenLiveClient:
         if leverage and leverage > 1:
             payload["leverage"] = str(leverage)
 
-        encoded = urllib.parse.urlencode(payload)
-        signature = self._sign("/0/private/AddOrder", nonce, encoded)
-        headers = {
-            "API-Key": self.api_key,
-            "API-Sign": signature,
-        }
-        response = requests.post(self.private_base_url, data=payload, headers=headers, timeout=20)
-        response.raise_for_status()
-        data = response.json()
-        if data.get("error"):
-            raise RuntimeError(f"Kraken order error: {data['error']}")
-        txids = data.get("result", {}).get("txid", [])
-        txid = txids[0] if isinstance(txids, list) and txids else data.get("result", {}).get("descr", {}).get("order")
-        return {"txid": txid, "paper": False, "raw": data}
+        result = self._private_request("AddOrder", payload)
+        txids = result.get("txid", [])
+        txid = txids[0] if isinstance(txids, list) and txids else result.get("descr", {}).get("order")
+        return {"txid": txid, "paper": False, "raw": result}
+
+    def cancel_order(self, txid: str) -> Dict[str, Any]:
+        if not self.live_enabled:
+            return {"paper": True, "txid": txid, "status": "canceled"}
+        result = self._private_request("CancelOrder", {"txid": txid})
+        return {"paper": False, "txid": txid, "raw": result}
+
+    def open_orders(self) -> Dict[str, Any]:
+        if not self.live_enabled:
+            return {"paper": True, "open": {}}
+        result = self._private_request("OpenOrders")
+        return {"paper": False, "open": result.get("open", {}), "raw": result}
+
+    def query_orders(self, txids: Sequence[str]) -> Dict[str, Any]:
+        if not txids:
+            return {"paper": (not self.live_enabled), "orders": {}}
+        if not self.live_enabled:
+            return {
+                "paper": True,
+                "orders": {txid: {"status": "closed", "descr": {"order": "paper"}} for txid in txids},
+            }
+        result = self._private_request("QueryOrders", {"txid": ",".join(txids)})
+        return {"paper": False, "orders": result, "raw": result}
+
+    def balance(self) -> Dict[str, Any]:
+        if not self.live_enabled:
+            return {"paper": True, "balances": {}}
+        result = self._private_request("Balance")
+        return {"paper": False, "balances": result, "raw": result}
 
     def _sign(self, path: str, nonce: str, post_data: str) -> str:
         """
         Minimal Kraken API signature helper for private endpoints.
         """
-        import base64
-
         secret = base64.b64decode(self.api_secret)
         message = path.encode() + hashlib.sha256((nonce + post_data).encode()).digest()
         return base64.b64encode(hmac.new(secret, message, hashlib.sha512).digest()).decode()

@@ -242,7 +242,13 @@ live_trading:
     enabled: false      # master switch
     default: 1          # 1 = no leverage
     min: 1
-    max: 5
+    max: 2
+    high_conf_leverage: 2
+    high_conf_tiers: ["A+"]
+    high_conf_min_conf: 0.82
+    high_conf_min_evr: 1.80
+    high_conf_max_hazard: 0.25
+    high_conf_min_bos_cont: 0.55
 
   venue:
     mode: "spot"        # spot | margin | futures

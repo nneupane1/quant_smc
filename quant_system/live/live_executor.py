@@ -81,6 +81,8 @@ class LiveExecutor:
         lev_cfg = self.live_cfg.get("leverage", {})
         self.leverage_enabled = bool(lev_cfg.get("enabled", False))
         self.max_lev = int(lev_cfg.get("max", 1))
+        self.default_lev = int(lev_cfg.get("default", 1))
+        self.live_enabled = bool(self.live_cfg.get("enabled", False))
 
         LOG.info(f"[LiveExecutor] Initialized. Leverage enabled={self.leverage_enabled}, max={self.max_lev}")
 
@@ -101,7 +103,7 @@ class LiveExecutor:
 
         side = "long" if meta.get("direction", "long") == "long" else "short"
 
-        lev = 1
+        lev = max(1, self.default_lev)
         if self.leverage_enabled and symbol_cfg["leverage_allowed"]:
             lev = max(1, min(self.max_lev, meta.get("leverage", 1)))
 
@@ -114,9 +116,13 @@ class LiveExecutor:
 
         LOG.info(f"[LiveExecutor] Opening {side.upper()} {asset} qty={qty} lev={lev} price={price}")
 
-        order_id = self._submit_order(asset, side, qty, price, lev)
-        if not order_id:
+        order_resp = self._submit_order(asset, side, qty, price, lev)
+        if not order_resp:
             LOG.error("[LiveExecutor] Order failed.")
+            return None
+        order_id = str(order_resp.get("txid", ""))
+        if not order_id:
+            LOG.error("[LiveExecutor] Order response missing txid.")
             return None
 
         pos = LivePosition(
@@ -160,7 +166,10 @@ class LiveExecutor:
         side = "sell" if pos.side == "long" else "buy"
         LOG.info(f"[LiveExecutor] Exiting {pos.asset} [{trade_id}] qty={pos.qty} at price={price}")
 
-        self._submit_order(pos.asset, side, pos.qty, price, pos.leverage)
+        exit_resp = self._submit_order(pos.asset, side, pos.qty, price, pos.leverage)
+        if not exit_resp:
+            LOG.error("[LiveExecutor] exit submit failed for trade_id=%s", trade_id)
+            return None
 
         pnl = self._calculate_pnl(pos, price)
         value = pos.notional_usd + pnl
@@ -189,6 +198,8 @@ class LiveExecutor:
             "evr": pos.meta.get("evr"),
             "tier": pos.meta.get("tier"),
             "reason": pos.meta.get("reason"),
+            "exit_txid": exit_resp.get("txid"),
+            "exit_order_status": exit_resp.get("status"),
         }
 
     # ----------------------------------------------------------
@@ -221,11 +232,11 @@ class LiveExecutor:
 
         LOG.info(f"[LiveExecutor] Hedging {pos.asset}: qty={hedge_qty} at price={price}")
 
-        order_id = self._submit_order(pos.asset, "sell", hedge_qty, price, pos.leverage)
-        if order_id:
-            pos.hedge_leg = order_id
+        order_resp = self._submit_order(pos.asset, "sell", hedge_qty, price, pos.leverage)
+        if order_resp:
+            pos.hedge_leg = order_resp.get("txid")
 
-        return order_id
+        return order_resp
 
     # ----------------------------------------------------------
     # MTM
@@ -267,12 +278,39 @@ class LiveExecutor:
                 price=price,
                 leverage=lev
             )
-            oid = resp.get("txid")
-            LOG.info(f"[LiveExecutor] Order success {pair}, oid={oid}")
-            return oid
+            txid = resp.get("txid")
+            status = "unknown"
+            if txid:
+                status = self._reconcile_order(txid)
+            LOG.info("[LiveExecutor] Order success pair=%s txid=%s status=%s", pair, txid, status)
+            return {
+                "txid": txid,
+                "status": status,
+                "paper": bool(resp.get("paper", False)),
+                "raw": resp.get("raw"),
+            }
         except Exception as e:
             LOG.error(f"[LiveExecutor] Order failed: {e}")
             return None
+
+    def _reconcile_order(self, txid: str) -> str:
+        if not txid:
+            return "unknown"
+        if not self.live_enabled:
+            return "paper"
+        try:
+            info = self.kraken.query_orders([txid])
+            orders = info.get("orders", {})
+            if isinstance(orders, dict):
+                rec = orders.get(txid)
+                if rec is None and len(orders) == 1:
+                    rec = next(iter(orders.values()))
+                if isinstance(rec, dict):
+                    return str(rec.get("status", "unknown"))
+            return "unknown"
+        except Exception as exc:
+            LOG.warning("[LiveExecutor] reconcile failed txid=%s err=%s", txid, exc)
+            return "unknown"
 
     # ----------------------------------------------------------
     # UTILITIES

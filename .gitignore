@@ -1,8 +1,11 @@
 # Environment / virtualenv
 .env
 .env.*
+.env.local
+.env.development.local
 .venv/
 venv/
+quant_system/config/secrets.env
 
 # Python artifacts
 __pycache__/
@@ -75,3 +78,4 @@ temp/
 backtest_outputs/
 forward_outputs/
 live_outputs/
+dashboard_preview.png
