@@ -325,31 +325,35 @@ export function TerminalApp({ initialSnapshot }: { initialSnapshot: TerminalSnap
 
 function TopBar({ snapshot, wsConnected }: { snapshot: TerminalSnapshot; wsConnected: boolean }) {
   return (
-    <div className="glass-panel overflow-hidden px-5 py-4">
+    <div className="glass-panel overflow-hidden px-5 py-5">
       <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-cyan/70 to-transparent" />
-      <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
-        <div className="flex items-start gap-6">
-          <div className="relative hidden h-[148px] w-[292px] shrink-0 overflow-hidden rounded-[32px] border border-cyan/35 bg-[#04101b] shadow-bloom lg:block lg:translate-y-5">
-            <Image
-              src="/bull_bear.png"
-              alt="Quant SMC Bull Bear"
-              fill
-              priority
-              className="object-cover object-center scale-[1.08] [clip-path:inset(1.2%_1.2%_1.2%_1.2%_round_34px)]"
-            />
-            <div className="pointer-events-none absolute inset-0 bg-gradient-to-tr from-cyan/20 via-transparent to-amber/25" />
-            <div className="pointer-events-none absolute inset-0 rounded-[32px] ring-1 ring-inset ring-cyan/20" />
+      <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+        <div className="flex items-center gap-7">
+          <div className="relative hidden h-[176px] w-[336px] shrink-0 overflow-hidden rounded-[34px] border border-cyan/30 bg-[#030c15] shadow-bloom lg:block">
+            <div className="absolute inset-[5px] overflow-hidden rounded-[30px] bg-[#020912]">
+              <Image
+                src="/bull_bear.png"
+                alt="Quant SMC Bull Bear"
+                fill
+                priority
+                className="object-cover object-center scale-[1.34] [clip-path:inset(0_16%_0_16%)]"
+              />
+              <div className="pointer-events-none absolute inset-y-0 left-0 w-16 bg-gradient-to-r from-[#020912] to-transparent" />
+              <div className="pointer-events-none absolute inset-y-0 right-0 w-16 bg-gradient-to-l from-[#020912] to-transparent" />
+              <div className="pointer-events-none absolute inset-0 bg-gradient-to-tr from-cyan/18 via-transparent to-amber/20" />
+            </div>
+            <div className="pointer-events-none absolute inset-0 rounded-[34px] ring-1 ring-inset ring-cyan/18" />
           </div>
           <div>
-            <div className="section-kicker">Live Trading Room</div>
-            <div className="mt-2 font-[var(--font-display)] text-3xl font-semibold tracking-tight text-white md:text-4xl xl:whitespace-nowrap">
-              Deterministic Execution Terminal
+            <div className="section-kicker">Live Control Room</div>
+            <div className="mt-2 font-[var(--font-display)] text-3xl font-semibold tracking-tight text-cyan md:text-4xl xl:whitespace-nowrap">
+              Quant Execution Cockpit
             </div>
-            <p className="mt-2 max-w-3xl text-xs uppercase tracking-[0.18em] text-cyan/75">{snapshot.mission.headline}</p>
+            <p className="mt-2 max-w-3xl text-xs uppercase tracking-[0.18em] text-amber/80">{snapshot.mission.headline}</p>
             <p className="mt-3 max-w-4xl text-sm leading-6 text-slate-300/75">{snapshot.mission.substatus}</p>
           </div>
         </div>
-        <div className="flex flex-wrap gap-3">
+        <div className="flex flex-wrap gap-3 xl:max-w-[520px] xl:justify-end">
           <StatusPill label={snapshot.meta.source === "artifacts" ? "Artifact parity live" : "Demo parity preview"} tone={snapshot.meta.source === "artifacts" ? "teal" : "amber"} />
           <StatusPill label={wsConnected ? "WS linked" : "WS standby"} tone={wsConnected ? "teal" : "amber"} />
           <StatusPill label={`Models ${snapshot.meta.modelVersion}`} tone="cyan" />
