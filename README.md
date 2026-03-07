@@ -531,6 +531,15 @@ The live orchestrator can automatically step from `1x` to `2x` leverage only whe
 
 If thresholds fail, the trade stays on default leverage.
 
+### Manual Alert-Only Mode
+
+If you want to trade manually after receiving alerts, set:
+
+- `execution.manual_alert_only: true`
+- keep `live_trading.enabled: false` unless you intentionally want exchange order routing
+
+With `manual_alert_only=true`, forward/live engines still compute confluence, EVR, risk, and full reasoning, but they emit `alert` events and do not open/close positions automatically.
+
 ### Configuration Model
 
 The configuration system merges a base config, module configs, overrides, and environment substitutions into one unified runtime config. In practical terms, that means:
@@ -681,6 +690,8 @@ The label horizons in `labels.yaml` are currently the production baseline, but t
 python tune_BTCUSD_label_horizons.py
 ```
 
+The tuner now requires `xgboost`, `lightgbm`, and `optuna` in the active Python environment.
+
 ### What It Does
 
 The tuner:
@@ -688,9 +699,20 @@ The tuner:
 1. loads the engineered BTCUSD feature frame
 2. rebuilds candidate label sets for multiple horizon choices
 3. includes the current default profile as the baseline
-4. scores challengers empirically with a simple time-series CV baseline
-5. compares challenger objective score vs baseline objective score
-6. promotes only if the challenger clears the configured improvement threshold
+4. scores challengers with purged + embargoed time-series CV using production learners (`lightgbm`, `xgboost`) plus logistic baseline
+5. applies leak-safe preprocessing (median impute, quantile clipping, conditional scaling) and optional Bayesian HPO (Optuna) per model
+6. computes a consensus objective and confidence bounds per candidate
+7. compares challenger objective score vs baseline objective score
+8. promotes only if improvement threshold, model-consensus gate, and CI gate all pass
+
+### Checkpointing And Resume Semantics
+
+The tuner supports resume and writes progress checkpoints so interrupted runs can continue without recomputing every candidate from zero. Current progress is tracked in:
+
+- `artifacts/label_tuning/BTCUSD/progress.json`
+- `artifacts/label_tuning/BTCUSD/progress.ndjson`
+
+Per-task candidate summaries are stored as CSV files in the same directory (`*_tuning.csv`). When rerun with resume enabled, previously scored candidates are loaded from checkpoint and skipped.
 
 ### Promotion Behavior
 
@@ -794,6 +816,8 @@ That is expected. `2017-01-01 00:00 Europe/Berlin` converts to `2016-12-31 23:00
 ### `pandas` Or Another Dependency Is Missing When Running A Top-Level Script
 
 The BTCUSD launchers include a Python bootstrap helper and will try to re-exec into a compatible interpreter when possible. The preferred environment is still a dedicated project environment with `requirements.txt` installed.
+
+The bootstrap now validates by import (not only module presence) and applies a pandas compatibility shim before importing LightGBM. This prevents false "missing dependency" failures in environments where LightGBM import can fail due to pandas API differences.
 
 ### Why Is `data/raw_1m/` Filling Before `data/tf/`?
 

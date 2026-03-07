@@ -15,6 +15,7 @@ except Exception:  # pragma: no cover - optional dependency
     optuna = None
 
 from quant_system.utils.logger import log
+from quant_system.utils.pandas_compat import ensure_stringmethods_alias
 
 
 class ModelOptimizer:
@@ -41,6 +42,7 @@ class ModelOptimizer:
             )
 
         elif algo == "lightgbm":
+            ensure_stringmethods_alias()
             import lightgbm as lgb
             return lgb.LGBMClassifier(
                 n_estimators=int(params["n_estimators"]),

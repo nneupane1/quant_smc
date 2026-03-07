@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from python_bootstrap import ensure_runtime
 
-ensure_runtime(("pandas", "sklearn"))
+ensure_runtime(("pandas", "sklearn", "xgboost", "lightgbm", "optuna"))
 
 import warnings
 from pathlib import Path

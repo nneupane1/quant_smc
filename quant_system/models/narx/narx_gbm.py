@@ -21,9 +21,11 @@ from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from quant_system.utils.pandas_compat import ensure_stringmethods_alias
 
 # Optional LightGBM (preferred for quantile heads)
 try:
+    ensure_stringmethods_alias()
     import lightgbm as lgb
 
     _HAS_LGBM = True

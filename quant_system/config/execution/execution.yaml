@@ -1,5 +1,6 @@
 execution:
   starting_equity: 20000
+  manual_alert_only: false
   capital:
     base_ticket_usd: 20000
     compound_ticket: true

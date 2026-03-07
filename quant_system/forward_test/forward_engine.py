@@ -62,6 +62,7 @@ class ForwardEngine:
         merged_cfg = self.cfg.load()
         self.assets_cfg = self.cfg.load_yaml("assets.yaml")
         self.exec_cfg = merged_cfg.get("execution", {})
+        self.manual_alert_only = bool(self.exec_cfg.get("manual_alert_only", False))
 
         self.models = None
         self.dashboard = dashboard_adapter
@@ -214,6 +215,21 @@ class ForwardEngine:
             return
 
         if tier_result.get("tier") == "skip" or not tier_result.get("execute", False):
+            self._update_equity(dt, enriched_row)
+            return
+
+        if self.manual_alert_only:
+            self._emit_manual_alert(
+                asset=asset,
+                dt=dt,
+                row=enriched_row,
+                conf=float(conf),
+                evr=evr,
+                tier_result=tier_result,
+                gate=gate,
+                danger=danger,
+                cooling_gate=cooling_gate,
+            )
             self._update_equity(dt, enriched_row)
             return
 
@@ -498,6 +514,40 @@ class ForwardEngine:
 
         return False
 
+    def _emit_manual_alert(
+        self,
+        *,
+        asset: str,
+        dt,
+        row: Dict[str, Any],
+        conf: float,
+        evr: Dict[str, Any],
+        tier_result: Dict[str, Any],
+        gate: Dict[str, Any],
+        danger: Dict[str, Any],
+        cooling_gate: Dict[str, Any],
+    ) -> None:
+        alert_id = f"{asset}-{pd.Timestamp(dt).strftime('%Y%m%d%H%M')}-alert"
+        reason = self.reason.build(
+            asset,
+            row,
+            conf,
+            evr,
+            tier_result.get("tier"),
+            self.current_risk_mode,
+            self.current_hedge_ratio,
+        )
+        reason["decision_path"] = {
+            "gates": gate,
+            "danger": danger,
+            "cooling_gate": cooling_gate,
+            "tiering": tier_result,
+            "manual_alert_only": True,
+        }
+        reason["timestamp"] = dt
+        if self.dashboard:
+            self.dashboard.log_event("alert", alert_id, reason)
+
     def run_rows(self, asset: str, rows: pd.DataFrame):
         ordered = rows.sort_values("dt").reset_index(drop=True)
         for _, row in ordered.iterrows():
@@ -518,6 +568,7 @@ class ForwardEngine:
             "open_trades": self.open_positions,
             "closed_trades": self.closed_trades,
             "exposures": self.exposure.current_exposures(self.equity),
+            "manual_alert_only": self.manual_alert_only,
         }
 
     def _register_exposure(self, pos) -> None:

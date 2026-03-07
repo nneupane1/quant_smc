@@ -39,6 +39,7 @@ class LiveOrchestrator:
         self.cfg_loader = config_loader
         self.cfg = config_loader.load()
         self.exec_cfg = self.cfg.get("execution", {})
+        self.manual_alert_only = bool(self.exec_cfg.get("manual_alert_only", False))
         self.registry = registry
         self.dashboard = dashboard_adapter
 
@@ -207,6 +208,21 @@ class LiveOrchestrator:
             return
 
         if tier.get("tier") == "skip" or not tier.get("execute", False):
+            self._refresh_equity(dt, enriched)
+            return
+
+        if self.manual_alert_only:
+            self._emit_manual_alert(
+                asset=asset,
+                dt=dt,
+                row=enriched,
+                conf=float(conf),
+                evr_pack=evr_pack,
+                tier=tier,
+                gate=gate,
+                danger=danger,
+                cooling_gate=cooling_gate,
+            )
             self._refresh_equity(dt, enriched)
             return
 
@@ -527,6 +543,40 @@ class LiveOrchestrator:
             return True
         return False
 
+    def _emit_manual_alert(
+        self,
+        *,
+        asset: str,
+        dt,
+        row: pd.Series,
+        conf: float,
+        evr_pack: Dict[str, Any],
+        tier: Dict[str, Any],
+        gate: Dict[str, Any],
+        danger: Dict[str, Any],
+        cooling_gate: Dict[str, Any],
+    ) -> None:
+        alert_id = f"{asset}-{pd.Timestamp(dt).strftime('%Y%m%d%H%M')}-alert"
+        reason = self.reason.build(
+            asset,
+            row.to_dict(),
+            conf,
+            evr_pack,
+            tier.get("tier"),
+            self.current_risk_mode,
+            self.current_hedge_ratio,
+        )
+        reason["decision_path"] = {
+            "gates": gate,
+            "danger": danger,
+            "cooling_gate": cooling_gate,
+            "tiering": tier,
+            "manual_alert_only": True,
+        }
+        reason["timestamp"] = dt
+        if self.dashboard:
+            self.dashboard.log_event("alert", alert_id, reason)
+
     def _resolve_entry_leverage(
         self,
         *,
@@ -592,4 +642,5 @@ class LiveOrchestrator:
             "open_trades": self.executor.positions,
             "closed_trades": self.closed_trades,
             "exposures": self.exposure.current_exposures(self.executor.equity),
+            "manual_alert_only": self.manual_alert_only,
         }

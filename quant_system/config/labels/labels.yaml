@@ -96,6 +96,29 @@ labels:
     treat_choch_as_event: true
     treat_stop_as_event: true
 
+tuning:
+  proxy_models: ["lightgbm", "xgboost", "logreg"]
+  use_hpo: true
+  default_hpo_trials: 6
+  model_hpo_trials:
+    lightgbm: 8
+    xgboost: 8
+    logreg: 0
+  cv_splits: 4
+  embargo_bars: 2
+  score:
+    include_precision_at_top_k: true
+    top_k_pct: 0.10
+    weights:
+      ap: 0.55
+      auc: 0.15
+      balance: 0.10
+      topk_precision: 0.20
+  promotion:
+    require_consensus: true
+    min_models_for_consensus: 2
+    require_positive_ci_delta: true
+    consensus_eps: 0.000000001
 
   # =======================================================
   # Quantile Return Forecaster (for MPC / CVaR)

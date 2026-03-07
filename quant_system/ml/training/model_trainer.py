@@ -31,6 +31,7 @@ from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.exceptions import ConvergenceWarning, UndefinedMetricWarning
 from sklearn.base import BaseEstimator, TransformerMixin
+from quant_system.utils.pandas_compat import ensure_stringmethods_alias
 
 try:
     import optuna
@@ -38,6 +39,7 @@ except ImportError:  # pragma: no cover - runtime fallback
     optuna = None
 
 try:
+    ensure_stringmethods_alias()
     import lightgbm as lgb
 except Exception:  # pragma: no cover - runtime fallback
     lgb = None

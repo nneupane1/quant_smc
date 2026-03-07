@@ -21,6 +21,7 @@ krakenex==2.1.0
 lightgbm==4.3.0
 xgboost==2.0.3
 scikit-learn==1.4.1.post1
+threadpoolctl==3.5.0
 hmmlearn==0.3.2
 hdbscan==0.8.33
 statsmodels==0.14.1
@@ -37,6 +38,7 @@ matplotlib==3.8.3
 seaborn==0.13.2
 plotly==5.19.0
 altair==5.2.0
+rich==13.7.1
 
 # Streamlit dashboards
 streamlit==1.32.0
