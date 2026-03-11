@@ -305,3 +305,11 @@ tcn_training:
       hpo_space:
         lookback: [16, 64]
         max_epochs: [8, 20]
+
+# -------------------------------------------------------
+# Runtime inference source preference for specialist models
+# -------------------------------------------------------
+inference_preference:
+  # True = try <specialist>_tcn first, then fallback to tree specialist.
+  # False = try tree specialist first, then fallback to <specialist>_tcn.
+  prefer_tcn_specialists: true

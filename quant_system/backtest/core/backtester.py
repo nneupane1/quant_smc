@@ -66,6 +66,8 @@ class Backtester:
 
         self.assets_cfg = self.cfg.get("assets", {})
         self.exec_cfg = self.cfg.get("execution", {})
+        pref_cfg = self.cfg.get("inference_preference", {}) if isinstance(self.cfg.get("inference_preference", {}), dict) else {}
+        self.prefer_tcn_specialists = bool(pref_cfg.get("prefer_tcn_specialists", True))
 
         self.simulator = ExecutionSimulator(self.cfg)
         self.tiering = TieringEngine(self.cfg)
@@ -75,7 +77,10 @@ class Backtester:
 
         self.hazard_engine = HazardTrailingEngine(self.cfg)
         self.profit_ladder = ProfitLadderManager(self.cfg)
-        self.predictor = ModelPredictor(model_registry)
+        self.predictor = ModelPredictor(
+            model_registry,
+            prefer_tcn_specialists=self.prefer_tcn_specialists,
+        )
         self.mpc = MPCRiskManager(self.cfg)
         self.capital = CapitalAllocator(self.cfg)
         self.compound_cooling = CompoundCoolingPolicy(self.cfg)

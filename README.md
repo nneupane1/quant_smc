@@ -416,6 +416,17 @@ Current default TCN policy:
 - `hpo_adaptive_no_improve_trials: 6`
 - `hpo_adaptive_min_delta: 0.001`
 
+Runtime specialist inference source preference is configured in `quant_system/config/models/models.yaml`:
+
+- `inference_preference.prefer_tcn_specialists: true` (default)
+
+With this flag on, forward/live/backtest predictor resolution is:
+
+1. try `<specialist>_tcn`
+2. fallback to `<specialist>` tree model
+
+Downstream keys remain canonical (`prob_liq_flow`, `p_liq_flow`, etc.), so existing gating/confluence/EVR logic is preserved.
+
 ### Resume, Checkpointing, And Progress Files
 
 Each target writes to its own isolated artifact root:

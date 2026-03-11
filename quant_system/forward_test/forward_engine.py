@@ -62,6 +62,8 @@ class ForwardEngine:
         merged_cfg = self.cfg.load()
         self.assets_cfg = self.cfg.load_yaml("assets.yaml")
         self.exec_cfg = merged_cfg.get("execution", {})
+        pref_cfg = merged_cfg.get("inference_preference", {}) if isinstance(merged_cfg.get("inference_preference", {}), dict) else {}
+        self.prefer_tcn_specialists = bool(pref_cfg.get("prefer_tcn_specialists", True))
         self.manual_alert_only = bool(self.exec_cfg.get("manual_alert_only", False))
 
         self.models = None
@@ -78,7 +80,10 @@ class ForwardEngine:
         self.compound_cooling = CompoundCoolingPolicy(config_loader)
         self.position_sizer = PositionSizer()
         self.exposure = ExposureTracker(merged_cfg)
-        self.predictor = ModelPredictor(model_registry)
+        self.predictor = ModelPredictor(
+            model_registry,
+            prefer_tcn_specialists=self.prefer_tcn_specialists,
+        )
 
         self.executor = ForwardExecutor(config_loader)
 
@@ -112,6 +117,7 @@ class ForwardEngine:
         """
         Load latest generic model artifacts for forward execution.
         """
+        specialist_names = {"liq_flow", "bos_cont", "flow_1h", "momo", "eop", "edp"}
         names = [
             "liq_flow",
             "bos_cont",
@@ -126,12 +132,26 @@ class ForwardEngine:
         ]
         self.models = {}
         for name in names:
-            try:
-                self.models[name], _ = self.registry.load_latest(name)
-                LOG.info(f"[ForwardEngine] Loaded model {name}")
-            except Exception as e:
-                LOG.warning(f"[ForwardEngine] Missing model {name}: {e}")
-        self.predictor = ModelPredictor(self.registry)
+            candidates = [name]
+            if name in specialist_names:
+                candidates = [f"{name}_tcn", name] if self.prefer_tcn_specialists else [name, f"{name}_tcn"]
+            loaded = False
+            last_exc = None
+            for candidate in candidates:
+                try:
+                    self.models[name], _ = self.registry.load_latest(candidate)
+                    LOG.info(f"[ForwardEngine] Loaded model {name} via {candidate}")
+                    loaded = True
+                    break
+                except Exception as e:
+                    last_exc = e
+                    continue
+            if not loaded:
+                LOG.warning(f"[ForwardEngine] Missing model {name}: {last_exc}")
+        self.predictor = ModelPredictor(
+            self.registry,
+            prefer_tcn_specialists=self.prefer_tcn_specialists,
+        )
         if self.dashboard:
             self.dashboard.log_event("models_loaded", None, {"version": version})
 

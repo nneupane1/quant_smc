@@ -21,9 +21,55 @@ class ModelPredictor:
         - Hazard score
     """
 
-    def __init__(self, registry: ModelRegistry):
+    SPECIALIST_MODELS = {"liq_flow", "bos_cont", "flow_1h", "momo", "eop", "edp"}
+
+    def __init__(self, registry: ModelRegistry, *, prefer_tcn_specialists: bool = True):
         self.registry = registry
-        log("ModelPredictor initialized.")
+        self.prefer_tcn_specialists = bool(prefer_tcn_specialists)
+        self._resolved_specialist_names: Dict[str, str] = {}
+        log(f"ModelPredictor initialized. prefer_tcn_specialists={self.prefer_tcn_specialists}")
+
+    @staticmethod
+    def _is_asset_specific(name: str) -> bool:
+        return "_" in name and name.split("_", 1)[0].isupper()
+
+    def _candidate_specialist_names(self, model_name: str) -> List[str]:
+        name = str(model_name)
+        if name.endswith("_tcn"):
+            return [name]
+        if self._is_asset_specific(name):
+            return [name]
+        if name not in self.SPECIALIST_MODELS:
+            return [name]
+
+        # Keep canonical downstream naming (prob_liq_flow etc.) while allowing
+        # model source routing to prefer TCN artifacts by default.
+        if self.prefer_tcn_specialists:
+            return [f"{name}_tcn", name, f"BTCUSD_{name}_tcn", f"BTCUSD_{name}"]
+        return [name, f"{name}_tcn", f"BTCUSD_{name}", f"BTCUSD_{name}_tcn"]
+
+    def _load_specialist_bundle(self, model_name: str) -> Tuple[Any, Any, Dict[str, Any], str]:
+        requested = str(model_name)
+        cached = self._resolved_specialist_names.get(requested)
+        if cached is not None:
+            clf, cal, cfg = self.registry.load_latest_bundle(cached)
+            return clf, cal, cfg, cached
+
+        last_exc: Optional[Exception] = None
+        for candidate in self._candidate_specialist_names(requested):
+            try:
+                clf, cal, cfg = self.registry.load_latest_bundle(candidate)
+                self._resolved_specialist_names[requested] = candidate
+                if candidate != requested:
+                    log(f"ModelPredictor specialist route: {requested} -> {candidate}")
+                return clf, cal, cfg, candidate
+            except Exception as exc:
+                last_exc = exc
+                continue
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"No model candidate resolved for specialist '{requested}'.")
 
     @staticmethod
     def _row_frame(row_like, feature_cols: List[str]):
@@ -55,7 +101,7 @@ class ModelPredictor:
         return float(arr[0, min(1, arr.shape[1] - 1)])
 
     def _predict_specialist(self, model_name: str, row_like) -> float:
-        clf, cal, cfg = self.registry.load_latest_bundle(model_name)
+        clf, cal, cfg, _resolved_name = self._load_specialist_bundle(model_name)
         feature_cols = cfg.get("features", [])
         X_in = self._row_frame(row_like, feature_cols) if feature_cols else self._row_frame(row_like, [])
         if isinstance(clf, dict) and "model" in clf:

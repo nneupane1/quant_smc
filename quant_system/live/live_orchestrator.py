@@ -39,6 +39,8 @@ class LiveOrchestrator:
         self.cfg_loader = config_loader
         self.cfg = config_loader.load()
         self.exec_cfg = self.cfg.get("execution", {})
+        pref_cfg = self.cfg.get("inference_preference", {}) if isinstance(self.cfg.get("inference_preference", {}), dict) else {}
+        self.prefer_tcn_specialists = bool(pref_cfg.get("prefer_tcn_specialists", True))
         self.manual_alert_only = bool(self.exec_cfg.get("manual_alert_only", False))
         self.registry = registry
         self.dashboard = dashboard_adapter
@@ -56,7 +58,10 @@ class LiveOrchestrator:
         self.exposure = ExposureTracker(self.cfg)
         self.reason = ReasoningAttach()
 
-        self.predictor = ModelPredictor(registry)
+        self.predictor = ModelPredictor(
+            registry,
+            prefer_tcn_specialists=self.prefer_tcn_specialists,
+        )
         self.models_loaded = False
 
         self.feed = KrakenLiveClient(config_loader)
