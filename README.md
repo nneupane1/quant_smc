@@ -40,8 +40,8 @@ The central design promise of the project is research-to-execution parity. The s
 - [7. Feature Engineering](#7-feature-engineering)
 - [8. Labeling And Supervised Targets](#8-labeling-and-supervised-targets)
 - [9. Model Stack](#9-model-stack)
-- [9A. TCN Specialist Benchmark Stack](#9a-tcn-specialist-benchmark-stack)
-- [9B. TCN Design Rationale And Learning Mechanics](#9b-tcn-design-rationale-and-learning-mechanics)
+- [9A. Temporal Convolutional Network (TCN) Specialist Benchmark Stack](#9a-temporal-convolutional-network-tcn-specialist-benchmark-stack)
+- [9B. Temporal Convolutional Network (TCN) Design Rationale And Learning Mechanics](#9b-temporal-convolutional-network-tcn-design-rationale-and-learning-mechanics)
 - [10. Execution, Risk, And Capital Logic](#10-execution-risk-and-capital-logic)
 - [11. Runtime Modes](#11-runtime-modes)
 - [12. Dashboards, Terminal, And Telemetry](#12-dashboards-terminal-and-telemetry)
@@ -49,7 +49,7 @@ The central design promise of the project is research-to-execution parity. The s
 - [14. Environment And Secrets](#14-environment-and-secrets)
 - [15. Main Entry Points](#15-main-entry-points)
 - [16. BTCUSD Sequential Runbook](#16-btcusd-sequential-runbook)
-- [16A. BTCUSD TCN-Only Sequential Runbook](#16a-btcusd-tcn-only-sequential-runbook)
+- [16A. BTCUSD Temporal Convolutional Network (TCN)-Only Sequential Runbook](#16a-btcusd-temporal-convolutional-network-tcn-only-sequential-runbook)
 - [17. Label Horizon Governance](#17-label-horizon-governance)
 - [18. Expected Artifacts By Stage](#18-expected-artifacts-by-stage)
 - [19. Project Layout](#19-project-layout)
@@ -327,7 +327,7 @@ On top of the specialist layer, the repo trains:
 
 At inference time, the predictor is expected to return a structured output rather than a single scalar. The downstream execution layer expects specialist probabilities, meta probability, confluence probability, hazard shape, and quantile outputs in a schema-stable form. That is why model registry artifacts persist their feature lists and why the predictor reads those persisted feature contracts instead of guessing from column names at runtime.
 
-## 9A. TCN Specialist Benchmark Stack
+## 9A. Temporal Convolutional Network (TCN) Specialist Benchmark Stack
 
 The repository now includes a full deep-learning specialist benchmark path based on a Temporal Convolutional Network (TCN). It is not a side notebook path. It is integrated into the same training artifact, registry, and telemetry contract used by the tabular stack.
 
@@ -458,7 +458,7 @@ For each completed TCN specialist run:
 
 This means trained TCN outputs are inference-ready and version-tracked, not just trial logs.
 
-## 9B. TCN Design Rationale And Learning Mechanics
+## 9B. Temporal Convolutional Network (TCN) Design Rationale And Learning Mechanics
 
 This section explains, at model-mechanics level, how TCN is used in this repo and why it was selected as the deep-learning challenger.
 
@@ -690,7 +690,7 @@ The terminal is organized into six domains:
 5. `Risk Radar`
 6. `Research & Audit`
 
-The performance domain now includes richer analytics payloads from telemetry:
+The performance domain now includes TradeZella-style richer analytics payloads from telemetry:
 
 - attribution by model/session/regime/hour/hold bucket
 - expectancy metrics (avg win/loss, payoff, streaks, max drawdown)
@@ -851,8 +851,8 @@ These are the human-friendly top-level scripts that make the pipeline explicit:
 - `train_BTCUSD_confluence_model.py`
 - `train_BTCUSD_hazard_model.py`
 - `train_BTCUSD_quantile_model.py`
-- `train_BTCUSD_tcn_model.py` (deep-learning benchmark runner)
-- `train_BTCUSD_all_tcn_models.py` (sequential TCN specialist batch runner)
+- `train_BTCUSD_tcn_model.py` (Temporal Convolutional Network benchmark runner)
+- `train_BTCUSD_all_tcn_models.py` (sequential Temporal Convolutional Network specialist batch runner)
 - `train_BTCUSD_liq_flow_tcn_model.py`
 - `train_BTCUSD_bos_cont_tcn_model.py`
 - `train_BTCUSD_flow_1h_tcn_model.py`
@@ -861,27 +861,27 @@ These are the human-friendly top-level scripts that make the pipeline explicit:
 - `train_BTCUSD_edp_tcn_model.py`
 - `tune_BTCUSD_label_horizons.py`
 
-TCN launchers require PyTorch in the active interpreter:
+Temporal Convolutional Network (TCN) launchers require PyTorch in the active interpreter:
 
 ```bash
 pip install torch
 ```
 
-Batch TCN run across all specialist targets:
+Batch Temporal Convolutional Network (TCN) run across all specialist targets:
 
 ```bash
 python train_BTCUSD_all_tcn_models.py --trials 20 --cv-splits 4
 ```
 
-Single-target TCN default run (now defaults to `flow_1h`):
+Single-target Temporal Convolutional Network (TCN) default run (now defaults to `flow_1h`):
 
 ```bash
 python train_BTCUSD_tcn_model.py
 ```
 
-TCN HPO now supports SQLite-backed resume by default under each target artifact folder, so interrupted runs can continue without restarting from trial 1.
+Temporal Convolutional Network (TCN) HPO now supports SQLite-backed resume by default under each target artifact folder, so interrupted runs can continue without restarting from trial 1.
 
-During long TCN runs, live progress is persisted to:
+During long Temporal Convolutional Network (TCN) runs, live progress is persisted to:
 
 - `artifacts/train/BTCUSD/<target>_tcn/hpo_progress.json` (latest snapshot)
 - `artifacts/train/BTCUSD/<target>_tcn/hpo_progress.ndjson` (event history)
@@ -965,9 +965,9 @@ The cleanest manual workflow is:
 | 12 | `python train_BTCUSD_hazard_model.py` | Trains the hazard timing layer. | `artifacts/train/BTCUSD/hazard/` |
 | 13 | `python train_BTCUSD_quantile_model.py` | Trains the quantile forecaster. | `artifacts/train/BTCUSD/quantile/` |
 
-## 16A. BTCUSD TCN-Only Sequential Runbook
+## 16A. BTCUSD Temporal Convolutional Network (TCN)-Only Sequential Runbook
 
-If you are running TCN specialists only (no tree retraining in the same cycle), use this sequence:
+If you are running Temporal Convolutional Network (TCN) specialists only (no tree retraining in the same cycle), use this sequence:
 
 | Step | Run | Output Folder |
 |---|---|---|
@@ -979,7 +979,7 @@ If you are running TCN specialists only (no tree retraining in the same cycle), 
 | 6 | `python train_BTCUSD_edp_tcn_model.py` | `artifacts/train/BTCUSD/edp_tcn/` |
 | 7 | `python run_BTCUSD_stress_matrix.py` | `backtest_outputs/stress_matrix/` |
 
-If you want one command for all TCN specialists:
+If you want one command for all Temporal Convolutional Network (TCN) specialists:
 
 ```bash
 python train_BTCUSD_all_tcn_models.py --trials 20 --cv-splits 4
