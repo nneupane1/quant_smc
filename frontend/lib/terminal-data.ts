@@ -712,6 +712,8 @@ function buildTrades(rows: Record<string, string>[]): AuditTrade[] {
       tier: String(row.tier || "unranked"),
       pnl: num(row.pnl),
       r: num(row.r),
+      session: String(row.session || row.session_name || "unknown"),
+      regime: String(row.regime || row.regime_state || "unknown"),
       entryPrice: num(row.entry_price),
       exitPrice: num(row.exit_price),
       qty: num(row.qty || row.quantity),
@@ -719,6 +721,8 @@ function buildTrades(rows: Record<string, string>[]): AuditTrade[] {
       riskUsd: num(row.risk_usd || row.risk),
       fees: num(row.fees || row.fee_usd || row.total_fees),
       slippageBps: num(row.slippage_bps || row.slip_bps),
+      mae: num(row.mae || row.mae_r || row.max_adverse_excursion),
+      mfe: num(row.mfe || row.mfe_r || row.max_favorable_excursion),
       holdMinutes,
       status,
       model: String(row.model || row.model_name || row.tier || "multi"),
@@ -740,6 +744,14 @@ function buildEvents(rows: Record<string, string>[]): AuditEvent[] {
 function buildPerformance(trades: AuditTrade[]): TerminalSnapshot["performance"] {
   const closedTrades = trades.filter((trade) => trade.status !== "open");
   const scope = closedTrades.length ? closedTrades : trades;
+  const ordered = [...scope].sort((a, b) => {
+    const aTs = Date.parse(a.exitTs || a.entryTs || "");
+    const bTs = Date.parse(b.exitTs || b.entryTs || "");
+    if (!Number.isFinite(aTs) && !Number.isFinite(bTs)) return 0;
+    if (!Number.isFinite(aTs)) return 1;
+    if (!Number.isFinite(bTs)) return -1;
+    return aTs - bTs;
+  });
   const netPnl = scope.reduce((acc, trade) => acc + num(trade.pnl), 0);
   const grossProfit = scope.reduce((acc, trade) => acc + Math.max(0, num(trade.pnl)), 0);
   const grossLoss = scope.reduce((acc, trade) => acc + Math.min(0, num(trade.pnl)), 0);
@@ -755,6 +767,92 @@ function buildPerformance(trades: AuditTrade[]): TerminalSnapshot["performance"]
     : 0;
   const profitFactor = grossLoss < 0 ? grossProfit / Math.abs(grossLoss) : grossProfit > 0 ? 99 : 0;
   const maxLoss = scope.reduce((acc, trade) => Math.min(acc, num(trade.pnl)), 0);
+  const pnlValues = scope.map((trade) => num(trade.pnl));
+  const rValues = scope.map((trade) => num(trade.r));
+  const sortedPnl = [...pnlValues].sort((a, b) => a - b);
+  const sortedR = [...rValues].sort((a, b) => a - b);
+  const winsOnly = pnlValues.filter((value) => value > 0);
+  const lossesOnly = pnlValues.filter((value) => value < 0);
+  const avgWin = winsOnly.length ? winsOnly.reduce((a, b) => a + b, 0) / winsOnly.length : 0;
+  const avgLoss = lossesOnly.length ? lossesOnly.reduce((a, b) => a + b, 0) / lossesOnly.length : 0;
+  const payoffRatio = avgLoss < 0 ? avgWin / Math.abs(avgLoss) : 0;
+  const median = (arr: number[]) => {
+    if (!arr.length) return 0;
+    const mid = Math.floor(arr.length / 2);
+    return arr.length % 2 === 0 ? (arr[mid - 1] + arr[mid]) / 2 : arr[mid];
+  };
+
+  let maxConsecutiveWins = 0;
+  let maxConsecutiveLosses = 0;
+  let winRun = 0;
+  let lossRun = 0;
+  for (const trade of ordered) {
+    const pnl = num(trade.pnl);
+    if (pnl > 0) {
+      winRun += 1;
+      lossRun = 0;
+    } else if (pnl < 0) {
+      lossRun += 1;
+      winRun = 0;
+    } else {
+      winRun = 0;
+      lossRun = 0;
+    }
+    maxConsecutiveWins = Math.max(maxConsecutiveWins, winRun);
+    maxConsecutiveLosses = Math.max(maxConsecutiveLosses, lossRun);
+  }
+
+  let runningEquity = 20_000;
+  let peakEquity = runningEquity;
+  const equityTimeline = ordered.map((trade, idx) => {
+    runningEquity += num(trade.pnl);
+    peakEquity = Math.max(peakEquity, runningEquity);
+    const drawdown = runningEquity - peakEquity;
+    const ts = trade.exitTs || trade.entryTs || "";
+    const parsed = ts ? Date.parse(ts) : NaN;
+    const label = Number.isFinite(parsed)
+      ? new Date(parsed).toISOString().slice(0, 16).replace("T", " ")
+      : `trade-${idx + 1}`;
+    return {
+      label,
+      ts,
+      pnl: num(trade.pnl),
+      trades: idx + 1,
+      equity: runningEquity,
+      drawdown,
+    };
+  });
+
+  const timelineBucket = (period: "daily" | "monthly") => {
+    const map = new Map<string, { pnl: number; trades: number; wins: number; rSum: number; ts: string }>();
+    for (const trade of ordered) {
+      const tsRaw = trade.exitTs || trade.entryTs || "";
+      const parsed = tsRaw ? Date.parse(tsRaw) : NaN;
+      if (!Number.isFinite(parsed)) continue;
+      const dt = new Date(parsed);
+      const year = dt.getUTCFullYear();
+      const month = `${dt.getUTCMonth() + 1}`.padStart(2, "0");
+      const day = `${dt.getUTCDate()}`.padStart(2, "0");
+      const key = period === "daily" ? `${year}-${month}-${day}` : `${year}-${month}`;
+      const ts = period === "daily" ? key : `${key}-01`;
+      const prev = map.get(key) ?? { pnl: 0, trades: 0, wins: 0, rSum: 0, ts };
+      prev.pnl += num(trade.pnl);
+      prev.trades += 1;
+      if (num(trade.pnl) > 0) prev.wins += 1;
+      prev.rSum += num(trade.r);
+      map.set(key, prev);
+    }
+    return [...map.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([label, stat]) => ({
+        label,
+        ts: stat.ts,
+        pnl: stat.pnl,
+        trades: stat.trades,
+        winRate: stat.trades ? (stat.wins / stat.trades) * 100 : 0,
+        avgR: stat.trades ? stat.rSum / stat.trades : 0,
+      }));
+  };
 
   const periodDefs = [
     { label: "Daily", ms: 24 * 60 * 60 * 1000 },
@@ -801,6 +899,91 @@ function buildPerformance(trades: AuditTrade[]): TerminalSnapshot["performance"]
       .slice(0, 8);
   };
 
+  const weekdayOrder = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+  const byWeekday = (() => {
+    const map = new Map<string, { pnl: number; trades: number; wins: number }>();
+    for (const label of weekdayOrder) map.set(label, { pnl: 0, trades: 0, wins: 0 });
+    for (const trade of ordered) {
+      const parsed = Date.parse(trade.exitTs || trade.entryTs || "");
+      if (!Number.isFinite(parsed)) continue;
+      const idx = (new Date(parsed).getUTCDay() + 6) % 7;
+      const key = weekdayOrder[idx];
+      const slot = map.get(key)!;
+      slot.pnl += num(trade.pnl);
+      slot.trades += 1;
+      if (num(trade.pnl) > 0) slot.wins += 1;
+    }
+    return weekdayOrder.map((label) => {
+      const slot = map.get(label)!;
+      return {
+        label,
+        pnl: slot.pnl,
+        trades: slot.trades,
+        winRate: slot.trades ? (slot.wins / slot.trades) * 100 : 0,
+      };
+    });
+  })();
+
+  const byHour = (() => {
+    const map = new Map<string, { pnl: number; trades: number; wins: number }>();
+    for (let hour = 0; hour < 24; hour += 1) {
+      map.set(`${String(hour).padStart(2, "0")}:00`, { pnl: 0, trades: 0, wins: 0 });
+    }
+    for (const trade of ordered) {
+      const parsed = Date.parse(trade.exitTs || trade.entryTs || "");
+      if (!Number.isFinite(parsed)) continue;
+      const hour = new Date(parsed).getUTCHours();
+      const key = `${String(hour).padStart(2, "0")}:00`;
+      const slot = map.get(key)!;
+      slot.pnl += num(trade.pnl);
+      slot.trades += 1;
+      if (num(trade.pnl) > 0) slot.wins += 1;
+    }
+    return [...map.entries()].map(([label, stat]) => ({
+      label,
+      pnl: stat.pnl,
+      trades: stat.trades,
+      winRate: stat.trades ? (stat.wins / stat.trades) * 100 : 0,
+    }));
+  })();
+
+  const byHold = (() => {
+    const defs = [
+      { label: "<15m", min: 0, max: 15 },
+      { label: "15m-1h", min: 15, max: 60 },
+      { label: "1h-4h", min: 60, max: 240 },
+      { label: "4h-12h", min: 240, max: 720 },
+      { label: ">12h", min: 720, max: Number.POSITIVE_INFINITY },
+    ];
+    const map = new Map<string, { pnl: number; trades: number; wins: number }>();
+    for (const def of defs) map.set(def.label, { pnl: 0, trades: 0, wins: 0 });
+    for (const trade of ordered) {
+      const hold = Math.max(0, num(trade.holdMinutes));
+      const bucketDef = defs.find((def) => hold >= def.min && hold < def.max);
+      if (!bucketDef) continue;
+      const slot = map.get(bucketDef.label)!;
+      slot.pnl += num(trade.pnl);
+      slot.trades += 1;
+      if (num(trade.pnl) > 0) slot.wins += 1;
+    }
+    return defs.map((def) => {
+      const stat = map.get(def.label)!;
+      return {
+        label: def.label,
+        pnl: stat.pnl,
+        trades: stat.trades,
+        winRate: stat.trades ? (stat.wins / stat.trades) * 100 : 0,
+      };
+    });
+  })();
+
+  const ranked = [...scope].sort((a, b) => num(b.pnl) - num(a.pnl));
+  const topWinners = ranked.slice(0, 10);
+  const topLosers = [...ranked].reverse().slice(0, 10);
+  const maxDrawdown = Math.abs(
+    equityTimeline.reduce((acc, point) => Math.min(acc, num(point.drawdown)), 0)
+  );
+
   return {
     summary: "Performance intelligence is synchronized with the same trade ledger used by runtime and audit views.",
     kpis: [
@@ -815,7 +998,31 @@ function buildPerformance(trades: AuditTrade[]): TerminalSnapshot["performance"]
     periods,
     byAsset: bucket((trade) => trade.asset),
     byTier: bucket((trade) => trade.tier),
-    tradeTable: trades.slice(0, 40),
+    byModel: bucket((trade) => trade.model || "unknown"),
+    bySession: bucket((trade) => trade.session || "unknown"),
+    byRegime: bucket((trade) => trade.regime || "unknown"),
+    byWeekday,
+    byHour,
+    byHold,
+    topWinners,
+    topLosers,
+    expectancy: {
+      expectancyR: avgR,
+      avgWin,
+      avgLoss,
+      payoffRatio,
+      medianPnl: median(sortedPnl),
+      medianR: median(sortedR),
+      maxConsecutiveWins,
+      maxConsecutiveLosses,
+      maxDrawdown,
+    },
+    timeline: {
+      equity: equityTimeline.slice(-500),
+      daily: timelineBucket("daily").slice(-180),
+      monthly: timelineBucket("monthly").slice(-48),
+    },
+    tradeTable: trades.slice(0, 260),
   };
 }
 

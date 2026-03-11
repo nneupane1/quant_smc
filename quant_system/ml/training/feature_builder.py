@@ -20,6 +20,7 @@ import argparse
 import time
 from pathlib import Path
 import json
+from zoneinfo import ZoneInfo
 
 from quant_system.config.config_loader import ConfigLoader
 from quant_system.features.smc.swings import SwingHighLowDetector
@@ -40,7 +41,7 @@ from quant_system.features.absorption_features import (
 )
 
 from quant_system.utils.time_utils import SessionClassifier as SessionTimeFeature  # placeholder
-from quant_system.utils.logger import get_logger, runtime_logged
+from quant_system.utils.logger import get_logger, runtime_logged, console_kv, console_stage, fmt_seconds
 
 LOG = get_logger("feature_builder")
 
@@ -90,6 +91,13 @@ class FeatureBuilder:
         self.lag_cfg = self.features_cfg.get("lagging", {})
 
         LOG.info("[FeatureBuilder] Initialized successfully")
+
+    def _run_block(self, title: str, fn, *args, **kwargs):
+        t0 = time.perf_counter()
+        console_stage(title, "running", status="info")
+        out = fn(*args, **kwargs)
+        console_stage(title, f"done elapsed={fmt_seconds(time.perf_counter() - t0)}", status="ok")
+        return out
 
     @staticmethod
     def _normalize_df(df: pd.DataFrame, path_hint: str = "") -> pd.DataFrame:
@@ -247,6 +255,18 @@ class FeatureBuilder:
         df1h = dfs["1h"]
         df6h = dfs["6h"]
         df12 = dfs["12h"]
+        console_kv(
+            "Feature Build Room",
+            {
+                "asset": asset,
+                "rows_15m": f"{len(df15):,}",
+                "rows_1h": f"{len(df1h):,}",
+                "rows_6h": f"{len(df6h):,}",
+                "rows_12h": f"{len(df12):,}",
+                "output": out_path or "-",
+            },
+            style="cyan",
+        )
 
         # Stage 1: 15m SMC + helper flags
         if ckpt.get("last_stage", 0) >= 1 and paths.get("stage1") and paths["stage1"].exists():
@@ -256,11 +276,11 @@ class FeatureBuilder:
             t0 = time.perf_counter()
             LOG.info("[FeatureBuilder] Stage 1: 15m SMC (swings/BOS/FVG/sweep/zones)")
             df15 = self._normalize_df(df15, "15m")
-            df15 = self.swings_15.apply(df15)
-            df15 = self.bos.apply(df15)
-            df15 = self.fvg.apply(df15)
-            df15 = self.sweep.apply(df15)
-            df15 = self.zones.apply(df15)
+            df15 = self._run_block("Stage1/5 swings_15m", self.swings_15.apply, df15)
+            df15 = self._run_block("Stage1/5 bos_choch_15m", self.bos.apply, df15)
+            df15 = self._run_block("Stage1/5 fvg_15m", self.fvg.apply, df15)
+            df15 = self._run_block("Stage1/5 sweep_15m", self.sweep.apply, df15)
+            df15 = self._run_block("Stage1/5 zones_15m", self.zones.apply, df15)
             df15 = self._add_helper_flags(df15)
             if paths.get("stage1"):
                 df15.to_csv(paths["stage1"], index=False)
@@ -293,9 +313,9 @@ class FeatureBuilder:
             t0 = time.perf_counter()
             LOG.info("[FeatureBuilder] Stage 2: HTF SMC + joins")
             htf_full = {
-                "1h": self._apply_smc_full(df1h, "1h"),
-                "6h": self._apply_smc_full(df6h, "6h"),
-                "12h": self._apply_smc_full(df12, "12h"),
+                "1h": self._run_block("Stage2 HTF 1h SMC", self._apply_smc_full, df1h, "1h"),
+                "6h": self._run_block("Stage2 HTF 6h SMC", self._apply_smc_full, df6h, "6h"),
+                "12h": self._run_block("Stage2 HTF 12h SMC", self._apply_smc_full, df12, "12h"),
             }
             self.audit_table = self._build_audit_table(htf_full, asset)
             df1h_s = self._apply_smc_pruned(htf_full["1h"])
@@ -331,11 +351,11 @@ class FeatureBuilder:
         if ckpt.get("last_stage", 0) < 3:
             t0 = time.perf_counter()
             LOG.info("[FeatureBuilder] Stage 3: EMA/Liq/Vol/Absorption/Regime")
-            df15 = self.ema_block.apply(df15, df1h, df6h, df12)
-            df15 = self.liq_block.apply(df15)
-            df15 = self.vol_block.apply(df15)
-            df15 = self.absorb_block.apply(df15)
-            df15 = self.reg_block.apply(df15, df6h, df12, asset)
+            df15 = self._run_block("Stage3/5 ema_block", self.ema_block.apply, df15, df1h, df6h, df12)
+            df15 = self._run_block("Stage3/5 liquidity_block", self.liq_block.apply, df15)
+            df15 = self._run_block("Stage3/5 volatility_block", self.vol_block.apply, df15)
+            df15 = self._run_block("Stage3/5 absorption_block", self.absorb_block.apply, df15)
+            df15 = self._run_block("Stage3/5 regime_block", self.reg_block.apply, df15, df6h, df12, asset)
             if paths.get("stage3"):
                 df15.to_csv(paths["stage3"], index=False)
                 self._save_checkpoint(
@@ -353,6 +373,7 @@ class FeatureBuilder:
         t0 = time.perf_counter()
         df15 = self.session_block.apply(df15)
         df15 = self._ensure_session_weight(df15)
+        df15 = self._add_session_context_features(df15)
         df15 = self._lag_event_flags(df15)
         df15 = self._add_lagged_features(df15)
         core_subset = [c for c in ["dt", "timestamp", "open", "high", "low", "close"] if c in df15.columns]
@@ -461,6 +482,7 @@ class FeatureBuilder:
         LOG.info("[FeatureBuilder] Attaching session features")
         df15 = self.session_block.apply(df15)
         df15 = self._ensure_session_weight(df15)
+        df15 = self._add_session_context_features(df15)
 
         # Leak guard on local events
         LOG.info("[FeatureBuilder] Shifting event flags by +1 bar to avoid look-ahead")
@@ -702,6 +724,167 @@ class FeatureBuilder:
             if set(out[c].dropna().unique()).issubset({0, 1}):
                 shifted = shifted.fillna(0).astype(int)
             out[f"{c}_lag1"] = shifted
+        return out
+
+    def _add_session_context_features(self, df15: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add richer session-awareness features:
+          - session-relative volume/range/wick percentiles
+          - distance to Asia/London highs/lows (ATR-normalized)
+          - overlap breakout marker
+          - time since last sweep + first-retest-after-session-sweep
+        """
+        if df15 is None or df15.empty or "dt" not in df15.columns:
+            return df15
+
+        out = df15.copy()
+        dt_utc = pd.to_datetime(out["dt"], utc=True, errors="coerce")
+        if dt_utc.isna().all():
+            return out
+
+        session_cfg = self.features_cfg.get("session", {}) if isinstance(self.features_cfg, dict) else {}
+        tz_name = str(session_cfg.get("timezone", "Europe/Berlin"))
+        tz = ZoneInfo(tz_name)
+        dt_local = dt_utc.dt.tz_convert(tz)
+        out["_session_date"] = dt_local.dt.date
+        tod_min = dt_local.dt.hour * 60 + dt_local.dt.minute
+
+        def _hhmm_to_min(text: str, fallback: str) -> int:
+            value = str(text or fallback)
+            hh, mm = value.split(":", 1)
+            return int(hh) * 60 + int(mm)
+
+        london_start = _hhmm_to_min(session_cfg.get("london", {}).get("start"), "08:00")
+        london_end = _hhmm_to_min(session_cfg.get("london", {}).get("end"), "17:00")
+        ny_start = _hhmm_to_min(session_cfg.get("ny", {}).get("start"), "14:30")
+        ny_end = _hhmm_to_min(session_cfg.get("ny", {}).get("end"), "21:00")
+        asia_start = _hhmm_to_min(session_cfg.get("asia", {}).get("start"), "00:00")
+        asia_end = _hhmm_to_min(session_cfg.get("asia", {}).get("end"), "08:00")
+        overlap_start = max(london_start, ny_start)
+        overlap_end = min(london_end, ny_end)
+
+        pre_expansion_m = int(session_cfg.get("pre_expansion_minutes", 60))
+        london_open_expansion_m = int(session_cfg.get("london_open_expansion_minutes", 120))
+        ny_open_expansion_m = int(session_cfg.get("ny_open_expansion_minutes", 90))
+        rolling_window = int(session_cfg.get("relative_window_bars", 96))
+        breakout_lookback = int(session_cfg.get("breakout_lookback_bars", 16))
+
+        in_london = (tod_min >= london_start) & (tod_min < london_end)
+        in_ny = (tod_min >= ny_start) & (tod_min < ny_end)
+        in_overlap = in_london & in_ny
+        in_pre = ((tod_min >= (london_start - pre_expansion_m)) & (tod_min < london_start)) | (
+            (tod_min >= (ny_start - pre_expansion_m)) & (tod_min < ny_start)
+        )
+        in_expansion = ((tod_min - london_start).between(0, london_open_expansion_m)) & in_london
+        in_expansion = in_expansion | (((tod_min - ny_start).between(0, ny_open_expansion_m)) & in_ny)
+
+        if "session_bucket" not in out.columns:
+            bucket = pd.Series("dead_zone", index=out.index, dtype="object")
+            bucket = bucket.mask(in_pre, "pre_expansion")
+            bucket = bucket.mask(in_expansion, "expansion")
+            bucket = bucket.mask(in_overlap, "overlap")
+            out["session_bucket"] = bucket
+        if "session_bucket_id" not in out.columns:
+            bucket_map = {"dead_zone": 0, "pre_expansion": 1, "expansion": 2, "overlap": 3}
+            out["session_bucket_id"] = out["session_bucket"].map(bucket_map).fillna(0).astype(int)
+
+        if "minutes_since_london_open" not in out.columns:
+            out["minutes_since_london_open"] = np.where(in_london, (tod_min - london_start).astype(int), -1)
+        if "minutes_since_ny_open" not in out.columns:
+            out["minutes_since_ny_open"] = np.where(in_ny, (tod_min - ny_start).astype(int), -1)
+        if "minutes_to_overlap_close" not in out.columns:
+            out["minutes_to_overlap_close"] = np.where(in_overlap, (overlap_end - tod_min).astype(int), -1)
+
+        if "session_quality_multiplier" not in out.columns:
+            bucket_quality = session_cfg.get(
+                "bucket_quality",
+                {"dead_zone": 0.75, "pre_expansion": 0.95, "expansion": 1.05, "overlap": 1.15},
+            )
+            out["session_quality_multiplier"] = (
+                out["session_bucket"].map(bucket_quality).fillna(1.0).astype(float)
+            )
+
+        close = pd.to_numeric(out.get("close"), errors="coerce")
+        high = pd.to_numeric(out.get("high"), errors="coerce")
+        low = pd.to_numeric(out.get("low"), errors="coerce")
+        open_ = pd.to_numeric(out.get("open"), errors="coerce")
+        volume = pd.to_numeric(out.get("volume"), errors="coerce")
+        atr = pd.to_numeric(out.get("atr"), errors="coerce")
+        atr_fallback = (high - low).rolling(14, min_periods=2).mean()
+        atr_norm = atr.fillna(atr_fallback).replace(0, np.nan)
+
+        range_pct = ((high - low) / close.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        upper_wick = (high - np.maximum(open_, close)).clip(lower=0.0)
+        lower_wick = (np.minimum(open_, close) - low).clip(lower=0.0)
+        wick_asym = ((upper_wick - lower_wick) / (high - low).replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+        wick_asym = wick_asym.fillna(0.0)
+        out["wick_asymmetry_15m"] = wick_asym
+
+        bucket = out["session_bucket"].astype(str).fillna("dead_zone")
+        min_periods = max(12, rolling_window // 4)
+
+        def _bucket_percentile(series: pd.Series, labels: pd.Series) -> pd.Series:
+            result = pd.Series(np.nan, index=series.index, dtype=float)
+            for lbl in sorted(labels.unique()):
+                mask = labels == lbl
+                sparse = series.where(mask)
+                mu = sparse.rolling(rolling_window, min_periods=min_periods).mean()
+                sigma = sparse.rolling(rolling_window, min_periods=min_periods).std().replace(0.0, np.nan)
+                z = ((series - mu) / sigma).where(mask)
+                pct = 1.0 / (1.0 + np.exp(-1.702 * z))
+                result = result.where(~mask, pct)
+            return result.fillna(0.5)
+
+        out["session_volume_pct"] = _bucket_percentile(volume.fillna(0.0), bucket)
+        out["session_range_pct"] = _bucket_percentile(range_pct.fillna(0.0), bucket)
+        out["session_wick_asym_pct"] = _bucket_percentile(wick_asym.fillna(0.0), bucket)
+        out["session_atr_pct"] = _bucket_percentile(atr_norm.fillna(0.0), bucket)
+
+        asia_mask = (tod_min >= asia_start) & (tod_min < asia_end)
+        asia_stats = out.loc[asia_mask, ["_session_date", "high", "low"]].groupby("_session_date").agg(
+            asia_high=("high", "max"),
+            asia_low=("low", "min"),
+        )
+        out = out.join(asia_stats, on="_session_date")
+        out["dist_to_asia_high_atr"] = ((close - pd.to_numeric(out.get("asia_high"), errors="coerce")) / atr_norm).replace(
+            [np.inf, -np.inf], np.nan
+        )
+        out["dist_to_asia_low_atr"] = ((close - pd.to_numeric(out.get("asia_low"), errors="coerce")) / atr_norm).replace(
+            [np.inf, -np.inf], np.nan
+        )
+
+        london_mask = (tod_min >= london_start) & (tod_min < london_end)
+        london_high = high.where(london_mask).groupby(out["_session_date"]).cummax()
+        london_low = low.where(london_mask).groupby(out["_session_date"]).cummin()
+        london_high = london_high.groupby(out["_session_date"]).ffill()
+        london_low = london_low.groupby(out["_session_date"]).ffill()
+        out["dist_to_london_high_atr"] = ((close - london_high) / atr_norm).replace([np.inf, -np.inf], np.nan)
+        out["dist_to_london_low_atr"] = ((close - london_low) / atr_norm).replace([np.inf, -np.inf], np.nan)
+
+        overlap_start_flag = in_overlap & (~in_overlap.shift(1, fill_value=False))
+        prior_hi = high.rolling(breakout_lookback, min_periods=4).max().shift(1)
+        prior_lo = low.rolling(breakout_lookback, min_periods=4).min().shift(1)
+        overlap_breakout = overlap_start_flag & ((close >= prior_hi) | (close <= prior_lo))
+        out["breakout_after_overlap_start_flag"] = overlap_breakout.fillna(False).astype(int)
+
+        sweep_candidates = ["sweep_flag", "sweep_high", "sweep_low"]
+        sweep_series = pd.Series(False, index=out.index)
+        for col in sweep_candidates:
+            if col in out.columns:
+                sweep_series = sweep_series | out[col].fillna(0).astype(float).ne(0.0)
+        idx = pd.Series(np.arange(len(out)), index=out.index, dtype=float)
+        last_sweep_idx = idx.where(sweep_series).ffill()
+        out["bars_since_last_liquidity_sweep"] = (idx - last_sweep_idx).fillna(999.0).astype(int)
+
+        session_sweep = sweep_series & (in_london | in_ny)
+        last_session_sweep_idx = idx.where(session_sweep).ffill()
+        bars_since_session_sweep = (idx - last_session_sweep_idx).fillna(999.0)
+        fresh_retest = out.get("fresh_retest_15m", pd.Series(0, index=out.index)).fillna(0).astype(float).gt(0.0)
+        out["first_retest_after_session_sweep"] = (
+            fresh_retest & bars_since_session_sweep.between(1, 4)
+        ).astype(int)
+
+        out.drop(columns=["_session_date"], inplace=True, errors="ignore")
         return out
 
     # ----------------------------------------------------------------------

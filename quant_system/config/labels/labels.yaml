@@ -68,6 +68,7 @@ labels:
   eop:
     horizon_bars: 96
     require_Aplus: true
+    Aplus_min_conf: 0.80
     Aplus_min_evr: 1.50
     Aplus_min_medianR: 5.0
     hazard_cap: 0.35
@@ -98,6 +99,7 @@ labels:
 
 tuning:
   proxy_models: ["lightgbm", "xgboost", "logreg"]
+  heartbeat_seconds: 60
   use_hpo: true
   default_hpo_trials: 6
   model_hpo_trials:
@@ -119,6 +121,20 @@ tuning:
     min_models_for_consensus: 2
     require_positive_ci_delta: true
     consensus_eps: 0.000000001
+
+  adaptive_refine:
+    enabled: true
+    tasks: ["liq_flow", "bos_cont", "eop", "edp", "hazard"]
+    top_k: 2
+    max_extra_candidates_per_task: 4
+    include_midpoint: true
+    neighbor_multipliers: [-2, -1, 1, 2]
+    step_by_task:
+      liq_flow: 2
+      bos_cont: 4
+      hazard: 4
+      eop: 12
+      edp: 12
 
   # =======================================================
   # Quantile Return Forecaster (for MPC / CVaR)

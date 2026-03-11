@@ -296,7 +296,7 @@ def _trade_rows(raw_snapshot: Dict[str, Any], fallback_bundle: Dict[str, Any]) -
     if closed.empty:
         return []
     out = []
-    for _, row in closed.tail(120).iloc[::-1].iterrows():
+    for _, row in closed.tail(500).iloc[::-1].iterrows():
         entry_ts = str(row.get("entry_ts") or row.get("entry_time") or "")
         exit_ts = str(row.get("exit_ts") or row.get("exit_time") or "")
         entry = pd.to_datetime(entry_ts, utc=True, errors="coerce")
@@ -326,6 +326,10 @@ def _trade_rows(raw_snapshot: Dict[str, Any], fallback_bundle: Dict[str, Any]) -
                 "holdMinutes": hold_minutes,
                 "status": status,
                 "model": str(row.get("model") or row.get("model_name") or row.get("tier") or "multi"),
+                "session": str(row.get("session") or row.get("session_name") or "unknown"),
+                "regime": str(row.get("regime") or row.get("regime_state") or "unknown"),
+                "mae": _num(row.get("mae") or row.get("mae_r") or row.get("max_adverse_excursion"), 0.0),
+                "mfe": _num(row.get("mfe") or row.get("mfe_r") or row.get("max_favorable_excursion"), 0.0),
                 "reason": str(row.get("reason", "closed")),
                 "entryTs": entry_ts,
                 "exitTs": exit_ts,
@@ -338,6 +342,19 @@ def _build_performance(trades: list[Dict[str, Any]]) -> Dict[str, Any]:
     closed = [t for t in trades if str(t.get("status", "closed")) != "open"]
     scope = closed if closed else trades
 
+    def _trade_ts(trade: Dict[str, Any]) -> pd.Timestamp:
+        parsed = pd.to_datetime(trade.get("exitTs") or trade.get("entryTs") or "", utc=True, errors="coerce")
+        return parsed if pd.notna(parsed) else pd.NaT
+
+    sentinel = pd.Timestamp("2262-01-01T00:00:00+00:00")
+    ordered = sorted(
+        scope,
+        key=lambda trade: (
+            1 if pd.isna(_trade_ts(trade)) else 0,
+            _trade_ts(trade) if pd.notna(_trade_ts(trade)) else sentinel,
+        ),
+    )
+
     net_pnl = sum(_num(t.get("pnl"), 0.0) for t in scope)
     gross_profit = sum(max(0.0, _num(t.get("pnl"), 0.0)) for t in scope)
     gross_loss = sum(min(0.0, _num(t.get("pnl"), 0.0)) for t in scope)
@@ -349,6 +366,54 @@ def _build_performance(trades: list[Dict[str, Any]]) -> Dict[str, Any]:
     avg_slippage = (sum(max(0.0, _num(t.get("slippageBps"), 0.0)) for t in scope) / len(scope)) if scope else 0.0
     profit_factor = gross_profit / abs(gross_loss) if gross_loss < 0 else (99.0 if gross_profit > 0 else 0.0)
     max_loss = min((_num(t.get("pnl"), 0.0) for t in scope), default=0.0)
+    median_pnl = float(pd.Series([_num(t.get("pnl"), 0.0) for t in scope]).median()) if scope else 0.0
+    median_r = float(pd.Series([_num(t.get("r"), 0.0) for t in scope]).median()) if scope else 0.0
+    wins_only = [_num(t.get("pnl"), 0.0) for t in scope if _num(t.get("pnl"), 0.0) > 0]
+    losses_only = [_num(t.get("pnl"), 0.0) for t in scope if _num(t.get("pnl"), 0.0) < 0]
+    avg_win = sum(wins_only) / len(wins_only) if wins_only else 0.0
+    avg_loss = sum(losses_only) / len(losses_only) if losses_only else 0.0
+    payoff_ratio = (avg_win / abs(avg_loss)) if avg_loss < 0 else 0.0
+
+    max_consecutive_wins = 0
+    max_consecutive_losses = 0
+    win_run = 0
+    loss_run = 0
+    for trade in ordered:
+        pnl = _num(trade.get("pnl"), 0.0)
+        if pnl > 0:
+            win_run += 1
+            loss_run = 0
+        elif pnl < 0:
+            loss_run += 1
+            win_run = 0
+        else:
+            win_run = 0
+            loss_run = 0
+        max_consecutive_wins = max(max_consecutive_wins, win_run)
+        max_consecutive_losses = max(max_consecutive_losses, loss_run)
+
+    starting_equity = 20_000.0
+    running_equity = starting_equity
+    peak_equity = starting_equity
+    equity_curve: list[Dict[str, Any]] = []
+    for idx, trade in enumerate(ordered):
+        pnl = _num(trade.get("pnl"), 0.0)
+        running_equity += pnl
+        peak_equity = max(peak_equity, running_equity)
+        drawdown = running_equity - peak_equity
+        ts = _trade_ts(trade)
+        label = ts.strftime("%Y-%m-%d %H:%M") if pd.notna(ts) else f"trade-{idx + 1}"
+        equity_curve.append(
+            {
+                "label": label,
+                "ts": ts.isoformat() if pd.notna(ts) else "",
+                "pnl": pnl,
+                "equity": running_equity,
+                "drawdown": drawdown,
+                "trades": idx + 1,
+            }
+        )
+    max_drawdown = abs(min((float(row.get("drawdown", 0.0)) for row in equity_curve), default=0.0))
 
     now = pd.Timestamp.utcnow()
     period_defs = [
@@ -360,9 +425,8 @@ def _build_performance(trades: list[Dict[str, Any]]) -> Dict[str, Any]:
     for label, delta in period_defs:
         floor = now - delta
         filtered = []
-        for trade in scope:
-            ts = str(trade.get("exitTs") or trade.get("entryTs") or "")
-            parsed = pd.to_datetime(ts, utc=True, errors="coerce")
+        for trade in ordered:
+            parsed = _trade_ts(trade)
             if pd.notna(parsed) and parsed >= floor:
                 filtered.append(trade)
         pnl = sum(_num(t.get("pnl"), 0.0) for t in filtered)
@@ -402,6 +466,114 @@ def _build_performance(trades: list[Dict[str, Any]]) -> Dict[str, Any]:
         rows.sort(key=lambda x: _num(x.get("pnl"), 0.0), reverse=True)
         return rows[:8]
 
+    weekday_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    weekday_stats: Dict[str, Dict[str, float]] = {
+        label: {"pnl": 0.0, "trades": 0.0, "wins": 0.0} for label in weekday_labels
+    }
+    hour_stats: Dict[str, Dict[str, float]] = {
+        f"{hour:02d}:00": {"pnl": 0.0, "trades": 0.0, "wins": 0.0} for hour in range(24)
+    }
+    hold_bucket_defs = [
+        ("<15m", 0.0, 15.0),
+        ("15m-1h", 15.0, 60.0),
+        ("1h-4h", 60.0, 240.0),
+        ("4h-12h", 240.0, 720.0),
+        (">12h", 720.0, float("inf")),
+    ]
+    hold_stats: Dict[str, Dict[str, float]] = {label: {"pnl": 0.0, "trades": 0.0, "wins": 0.0} for label, _, _ in hold_bucket_defs}
+    daily_stats: Dict[str, Dict[str, float]] = {}
+    monthly_stats: Dict[str, Dict[str, float]] = {}
+
+    for trade in ordered:
+        pnl = _num(trade.get("pnl"), 0.0)
+        is_win = 1.0 if pnl > 0 else 0.0
+        hold_minutes = max(0.0, _num(trade.get("holdMinutes"), 0.0))
+        ts = _trade_ts(trade)
+        if pd.notna(ts):
+            weekday_key = weekday_labels[int(ts.weekday())]
+            weekday_slot = weekday_stats[weekday_key]
+            weekday_slot["pnl"] += pnl
+            weekday_slot["trades"] += 1.0
+            weekday_slot["wins"] += is_win
+
+            hour_key = f"{int(ts.hour):02d}:00"
+            hour_slot = hour_stats[hour_key]
+            hour_slot["pnl"] += pnl
+            hour_slot["trades"] += 1.0
+            hour_slot["wins"] += is_win
+
+            daily_key = ts.strftime("%Y-%m-%d")
+            daily_slot = daily_stats.setdefault(daily_key, {"pnl": 0.0, "trades": 0.0, "wins": 0.0, "r_sum": 0.0})
+            daily_slot["pnl"] += pnl
+            daily_slot["trades"] += 1.0
+            daily_slot["wins"] += is_win
+            daily_slot["r_sum"] += _num(trade.get("r"), 0.0)
+
+            monthly_key = ts.strftime("%Y-%m")
+            monthly_slot = monthly_stats.setdefault(monthly_key, {"pnl": 0.0, "trades": 0.0, "wins": 0.0, "r_sum": 0.0})
+            monthly_slot["pnl"] += pnl
+            monthly_slot["trades"] += 1.0
+            monthly_slot["wins"] += is_win
+            monthly_slot["r_sum"] += _num(trade.get("r"), 0.0)
+
+        for label, low, high in hold_bucket_defs:
+            if low <= hold_minutes < high:
+                hold_slot = hold_stats[label]
+                hold_slot["pnl"] += pnl
+                hold_slot["trades"] += 1.0
+                hold_slot["wins"] += is_win
+                break
+
+    def _stats_to_rows(stats: Dict[str, Dict[str, float]], *, order: list[str] | None = None) -> list[Dict[str, Any]]:
+        keys = order if order is not None else sorted(stats.keys())
+        rows: list[Dict[str, Any]] = []
+        for label in keys:
+            slot = stats.get(label, {"pnl": 0.0, "trades": 0.0, "wins": 0.0})
+            trades_n = int(slot["trades"])
+            rows.append(
+                {
+                    "label": label,
+                    "pnl": float(slot["pnl"]),
+                    "trades": trades_n,
+                    "winRate": (float(slot["wins"]) / float(slot["trades"]) * 100.0) if trades_n else 0.0,
+                }
+            )
+        return rows
+
+    daily_timeline = []
+    for key in sorted(daily_stats.keys()):
+        slot = daily_stats[key]
+        trades_n = int(slot["trades"])
+        daily_timeline.append(
+            {
+                "label": key,
+                "ts": key,
+                "pnl": float(slot["pnl"]),
+                "trades": trades_n,
+                "winRate": (float(slot["wins"]) / float(slot["trades"]) * 100.0) if trades_n else 0.0,
+                "avgR": (float(slot["r_sum"]) / float(slot["trades"])) if trades_n else 0.0,
+            }
+        )
+
+    monthly_timeline = []
+    for key in sorted(monthly_stats.keys()):
+        slot = monthly_stats[key]
+        trades_n = int(slot["trades"])
+        monthly_timeline.append(
+            {
+                "label": key,
+                "ts": f"{key}-01",
+                "pnl": float(slot["pnl"]),
+                "trades": trades_n,
+                "winRate": (float(slot["wins"]) / float(slot["trades"]) * 100.0) if trades_n else 0.0,
+                "avgR": (float(slot["r_sum"]) / float(slot["trades"])) if trades_n else 0.0,
+            }
+        )
+
+    ranked = sorted(scope, key=lambda trade: _num(trade.get("pnl"), 0.0), reverse=True)
+    top_winners = ranked[:10]
+    top_losers = list(reversed(ranked[-10:])) if ranked else []
+
     return {
         "summary": "Performance intelligence is synchronized with the same trade ledger used by runtime and audit views.",
         "kpis": [
@@ -421,7 +593,31 @@ def _build_performance(trades: list[Dict[str, Any]]) -> Dict[str, Any]:
         "periods": periods,
         "byAsset": _bucket("asset"),
         "byTier": _bucket("tier"),
-        "tradeTable": trades[:40],
+        "byModel": _bucket("model"),
+        "bySession": _bucket("session"),
+        "byRegime": _bucket("regime"),
+        "byWeekday": _stats_to_rows(weekday_stats, order=weekday_labels),
+        "byHour": _stats_to_rows(hour_stats, order=[f"{hour:02d}:00" for hour in range(24)]),
+        "byHold": _stats_to_rows(hold_stats, order=[label for label, _, _ in hold_bucket_defs]),
+        "topWinners": top_winners,
+        "topLosers": top_losers,
+        "expectancy": {
+            "expectancyR": avg_r,
+            "avgWin": avg_win,
+            "avgLoss": avg_loss,
+            "payoffRatio": payoff_ratio,
+            "medianPnl": median_pnl,
+            "medianR": median_r,
+            "maxConsecutiveWins": max_consecutive_wins,
+            "maxConsecutiveLosses": max_consecutive_losses,
+            "maxDrawdown": max_drawdown,
+        },
+        "timeline": {
+            "equity": equity_curve[-500:],
+            "daily": daily_timeline[-180:],
+            "monthly": monthly_timeline[-48:],
+        },
+        "tradeTable": trades[:260],
     }
 
 

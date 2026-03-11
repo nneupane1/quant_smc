@@ -16,6 +16,7 @@ Tracks:
 """
 
 from typing import List, Dict, Optional
+import time
 import pandas as pd
 from quant_system.data.store.datamodel import Candle
 from quant_system.utils.logger import log
@@ -29,6 +30,15 @@ class LiquiditySweepDetector:
     def __init__(self, equal_tol: float = 0.0002):
         self.equal_tol = equal_tol
         log(f"LiquiditySweepDetector initialized (equal_tol={equal_tol}).")
+
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        total = max(int(seconds), 0)
+        h, rem = divmod(total, 3600)
+        m, s = divmod(rem, 60)
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
 
     def _equal(self, a: float, b: float) -> bool:
         if a == 0 or b == 0:
@@ -48,12 +58,30 @@ class LiquiditySweepDetector:
         closes = [c.close for c in candles]
         opens = [c.open for c in candles]
         ts_arr = [c.timestamp for c in candles]
+        started = time.perf_counter()
+        last_beat = started
+        beat_every = max(2000, len(candles) // 200)  # ~0.5% cadence
 
         # Track equal-high/low liquidity pools
         eq_high = None
         eq_low = None
 
         for i in range(1, len(candles)):
+            if i % beat_every == 0:
+                now = time.perf_counter()
+                if (now - last_beat) >= 10.0:
+                    done = i
+                    total = len(candles)
+                    pct = 100.0 * done / max(total, 1)
+                    elapsed = now - started
+                    rate = done / max(elapsed, 1e-6)
+                    eta = (total - done) / max(rate, 1e-6)
+                    log(
+                        "[LiquiditySweepDetector] progress "
+                        f"{done:,}/{total:,} ({pct:.1f}%) "
+                        f"elapsed={self._fmt_duration(elapsed)} eta={self._fmt_duration(eta)}"
+                    )
+                    last_beat = now
             ts = ts_arr[i]
 
             equal_high = False

@@ -29,6 +29,7 @@ class ConfluenceEngine:
         exec_cfg = cfg.get("execution", {})
         self.conf_cfg = exec_cfg.get("confluence", {})
         tiers_cfg = exec_cfg.get("tiers", {})
+        self.session_policy = exec_cfg.get("session_policy", {})
 
         self.weights = {
             "specialist": float(self.conf_cfg.get("weight_specialist", 1.0)),
@@ -40,6 +41,7 @@ class ConfluenceEngine:
         }
 
         self.session_weights = self.conf_cfg.get("session_weights", {})
+        self.session_bucket_policy = self.session_policy.get("confluence", {})
         self.normalize = bool(self.conf_cfg.get("normalize", True))
         self.default_threshold = float(
             self.conf_cfg.get(
@@ -99,6 +101,19 @@ class ConfluenceEngine:
         session = aliases.get(session, session)
         return float(self.session_weights.get(session, 1.0)) * self.weights["session"]
 
+    @staticmethod
+    def _session_bucket(row: pd.Series) -> str:
+        raw = str(row.get("session_bucket", "") or "").strip().lower()
+        if raw in {"dead_zone", "pre_expansion", "expansion", "overlap"}:
+            return raw
+        if bool(row.get("session_overlap", 0)):
+            return "overlap"
+        if bool(row.get("session_pre_expansion", 0)):
+            return "pre_expansion"
+        if bool(row.get("session_expansion", 0)) or bool(row.get("session_london", 0)) or bool(row.get("session_ny", 0)):
+            return "expansion"
+        return "dead_zone"
+
     def _specialist_score(self, row: pd.Series) -> float:
         p_liq = self._first(row, ["p_liq_flow", "prob_liq_flow"])
         p_bos = self._first(row, ["p_bos_cont", "prob_bos_cont"])
@@ -152,17 +167,30 @@ class ConfluenceEngine:
             )
             raw_score = raw_score / max(denom, 1e-9)
 
-        score = raw_score * session_w
-        passed = score >= self.default_threshold
+        bucket = self._session_bucket(row)
+        bucket_policy = self.session_bucket_policy.get(bucket, {})
+        score_mult = float(bucket_policy.get("score_multiplier", 1.0))
+        threshold_add = float(bucket_policy.get("threshold_add", 0.0))
+        score = raw_score * session_w * score_mult
+        threshold = max(self.default_threshold + threshold_add, 0.0)
+        passed = score >= threshold
 
         LOG.debug(
-            "[ConfluenceEngine] score=%.4f raw=%.4f passed=%s session_w=%.2f",
+            "[ConfluenceEngine] score=%.4f raw=%.4f passed=%s session_w=%.2f bucket=%s thr=%.3f",
             score,
             raw_score,
             passed,
             session_w,
+            bucket,
+            threshold,
         )
-        return {"confluence_score": float(score), "passed": bool(passed)}
+        return {
+            "confluence_score": float(score),
+            "passed": bool(passed),
+            "threshold": float(threshold),
+            "session_bucket": bucket,
+            "session_bucket_multiplier": float(score_mult),
+        }
 
     # Compatibility for older code paths
     def compute(self, *args, **kwargs) -> Dict[str, Any]:

@@ -27,6 +27,7 @@ Outputs:
 """
 
 from typing import List, Dict, Optional
+import time
 import pandas as pd
 
 from quant_system.data.store.datamodel import Candle
@@ -44,6 +45,15 @@ class BOSCHOCHDetector:
     def __init__(self, atr_buffer: float = 0.0):
         self.atr_buffer = atr_buffer
         log(f"BOSCHOCHDetector initialized (atr_buffer={atr_buffer}).")
+
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        total = max(int(seconds), 0)
+        h, rem = divmod(total, 3600)
+        m, s = divmod(rem, 60)
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
 
     def detect(
         self,
@@ -64,20 +74,38 @@ class BOSCHOCHDetector:
         ts_arr = [c.timestamp for c in candles]
 
         result: Dict[int, Dict[str, Optional[float]]] = {}
+        started = time.perf_counter()
+        last_beat = started
+        beat_every = max(2000, len(candles) // 200)  # ~0.5% cadence
 
         last_swing_high = None
         last_swing_low = None
 
         for i, candle in enumerate(candles):
+            if i > 0 and i % beat_every == 0:
+                now = time.perf_counter()
+                if (now - last_beat) >= 10.0:
+                    done = i
+                    total = len(candles)
+                    pct = 100.0 * done / max(total, 1)
+                    elapsed = now - started
+                    rate = done / max(elapsed, 1e-6)
+                    eta = (total - done) / max(rate, 1e-6)
+                    log(
+                        "[BOSCHOCHDetector] progress "
+                        f"{done:,}/{total:,} ({pct:.1f}%) "
+                        f"elapsed={self._fmt_duration(elapsed)} eta={self._fmt_duration(eta)}"
+                    )
+                    last_beat = now
             ts = candle.timestamp
             sh = swings.get(ts, {}).get("swing_high")
             sl = swings.get(ts, {}).get("swing_low")
 
-            # Track last swing levels
-            if sh is not None:
-                last_swing_high = sh
-            if sl is not None:
-                last_swing_low = sl
+            # Track last valid (non-NaN) swing levels
+            if sh is not None and pd.notna(sh):
+                last_swing_high = float(sh)
+            if sl is not None and pd.notna(sl):
+                last_swing_low = float(sl)
 
             # Initialize outputs
             bos_up = False
@@ -149,9 +177,11 @@ class BOSCHOCHDetector:
         swings = {}
         if "swing_high" in frame.columns or "swing_low" in frame.columns:
             for row in frame.itertuples():
+                sh = getattr(row, "swing_high", None)
+                sl = getattr(row, "swing_low", None)
                 swings[int(row.timestamp)] = {
-                    "swing_high": getattr(row, "swing_high", None),
-                    "swing_low": getattr(row, "swing_low", None),
+                    "swing_high": None if pd.isna(sh) else float(sh),
+                    "swing_low": None if pd.isna(sl) else float(sl),
                 }
         else:
             from quant_system.features.smc.swings import SwingHighLowDetector

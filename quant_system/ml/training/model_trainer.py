@@ -29,6 +29,8 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler, RobustScaler
 from sklearn.impute import SimpleImputer
 from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.feature_selection import mutual_info_classif
+from sklearn.inspection import permutation_importance
 from sklearn.exceptions import ConvergenceWarning, UndefinedMetricWarning
 from sklearn.base import BaseEstimator, TransformerMixin
 from quant_system.utils.pandas_compat import ensure_stringmethods_alias
@@ -146,6 +148,9 @@ class ModelTrainer:
         models_yaml = config_loader.load_yaml("models.yaml")
         self.model_cfg = models_yaml["models"]
         self.preproc_cfg = models_yaml.get("training_preprocessing", {})
+        self.training_log_cfg = deepcopy(models_yaml.get("training_logging", {}))
+        self.heartbeat_seconds = max(int(self.training_log_cfg.get("heartbeat_seconds", 60)), 5)
+        self.feature_sel_cfg = deepcopy(self.preproc_cfg.get("feature_selection", {}))
         self.optim_cfg = config_loader.load_yaml("optimization.yaml").get("optimization", {})
         self.assets_cfg = config_loader.load_yaml("assets.yaml")
         self.labels_cfg = config_loader.load_yaml("labels.yaml")
@@ -193,6 +198,29 @@ class ModelTrainer:
     @staticmethod
     def _display_name(name: str) -> str:
         return str(name).replace("_", " ").upper()
+
+    def _log_bundle_progress(
+        self,
+        *,
+        asset: str,
+        completed: int,
+        total: int,
+        phase: str,
+        started_at: float,
+    ) -> None:
+        pct = (100.0 * completed / max(total, 1))
+        elapsed = time.perf_counter() - started_at
+        rate = completed / max(elapsed, 1e-6)
+        remaining = max(total - completed, 0)
+        eta = remaining / max(rate, 1e-6)
+        console_stage(
+            "Training Progress",
+            (
+                f"{asset} {completed}/{total} ({pct:.1f}%) "
+                f"phase={phase} elapsed={fmt_seconds(elapsed)} eta={fmt_seconds(eta)}"
+            ),
+            status="info",
+        )
 
     def _log_training_header(
         self,
@@ -662,6 +690,29 @@ class ModelTrainer:
             required_specialists.extend(conf_cfg.get("specialist_inputs", self.SPECIALIST_MODELS))
         required_specialists = list(dict.fromkeys(required_specialists))
 
+        planned_steps = list(required_specialists)
+        if "meta_model" in requested_models:
+            planned_steps.append("meta_model")
+        if "confluence_model" in requested_models:
+            planned_steps.append("confluence_model")
+        if "hazard" in requested_models:
+            planned_steps.append("hazard")
+        if "quantile" in requested_models:
+            planned_steps.append("quantile")
+        total_steps = len(planned_steps)
+        completed_steps = 0
+        console_kv(
+            "Training Bundle Plan",
+            {
+                "asset": asset,
+                "requested_models": ", ".join(requested_models),
+                "planned_steps": fmt_num(total_steps),
+                "order": " -> ".join(planned_steps) if planned_steps else "-",
+                "heartbeat_seconds": self.heartbeat_seconds,
+            },
+            style="magenta",
+        )
+
         # Specialist models ------------------------------------------------
         specialists = {}
         specialist_metrics = {}
@@ -678,21 +729,46 @@ class ModelTrainer:
                 X_sel, targets[key], cfg, name=f"{asset}_{key}", num_cols=num_cols, cat_cols=cat_cols
             )
             model = self._calibrate(model, X_sel, targets[key], cfg.get("calibrator"))
-            specialists[key] = {"model": model, "feature_cols": cols_sel}
+            selected_cols = metrics.get("selected_feature_cols", cols_sel) if isinstance(metrics, dict) else cols_sel
+            specialists[key] = {"model": model, "feature_cols": selected_cols}
             specialist_metrics[key] = metrics
             LOG.info(f"[ModelTrainer] Specialist {key} done in {time.perf_counter() - t_spec:.2f}s")
+            completed_steps += 1
+            self._log_bundle_progress(
+                asset=asset,
+                completed=completed_steps,
+                total=total_steps,
+                phase=f"specialist:{key}",
+                started_at=t0,
+            )
 
         meta_model = meta_meta = None
         if "meta_model" in requested_models:
             LOG.info("[ModelTrainer] Training meta model (stacking)")
             meta_model, meta_meta = self._train_stack(df, specialists, meta_cfg, target_key="label_liq_flow")
             LOG.info("[ModelTrainer] Meta model done")
+            completed_steps += 1
+            self._log_bundle_progress(
+                asset=asset,
+                completed=completed_steps,
+                total=total_steps,
+                phase="meta_model",
+                started_at=t0,
+            )
 
         conf_model = conf_meta = None
         if "confluence_model" in requested_models:
             LOG.info("[ModelTrainer] Training confluence model")
             conf_model, conf_meta = self._train_stack(df, specialists, conf_cfg, target_key="label_liq_flow")
             LOG.info("[ModelTrainer] Confluence model done")
+            completed_steps += 1
+            self._log_bundle_progress(
+                asset=asset,
+                completed=completed_steps,
+                total=total_steps,
+                phase="confluence_model",
+                started_at=t0,
+            )
 
         hazard_models = haz_conf = None
         if "hazard" in requested_models:
@@ -700,6 +776,14 @@ class ModelTrainer:
             LOG.info("[ModelTrainer] Training hazard models")
             hazard_models, haz_conf = self._train_hazard(df, haz_cfg, haz_event, haz_time)
             LOG.info(f"[ModelTrainer] Hazard models done ({len(hazard_models)} bins)")
+            completed_steps += 1
+            self._log_bundle_progress(
+                asset=asset,
+                completed=completed_steps,
+                total=total_steps,
+                phase="hazard",
+                started_at=t0,
+            )
 
         quant_models = quant_conf = None
         if "quantile" in requested_models:
@@ -707,6 +791,14 @@ class ModelTrainer:
             LOG.info("[ModelTrainer] Training quantile forecaster")
             quant_models, quant_conf = self._train_quantile(df, q_cfg, prices)
             LOG.info("[ModelTrainer] Quantile forecaster done")
+            completed_steps += 1
+            self._log_bundle_progress(
+                asset=asset,
+                completed=completed_steps,
+                total=total_steps,
+                phase="quantile",
+                started_at=t0,
+            )
 
         # Persist
         version = self.versioner.new_version(asset)
@@ -949,6 +1041,8 @@ class ModelTrainer:
         if dropped:
             LOG.warning(f"[ModelTrainer] Dropped non-informative columns: {dropped}")
 
+        X_df = self._apply_feature_hygiene(X_df, task_name=task_name)
+
         num_cols = [c for c in X_df.columns if pd.api.types.is_numeric_dtype(X_df[c])]
         cat_cols = [c for c in X_df.columns if c not in num_cols]
         return X_df, list(X_df.columns), num_cols, cat_cols
@@ -970,6 +1064,212 @@ class ModelTrainer:
         if re.match(r"^q(_?\d|[0-9])", col):
             return True
         return False
+
+    def _apply_feature_hygiene(self, X_df: pd.DataFrame, task_name: Optional[str] = None) -> pd.DataFrame:
+        cfg = self.feature_sel_cfg if isinstance(self.feature_sel_cfg, dict) else {}
+        if not bool(cfg.get("enabled", True)):
+            return X_df
+
+        min_features = max(int(cfg.get("min_features", 24)), 1)
+        dropped: List[str] = []
+        out = X_df.copy()
+
+        max_missing_ratio = float(cfg.get("max_missing_ratio", 0.35))
+        if 0.0 <= max_missing_ratio < 1.0 and len(out.columns) > min_features:
+            miss = out.isna().mean()
+            miss_drop = [c for c in miss.index if miss[c] > max_missing_ratio]
+            room = max(len(out.columns) - min_features, 0)
+            miss_drop = miss_drop[:room]
+            if miss_drop:
+                out = out.drop(columns=miss_drop, errors="ignore")
+                dropped.extend(miss_drop)
+
+        if bool(cfg.get("drop_exact_duplicates", True)) and len(out.columns) > min_features:
+            sig_to_col: Dict[int, str] = {}
+            dup_cols: List[str] = []
+            for col in list(out.columns):
+                series = out[col]
+                try:
+                    sig = int(pd.util.hash_pandas_object(series, index=False).sum())
+                except Exception:
+                    continue
+                twin = sig_to_col.get(sig)
+                if twin is not None and series.equals(out[twin]):
+                    dup_cols.append(col)
+                else:
+                    sig_to_col[sig] = col
+            room = max(len(out.columns) - min_features, 0)
+            dup_cols = dup_cols[:room]
+            if dup_cols:
+                out = out.drop(columns=dup_cols, errors="ignore")
+                dropped.extend(dup_cols)
+
+        corr_threshold = float(cfg.get("correlation_threshold", 0.90))
+        if 0.0 < corr_threshold < 1.0 and len(out.columns) > min_features:
+            num_cols = [c for c in out.columns if pd.api.types.is_numeric_dtype(out[c])]
+            if len(num_cols) >= 2:
+                corr = out[num_cols].corr(method="pearson").abs()
+                upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+                corr_drop = [col for col in upper.columns if (upper[col] >= corr_threshold).any()]
+                room = max(len(out.columns) - min_features, 0)
+                corr_drop = corr_drop[:room]
+                if corr_drop:
+                    out = out.drop(columns=corr_drop, errors="ignore")
+                    dropped.extend(corr_drop)
+
+        if dropped:
+            task = task_name or "generic"
+            LOG.info(
+                "[ModelTrainer] Feature hygiene %s dropped=%s remaining=%s",
+                task,
+                len(dropped),
+                len(out.columns),
+            )
+        return out
+
+    def _apply_mutual_info_filter(
+        self,
+        X_df: pd.DataFrame,
+        y: np.ndarray,
+        model_name: str,
+    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        cfg = self.feature_sel_cfg if isinstance(self.feature_sel_cfg, dict) else {}
+        report: Dict[str, Any] = {"enabled": False}
+        if not bool(cfg.get("enabled", True)):
+            return X_df, report
+        if not bool(cfg.get("use_mutual_info", True)):
+            return X_df, report
+        if len(X_df.columns) <= 1:
+            return X_df, report
+        if pd.Series(y).nunique() < 2:
+            return X_df, report
+
+        top_k = int(cfg.get("mutual_info_top_k", 180))
+        min_features = max(int(cfg.get("min_features", 24)), 1)
+        keep_n = min(max(min_features, top_k), len(X_df.columns))
+        if keep_n >= len(X_df.columns):
+            return X_df, report
+
+        work = X_df.copy()
+        num_cols = [c for c in work.columns if pd.api.types.is_numeric_dtype(work[c])]
+        cat_cols = [c for c in work.columns if c not in num_cols]
+
+        for col in num_cols:
+            med = work[col].median()
+            work[col] = pd.to_numeric(work[col], errors="coerce").fillna(med if pd.notna(med) else 0.0)
+        for col in cat_cols:
+            vals = work[col].astype(str).fillna("__nan__")
+            work[col] = pd.factorize(vals, sort=False)[0]
+
+        discrete_mask = np.array([c in cat_cols for c in work.columns], dtype=bool)
+        random_state = int(cfg.get("mutual_info_random_state", 42))
+        try:
+            scores = mutual_info_classif(
+                work.values,
+                y,
+                discrete_features=discrete_mask,
+                random_state=random_state,
+            )
+        except Exception as exc:
+            LOG.warning("[ModelTrainer] mutual_info skipped for %s: %s", model_name, exc)
+            return X_df, report
+
+        score_s = pd.Series(scores, index=work.columns).fillna(0.0)
+        keep_ranked = list(score_s.sort_values(ascending=False).head(keep_n).index)
+        keep_set = set(keep_ranked)
+        keep_cols = [c for c in X_df.columns if c in keep_set]
+        if len(keep_cols) < min_features:
+            return X_df, report
+
+        top_features = score_s.sort_values(ascending=False).head(min(10, len(score_s)))
+        report = {
+            "enabled": True,
+            "method": "mutual_info",
+            "selected": int(len(keep_cols)),
+            "dropped": int(len(X_df.columns) - len(keep_cols)),
+            "top_features": {k: float(v) for k, v in top_features.items()},
+        }
+        LOG.info(
+            "[ModelTrainer] MI filter %s selected=%s/%s",
+            model_name,
+            len(keep_cols),
+            len(X_df.columns),
+        )
+        return X_df[keep_cols].copy(), report
+
+    @staticmethod
+    def _extract_model_importance(model: Any) -> Dict[str, Any]:
+        try:
+            clf = model.named_steps.get("clf") if hasattr(model, "named_steps") else model
+            pre = model.named_steps.get("pre") if hasattr(model, "named_steps") else None
+            if clf is None:
+                return {}
+            if pre is not None and hasattr(pre, "get_feature_names_out"):
+                names = [str(x) for x in pre.get_feature_names_out()]
+            else:
+                names = []
+
+            scores = None
+            if hasattr(clf, "feature_importances_"):
+                raw = np.asarray(clf.feature_importances_, dtype=float)
+                scores = np.abs(raw)
+            elif hasattr(clf, "coef_"):
+                coef = np.asarray(clf.coef_, dtype=float)
+                scores = np.abs(coef).mean(axis=0)
+
+            if scores is None or scores.size == 0:
+                return {}
+            if not names or len(names) != len(scores):
+                names = [f"f{i}" for i in range(len(scores))]
+            ser = pd.Series(scores, index=names).sort_values(ascending=False)
+            top = ser.head(20)
+            return {"top_features": {k: float(v) for k, v in top.items()}}
+        except Exception:
+            return {}
+
+    def _permutation_importance_audit(
+        self,
+        model: Any,
+        X_df: pd.DataFrame,
+        y: np.ndarray,
+    ) -> Dict[str, Any]:
+        cfg = self.feature_sel_cfg if isinstance(self.feature_sel_cfg, dict) else {}
+        if not bool(cfg.get("enabled", True)):
+            return {}
+        if not bool(cfg.get("use_permutation_audit", False)):
+            return {}
+        if len(X_df.columns) <= 1 or len(X_df) < 200:
+            return {}
+
+        sample_rows = int(cfg.get("permutation_sample_rows", 6000))
+        top_n = int(cfg.get("permutation_top_n", 20))
+        repeats = int(cfg.get("permutation_n_repeats", 4))
+        random_state = int(cfg.get("mutual_info_random_state", 42))
+
+        if len(X_df) > sample_rows:
+            X_eval = X_df.tail(sample_rows).copy()
+            y_eval = y[-sample_rows:]
+        else:
+            X_eval = X_df
+            y_eval = y
+
+        try:
+            imp = permutation_importance(
+                model,
+                X_eval,
+                y_eval,
+                scoring="average_precision",
+                n_repeats=max(repeats, 1),
+                random_state=random_state,
+                n_jobs=1,
+            )
+        except Exception as exc:
+            LOG.warning("[ModelTrainer] permutation_importance skipped: %s", exc)
+            return {}
+
+        ser = pd.Series(imp.importances_mean, index=list(X_eval.columns)).sort_values(ascending=False)
+        top = ser.head(max(top_n, 1))
+        return {"top_features": {k: float(v) for k, v in top.items()}}
 
     @staticmethod
     def _infer_timeframe(col: str) -> Optional[str]:
@@ -1100,6 +1400,10 @@ class ModelTrainer:
         cv_splits = int(cfg.get("cv_splits", 4))
         hpo_space = cfg.get("hpo_space", {})
 
+        X_df, mi_report = self._apply_mutual_info_filter(X_df, y, name)
+        num_cols = [c for c in X_df.columns if pd.api.types.is_numeric_dtype(X_df[c])]
+        cat_cols = [c for c in X_df.columns if c not in num_cols]
+
         # handle imbalance & single-class upfront
         cw, scale_pos = self._make_class_weight(y, cfg)
         class_counts = pd.Series(y).value_counts().to_dict()
@@ -1138,6 +1442,9 @@ class ModelTrainer:
             with self._suppress_low_signal_warnings():
                 model.fit(X_df, y)
             metrics = {"cv_score": None, "best_params": {}, "hpo_trials": 0, "class_counts": class_counts}
+            metrics["selected_feature_cols"] = list(X_df.columns)
+            metrics["feature_selection"] = mi_report
+            metrics["model_importance"] = self._extract_model_importance(model)
             return model, metrics
 
         LOG.info(f"[ModelTrainer] HPO for {name} algo={algo} trials={n_trials} splits={cv_splits}")
@@ -1226,7 +1533,12 @@ class ModelTrainer:
                 )
             }
 
-        def ts_score(params: Dict[str, Any]) -> float:
+        def ts_score(
+            params: Dict[str, Any],
+            *,
+            trial_label: Optional[str] = None,
+            trial_started_at: Optional[float] = None,
+        ) -> float:
             base_model = build_model(params)
             pre = self._build_preprocessor(num_cols, cat_cols, algo=algo)
             model = Pipeline([("pre", pre), ("clf", base_model)])
@@ -1240,7 +1552,9 @@ class ModelTrainer:
                     except Exception:
                         return 0.5
             scores = []
-            for tr_idx, va_idx in tscv.split(X_df):
+            splits = list(tscv.split(X_df))
+            last_beat = trial_started_at or time.perf_counter()
+            for fold_idx, (tr_idx, va_idx) in enumerate(splits, start=1):
                 Xt, Xv = X_df.iloc[tr_idx], X_df.iloc[va_idx]
                 yt, yv = y[tr_idx], y[va_idx]
                 with self._suppress_low_signal_warnings():
@@ -1252,12 +1566,35 @@ class ModelTrainer:
                     except Exception:
                         auc = 0.5
                 scores.append(pr if not np.isnan(pr) else auc)
+                now = time.perf_counter()
+                if trial_label and (now - last_beat) >= self.heartbeat_seconds:
+                    elapsed = now - (trial_started_at or now)
+                    fold_done = fold_idx
+                    fold_total = max(len(splits), 1)
+                    rate = fold_done / max(elapsed, 1e-6)
+                    eta = (fold_total - fold_done) / max(rate, 1e-6)
+                    partial = float(np.mean(scores)) if scores else 0.0
+                    console_stage(
+                        "Training heartbeat",
+                        (
+                            f"{self._display_name(name)} {trial_label} "
+                            f"fold={fold_done}/{fold_total} "
+                            f"partial_score={partial:.4f} "
+                            f"elapsed={fmt_seconds(elapsed)} eta={fmt_seconds(eta)}"
+                        ),
+                        status="info",
+                    )
+                    last_beat = now
             return float(np.mean(scores))
 
         def objective(trial):
             params = param_space(trial)
             params = {k: v for k, v in params.items() if v is not None}
-            return -ts_score(params)
+            return -ts_score(
+                params,
+                trial_label=f"trial {trial.number + 1}/{n_trials}",
+                trial_started_at=time.perf_counter(),
+            )
 
         def _cb(study, trial):
             if trial.value is None:
@@ -1280,12 +1617,12 @@ class ModelTrainer:
         if optuna is None or n_trials <= 0:
             LOG.warning("[ModelTrainer] Optuna unavailable for %s; using default params=%s", name, default_params)
             best_params = {k: v for k, v in default_params.items() if v is not None}
-            best_cv = ts_score(best_params)
+            best_cv = ts_score(best_params, trial_label="default", trial_started_at=time.perf_counter())
         else:
             study = self._make_study(direction="minimize", cfg=cfg)
             if study is None:
                 best_params = {k: v for k, v in default_params.items() if v is not None}
-                best_cv = ts_score(best_params)
+                best_cv = ts_score(best_params, trial_label="default", trial_started_at=time.perf_counter())
                 pre = self._build_preprocessor(num_cols, cat_cols, algo=algo)
                 final_model = Pipeline([("pre", pre), ("clf", build_model(best_params))])
                 with self._suppress_low_signal_warnings():
@@ -1295,6 +1632,10 @@ class ModelTrainer:
                     "best_params": best_params,
                     "hpo_trials": 0,
                     "class_counts": class_counts,
+                    "selected_feature_cols": list(X_df.columns),
+                    "feature_selection": mi_report,
+                    "model_importance": self._extract_model_importance(final_model),
+                    "permutation_importance": self._permutation_importance_audit(final_model, X_df, y),
                 }
                 return final_model, metrics
             with self._suppress_low_signal_warnings():
@@ -1312,7 +1653,7 @@ class ModelTrainer:
             name=name,
             best_params=best_params,
             best_score=best_cv,
-            score_fn=ts_score,
+            score_fn=lambda p: ts_score(p, trial_label="evolution", trial_started_at=time.perf_counter()),
             hpo_space=hpo_space,
             cfg=cfg,
         )
@@ -1321,12 +1662,18 @@ class ModelTrainer:
         final_model = Pipeline([("pre", pre), ("clf", build_model(best_params))])
         with self._suppress_low_signal_warnings():
             final_model.fit(X_df, y)
+        importance_report = self._extract_model_importance(final_model)
+        perm_report = self._permutation_importance_audit(final_model, X_df, y)
         metrics = {
             "cv_score": best_cv,
             "best_params": best_params,
             "hpo_trials": n_trials,
             # record label balance for downstream monitoring
             "class_counts": class_counts,
+            "selected_feature_cols": list(X_df.columns),
+            "feature_selection": mi_report,
+            "model_importance": importance_report,
+            "permutation_importance": perm_report,
         }
         return final_model, metrics
 
@@ -1468,6 +1815,19 @@ class ModelTrainer:
             },
             style="yellow",
         )
+        min_event_fraction = float(cfg.get("min_event_fraction", 0.005))
+        eligible_total = 0
+        for b in range(1, horizon + 1):
+            y_probe = ((event == 1) & (tte <= b)).astype(int)
+            if y_probe.mean() >= min_event_fraction:
+                eligible_total += 1
+        console_stage(
+            "Hazard schedule",
+            f"eligible_bins={eligible_total}/{horizon} min_event_fraction={min_event_fraction:.4f}",
+            status="info",
+        )
+        hazard_started = time.perf_counter()
+        processed_bins = 0
 
         # Optional challenger selection on a representative probe bin,
         # then reuse the winner for all hazard bins to control runtime.
@@ -1506,12 +1866,14 @@ class ModelTrainer:
 
         for b in range(1, horizon + 1):
             y_bin = ((event == 1) & (tte <= b)).astype(int)
-            if y_bin.mean() < cfg.get("min_event_fraction", 0.005):
+            if y_bin.mean() < min_event_fraction:
                 continue
+            processed_bins += 1
+            bin_started = time.perf_counter()
             if b == 1 or b == horizon or b % max(1, horizon // 6) == 0:
                 console_stage(
-                    f"Hazard bin {b}/{horizon}",
-                    f"event_rate={y_bin.mean():.4f}",
+                    f"Hazard bin {processed_bins}/{max(eligible_total, 1)}",
+                    f"bar={b}/{horizon} event_rate={y_bin.mean():.4f} algo={selected_algo}",
                     status="info",
                 )
             cw_bin, scale_pos_bin = self._make_class_weight(y_bin, cfg)
@@ -1624,8 +1986,27 @@ class ModelTrainer:
             if cfg.get("hpo", {}).get("enabled", True) and optuna is not None and hpo_trials > 0:
                 study = self._make_study(direction="minimize", cfg=cfg)
                 if study is not None:
+                    def _cb(study, trial):
+                        if trial.value is None:
+                            return
+                        should_log = (
+                            trial.number == 0
+                            or (trial.number + 1) == hpo_trials
+                            or ((trial.number + 1) % max(1, min(5, hpo_trials // 4 or 1)) == 0)
+                        )
+                        if should_log:
+                            self._log_hpo_progress(
+                                name=f"hazard_b{b}",
+                                trial_number=trial.number + 1,
+                                total_trials=hpo_trials,
+                                trial_value=float(trial.value),
+                                best_value=float(study.best_value),
+                                started_at=bin_started,
+                                direction="minimize",
+                                extra={"objective": "neg_ap"},
+                            )
                     with self._suppress_low_signal_warnings():
-                        study.optimize(objective, n_trials=hpo_trials, show_progress_bar=False)
+                        study.optimize(objective, n_trials=hpo_trials, show_progress_bar=False, callbacks=[_cb])
                     best_params = study.best_params
                 else:
                     best_params = default_params
@@ -1638,6 +2019,18 @@ class ModelTrainer:
             with self._suppress_low_signal_warnings():
                 pipe.fit(X_all, y_bin)
             models[b] = pipe
+            total_elapsed = time.perf_counter() - hazard_started
+            rate = processed_bins / max(total_elapsed, 1e-6)
+            eta = (max(eligible_total, 1) - processed_bins) / max(rate, 1e-6)
+            console_stage(
+                "Hazard bin done",
+                (
+                    f"bar={b} progress={processed_bins}/{max(eligible_total, 1)} "
+                    f"elapsed={fmt_seconds(total_elapsed)} eta={fmt_seconds(eta)} "
+                    f"bin_elapsed={fmt_seconds(time.perf_counter() - bin_started)}"
+                ),
+                status="ok",
+            )
 
         LOG.info(f"[ModelTrainer] Hazard model trained with {len(models)} bins.")
         return models, {
@@ -1679,12 +2072,18 @@ class ModelTrainer:
             },
             style="cyan",
         )
+        quant_started = time.perf_counter()
+        total_q = len(quantiles)
 
-        for q in quantiles:
+        for q_idx, q in enumerate(quantiles, start=1):
             LOG.info(f"[ModelTrainer] Training quantile model q={q}")
             q_name = f"quantile_{q}"
             q_t0 = time.perf_counter()
-            console_stage(f"Quantile q={q}", f"algo={algo}", status="info")
+            console_stage(
+                f"Quantile q={q} ({q_idx}/{total_q})",
+                f"algo={algo}",
+                status="info",
+            )
 
             def param_space(trial):
                 params = {
@@ -1794,7 +2193,7 @@ class ModelTrainer:
                     console_stage(
                         f"Quantile q={q} ready",
                         f"elapsed={fmt_seconds(time.perf_counter() - q_t0)}",
-                        status="success",
+                        status="ok",
                     )
                     continue
                 def _cb(study, trial):
@@ -1838,7 +2237,18 @@ class ModelTrainer:
             console_stage(
                 f"Quantile q={q} ready",
                 f"elapsed={fmt_seconds(time.perf_counter() - q_t0)}",
-                status="success",
+                status="ok",
+            )
+            total_elapsed = time.perf_counter() - quant_started
+            rate = q_idx / max(total_elapsed, 1e-6)
+            eta = (total_q - q_idx) / max(rate, 1e-6)
+            console_stage(
+                "Quantile progress",
+                (
+                    f"{q_idx}/{total_q} done "
+                    f"elapsed={fmt_seconds(total_elapsed)} eta={fmt_seconds(eta)}"
+                ),
+                status="info",
             )
 
         return models, {"quantiles": quantiles, "features": feature_cols}

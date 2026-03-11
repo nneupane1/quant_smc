@@ -30,6 +30,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 import math
+import time
 from quant_system.data.store.datamodel import Candle
 from quant_system.utils.logger import log
 
@@ -73,6 +74,15 @@ class FVGDetector:
             f"FVGDetector initialized (min_gap_pct={min_gap_pct}, require_full_fill={require_full_fill}, "
             f"tau={decay_tau_bars}, fresh={fresh_bars}, stale={stale_bars})."
         )
+
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        total = max(int(seconds), 0)
+        h, rem = divmod(total, 3600)
+        m, s = divmod(rem, 60)
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
 
     # Optional list API (kept for compatibility; emits event fields only)
     def detect(self, candles: List[Candle]) -> Dict[int, Dict[str, Optional[float]]]:
@@ -159,8 +169,26 @@ class FVGDetector:
         records = []
         active: List[Dict] = []  # open gaps
         last_ctx = None  # persistent context of last-created gap
+        started = time.perf_counter()
+        last_beat = started
+        beat_every = max(2000, len(candles) // 200)  # ~0.5% cadence
 
         for i, c in enumerate(candles):
+            if i % beat_every == 0:
+                now = time.perf_counter()
+                if (now - last_beat) >= 10.0:
+                    done = i
+                    total = len(candles)
+                    pct = 100.0 * done / max(total, 1)
+                    elapsed = now - started
+                    rate = done / max(elapsed, 1e-6)
+                    eta = (total - done) / max(rate, 1e-6)
+                    log(
+                        "[FVGDetector] progress "
+                        f"{done:,}/{total:,} ({pct:.1f}%) "
+                        f"elapsed={self._fmt_duration(elapsed)} eta={self._fmt_duration(eta)}"
+                    )
+                    last_beat = now
             ts = c.timestamp
             f_up = f_dn = False
             gap_top = gap_bot = gap_size = None

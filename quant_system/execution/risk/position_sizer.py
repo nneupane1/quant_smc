@@ -32,12 +32,44 @@ class PositionSizer:
         self.stretch_scale = float(scfg.get("ema_stretch_scale", 0.0))
         self.min_qty = float(scfg.get("min_qty", 0.0))
         self.max_leverage = float(scfg.get("max_leverage", 5.0))
+        self.session_sizing = exec_cfg.get("session_policy", {}).get("sizing", {})
+
+    @staticmethod
+    def _session_bucket(row: pd.Series) -> str:
+        raw = str(row.get("session_bucket", "") or "").strip().lower()
+        if raw in {"dead_zone", "pre_expansion", "expansion", "overlap"}:
+            return raw
+        if bool(row.get("session_overlap", 0)):
+            return "overlap"
+        if bool(row.get("session_pre_expansion", 0)):
+            return "pre_expansion"
+        if bool(row.get("session_expansion", 0)) or bool(row.get("session_london", 0)) or bool(row.get("session_ny", 0)):
+            return "expansion"
+        return "dead_zone"
+
+    def _session_multiplier(self, row: pd.Series) -> float:
+        quality = row.get("session_quality_multiplier")
+        if quality is not None:
+            try:
+                q = float(quality)
+                if np.isfinite(q) and q > 0:
+                    return q
+            except Exception:
+                pass
+        bucket = self._session_bucket(row)
+        if not isinstance(self.session_sizing, dict):
+            return 1.0
+        bucket_cfg = self.session_sizing.get(bucket, {})
+        if not isinstance(bucket_cfg, dict):
+            return 1.0
+        return float(bucket_cfg.get("qty_multiplier", 1.0))
 
     def _adjust_for_regime(self, qty: float, row: pd.Series) -> float:
         tox = float(row.get("toxicity_12h", 0.0))
         stretch = abs(float(row.get("ema_dist_z", 0.0)))
         qty *= (1.0 - self.tox_scale * tox)
         qty *= (1.0 - self.stretch_scale * stretch)
+        qty *= max(self._session_multiplier(row), 0.0)
         return max(qty, 0.0)
 
     def _compute_qty(self, equity: float, risk_mode: float, stop_dist: float, px: float) -> float:

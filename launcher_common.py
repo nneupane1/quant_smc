@@ -128,8 +128,9 @@ def build_labels(
         )
         labels_path = Path(labels_out)
         features_path = Path(features_csv) if features_csv else None
+        active_profile_path = Path("artifacts/label_profiles/active_label_profile.json")
         if resume and labels_path.exists():
-            sources = [features_path] if features_path is not None else []
+            sources = [s for s in (features_path, active_profile_path) if s is not None]
             if _is_up_to_date(labels_path, [s for s in sources if s is not None]):
                 console_stage(
                     "Labels cache hit",

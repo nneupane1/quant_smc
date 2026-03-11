@@ -19,6 +19,57 @@ execution:
     weight_session: 1.0
     normalize: true
 
+  session_policy:
+    confluence:
+      dead_zone:
+        score_multiplier: 0.90
+        threshold_add: 0.06
+      pre_expansion:
+        score_multiplier: 0.97
+        threshold_add: 0.02
+      expansion:
+        score_multiplier: 1.02
+        threshold_add: -0.01
+      overlap:
+        score_multiplier: 1.08
+        threshold_add: -0.03
+    gates:
+      dead_zone:
+        min_session_weight: 0.20
+        flow_prob_min: 0.58
+        hazard_max: 0.35
+      pre_expansion:
+        flow_prob_min: 0.55
+        hazard_max: 0.40
+      expansion:
+        flow_prob_min: 0.52
+        hazard_max: 0.45
+      overlap:
+        flow_prob_min: 0.50
+        hazard_max: 0.50
+    sizing:
+      dead_zone:
+        qty_multiplier: 0.70
+      pre_expansion:
+        qty_multiplier: 0.90
+      expansion:
+        qty_multiplier: 1.00
+      overlap:
+        qty_multiplier: 1.10
+    capital:
+      dead_zone:
+        ticket_multiplier: 0.75
+        use_quality_multiplier: true
+      pre_expansion:
+        ticket_multiplier: 0.90
+        use_quality_multiplier: true
+      expansion:
+        ticket_multiplier: 1.00
+        use_quality_multiplier: true
+      overlap:
+        ticket_multiplier: 1.10
+        use_quality_multiplier: true
+
   # =======================================================
   # Tier Criteria for A+/A/B classification
   # =======================================================

@@ -68,6 +68,19 @@ class LiveFeatureEnricher:
         self.weight_ny = float(ny_cfg.get("weight", 1.0))
         self.weight_overlap = float(overlap_cfg.get("weight", 1.1))
         self.weight_off = float(off_cfg.get("weight", 0.2))
+        self.pre_expansion_minutes = int(session_cfg.get("pre_expansion_minutes", 60))
+        self.london_open_expansion_minutes = int(session_cfg.get("london_open_expansion_minutes", 120))
+        self.ny_open_expansion_minutes = int(session_cfg.get("ny_open_expansion_minutes", 90))
+        self.relative_window_bars = int(session_cfg.get("relative_window_bars", 96))
+        self.bucket_quality = session_cfg.get(
+            "bucket_quality",
+            {
+                "dead_zone": 0.75,
+                "pre_expansion": 0.95,
+                "expansion": 1.05,
+                "overlap": 1.15,
+            },
+        )
 
     @staticmethod
     def _ensure_dt(df: pd.DataFrame) -> pd.DataFrame:
@@ -161,19 +174,69 @@ class LiveFeatureEnricher:
         in_london = self._in_window(tod, self.london_start, self.london_end)
         in_ny = self._in_window(tod, self.ny_start, self.ny_end)
         in_overlap = in_london and in_ny
+        mins_since_london = (
+            int((local - local.replace(hour=self.london_start.hour, minute=self.london_start.minute, second=0, microsecond=0)).total_seconds() // 60)
+            if in_london else -1
+        )
+        mins_since_ny = (
+            int((local - local.replace(hour=self.ny_start.hour, minute=self.ny_start.minute, second=0, microsecond=0)).total_seconds() // 60)
+            if in_ny else -1
+        )
+        mins_to_london_open = int(
+            (local.replace(hour=self.london_start.hour, minute=self.london_start.minute, second=0, microsecond=0) - local).total_seconds() // 60
+        )
+        mins_to_ny_open = int(
+            (local.replace(hour=self.ny_start.hour, minute=self.ny_start.minute, second=0, microsecond=0) - local).total_seconds() // 60
+        )
+        overlap_close = min(self.london_end, self.ny_end)
+        mins_to_overlap_close = (
+            int(
+                (
+                    local.replace(hour=overlap_close.hour, minute=overlap_close.minute, second=0, microsecond=0)
+                    - local
+                ).total_seconds() // 60
+            )
+            if in_overlap else -1
+        )
+
+        pre = ((not in_london) and (0 <= mins_to_london_open <= self.pre_expansion_minutes)) or (
+            (not in_ny) and (0 <= mins_to_ny_open <= self.pre_expansion_minutes)
+        )
+        expansion = (
+            (in_london and 0 <= mins_since_london <= self.london_open_expansion_minutes)
+            or (in_ny and 0 <= mins_since_ny <= self.ny_open_expansion_minutes)
+        )
+
         off = int(not (in_london or in_ny))
         if in_overlap:
             weight = self.weight_overlap
             session = "overlap"
+            bucket = "overlap"
+            bucket_id = 3
+        elif expansion:
+            bucket = "expansion"
+            bucket_id = 2
         elif in_london:
             weight = self.weight_london
             session = "london"
+            bucket = "expansion"
+            bucket_id = 2
         elif in_ny:
             weight = self.weight_ny
             session = "ny"
+            bucket = "expansion"
+            bucket_id = 2
+        elif pre:
+            weight = self.weight_off
+            session = "off_hours"
+            bucket = "pre_expansion"
+            bucket_id = 1
         else:
             weight = self.weight_off
             session = "off_hours"
+            bucket = "dead_zone"
+            bucket_id = 0
+        quality = float(self.bucket_quality.get(bucket, 1.0))
         return {
             "session_london": int(in_london),
             "session_ny": int(in_ny),
@@ -185,6 +248,16 @@ class LiveFeatureEnricher:
             "is_ny": int(in_ny),
             "session": session,
             "session_name": session,
+            "session_bucket": bucket,
+            "session_bucket_id": int(bucket_id),
+            "session_quality_multiplier": quality,
+            "session_pre_expansion": int(pre),
+            "session_expansion": int(expansion),
+            "minutes_since_london_open": int(mins_since_london),
+            "minutes_since_ny_open": int(mins_since_ny),
+            "minutes_to_london_open": int(mins_to_london_open),
+            "minutes_to_ny_open": int(mins_to_ny_open),
+            "minutes_to_overlap_close": int(mins_to_overlap_close),
         }
 
     @staticmethod
@@ -195,6 +268,20 @@ class LiveFeatureEnricher:
             n = 1.0 / max(len(vals), 1)
             return {k: n for k in vals}
         return {k: v / s for k, v in vals.items()}
+
+    @staticmethod
+    def _bucket_percentile(series: pd.Series, labels: pd.Series, window: int = 96) -> pd.Series:
+        out = pd.Series(np.nan, index=series.index, dtype=float)
+        min_periods = max(12, int(window) // 4)
+        for lbl in sorted(labels.dropna().unique()):
+            mask = labels == lbl
+            sparse = series.where(mask)
+            mu = sparse.rolling(int(window), min_periods=min_periods).mean()
+            sigma = sparse.rolling(int(window), min_periods=min_periods).std().replace(0.0, np.nan)
+            z = ((series - mu) / sigma).where(mask)
+            pct = 1.0 / (1.0 + np.exp(-1.702 * z))
+            out = out.where(~mask, pct)
+        return out.fillna(0.5)
 
     def enrich(self, state: QuoteState, asset: str, bar_15m: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         df15 = self._window(state, "15m")
@@ -315,6 +402,87 @@ class LiveFeatureEnricher:
         if pd.isna(dt):
             dt = pd.Timestamp.now(tz="UTC")
         session = self._session(dt)
+        session_hist = [self._session(pd.to_datetime(x, utc=True, errors="coerce")) for x in df15["dt"]]
+        bucket_hist = pd.Series(
+            [s.get("session_bucket", "dead_zone") for s in session_hist],
+            index=df15.index,
+            dtype="object",
+        )
+        overlap_hist = pd.Series(
+            [int(s.get("session_overlap", 0)) for s in session_hist],
+            index=df15.index,
+            dtype=int,
+        )
+
+        upper_wick_hist = (high15 - np.maximum(open15, close15)).clip(lower=0.0)
+        lower_wick_hist = (np.minimum(open15, close15) - low15).clip(lower=0.0)
+        wick_asym_hist = (
+            (upper_wick_hist - lower_wick_hist) / (high15 - low15).replace(0.0, np.nan)
+        ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        session_volume_pct = self._bucket_percentile(
+            pd.to_numeric(df15["volume"], errors="coerce").fillna(0.0),
+            bucket_hist,
+            self.relative_window_bars,
+        )
+        session_range_pct = self._bucket_percentile(range_pct15, bucket_hist, self.relative_window_bars)
+        session_wick_pct = self._bucket_percentile(wick_asym_hist, bucket_hist, self.relative_window_bars)
+        session_atr_pct = self._bucket_percentile(atr15.fillna(0.0), bucket_hist, self.relative_window_bars)
+
+        dt_local_hist = pd.to_datetime(df15["dt"], utc=True, errors="coerce").dt.tz_convert(self.tz)
+        session_date = dt_local_hist.dt.date
+        tod_min_hist = dt_local_hist.dt.hour * 60 + dt_local_hist.dt.minute
+        london_start_min = self.london_start.hour * 60 + self.london_start.minute
+        london_end_min = self.london_end.hour * 60 + self.london_end.minute
+        asia_mask = (tod_min_hist >= 0) & (tod_min_hist < london_start_min)
+        asia_stats = pd.DataFrame({"date": session_date, "high": high15, "low": low15})
+        asia_grouped = asia_stats.loc[asia_mask].groupby("date").agg(
+            asia_high=("high", "max"),
+            asia_low=("low", "min"),
+        )
+        current_date = session_date.iloc[-1]
+        asia_high_now = float(asia_grouped.get("asia_high", pd.Series(dtype=float)).get(current_date, np.nan))
+        asia_low_now = float(asia_grouped.get("asia_low", pd.Series(dtype=float)).get(current_date, np.nan))
+
+        london_mask = (tod_min_hist >= london_start_min) & (tod_min_hist < london_end_min)
+        london_high_roll = high15.where(london_mask).groupby(session_date).cummax().groupby(session_date).ffill()
+        london_low_roll = low15.where(london_mask).groupby(session_date).cummin().groupby(session_date).ffill()
+        london_high_now = _safe_float(london_high_roll.iloc[-1], np.nan)
+        london_low_now = _safe_float(london_low_roll.iloc[-1], np.nan)
+
+        overlap_start_hist = overlap_hist.eq(1) & overlap_hist.shift(1, fill_value=0).eq(0)
+        prior_hi = high15.rolling(16, min_periods=4).max().shift(1)
+        prior_lo = low15.rolling(16, min_periods=4).min().shift(1)
+        breakout_after_overlap_start = bool(
+            overlap_start_hist.iloc[-1]
+            and (
+                _safe_float(close15.iloc[-1], 0.0) >= _safe_float(prior_hi.iloc[-1], np.inf)
+                or _safe_float(close15.iloc[-1], 0.0) <= _safe_float(prior_lo.iloc[-1], -np.inf)
+            )
+        )
+
+        sweep_candidates = ["sweep_flag", "sweep_high", "sweep_low"]
+        sweep_hist = pd.Series(False, index=df15.index)
+        for col in sweep_candidates:
+            if col in df15.columns:
+                sweep_hist = sweep_hist | pd.to_numeric(df15[col], errors="coerce").fillna(0.0).ne(0.0)
+        idx_hist = pd.Series(np.arange(len(df15)), index=df15.index, dtype=float)
+        last_sweep_idx = idx_hist.where(sweep_hist).ffill()
+        bars_since_last_sweep = int((idx_hist.iloc[-1] - last_sweep_idx.iloc[-1]) if pd.notna(last_sweep_idx.iloc[-1]) else 999)
+
+        fresh_retest_hist = (
+            pd.to_numeric(df15.get("fresh_retest_15m", pd.Series(0, index=df15.index)), errors="coerce")
+            .fillna(0.0)
+            .gt(0.0)
+        )
+        session_sweep_hist = sweep_hist & pd.Series(
+            [bool(s.get("session_london", 0) or s.get("session_ny", 0)) for s in session_hist],
+            index=df15.index,
+        )
+        last_session_sweep_idx = idx_hist.where(session_sweep_hist).ffill()
+        bars_since_session_sweep = (idx_hist - last_session_sweep_idx).fillna(999.0)
+        first_retest_after_session_sweep = bool(
+            fresh_retest_hist.iloc[-1] and 1 <= float(bars_since_session_sweep.iloc[-1]) <= 4
+        )
 
         atr_now = max(_safe_float(atr15.iloc[-1], 0.0), 1e-9)
         close_now = _safe_float(bar_15m.get("close"), _safe_float(close15.iloc[-1], 0.0))
@@ -383,5 +551,33 @@ class LiveFeatureEnricher:
             }
         )
         enriched.update(session)
+        enriched.update(
+            {
+                "session_volume_pct": _safe_float(session_volume_pct.iloc[-1], 0.5),
+                "session_range_pct": _safe_float(session_range_pct.iloc[-1], 0.5),
+                "session_wick_asym_pct": _safe_float(session_wick_pct.iloc[-1], 0.5),
+                "session_atr_pct": _safe_float(session_atr_pct.iloc[-1], 0.5),
+                "wick_asymmetry_15m": _safe_float(wick_asym_hist.iloc[-1], 0.0),
+                "dist_to_asia_high_atr": _safe_float(
+                    (close_now - asia_high_now) / atr_now if np.isfinite(asia_high_now) else np.nan,
+                    0.0,
+                ),
+                "dist_to_asia_low_atr": _safe_float(
+                    (close_now - asia_low_now) / atr_now if np.isfinite(asia_low_now) else np.nan,
+                    0.0,
+                ),
+                "dist_to_london_high_atr": _safe_float(
+                    (close_now - london_high_now) / atr_now if np.isfinite(london_high_now) else np.nan,
+                    0.0,
+                ),
+                "dist_to_london_low_atr": _safe_float(
+                    (close_now - london_low_now) / atr_now if np.isfinite(london_low_now) else np.nan,
+                    0.0,
+                ),
+                "breakout_after_overlap_start_flag": int(breakout_after_overlap_start),
+                "bars_since_last_liquidity_sweep": int(max(bars_since_last_sweep, 0)),
+                "first_retest_after_session_sweep": int(first_retest_after_session_sweep),
+            }
+        )
 
         return enriched

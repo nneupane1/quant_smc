@@ -322,6 +322,7 @@ class LiveOrchestrator:
                 "risk_mode": risk_mode,
                 "hedge_ratio": self.current_hedge_ratio,
                 "lock_fraction": float(capital_out.get("lock_fraction", 0.0) or 0.0),
+                "session_ticket_multiplier": float(capital_out.get("session_ticket_multiplier", 1.0) or 1.0),
             },
             "position_sizer": {
                 "value_usd": float(sizing.get("value", 0.0) or 0.0),

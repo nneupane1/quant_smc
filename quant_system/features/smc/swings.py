@@ -16,6 +16,7 @@ All swings are computed strictly on *closed* bars.
 """
 
 from typing import List, Dict, Optional, Tuple
+import time
 from quant_system.data.store.datamodel import Candle
 from quant_system.utils.logger import log
 import pandas as pd
@@ -44,6 +45,15 @@ class SwingHighLowDetector:
             f"SwingHighLowDetector initialized "
             f"(left={left}, right={right}, equal_tol={equal_tol})."
         )
+
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        total = max(int(seconds), 0)
+        h, rem = divmod(total, 3600)
+        m, s = divmod(rem, 60)
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
 
     # ------------------------------------------------------------------
     def _is_swing_high(self, candles: List[Candle], i: int) -> bool:
@@ -108,8 +118,27 @@ class SwingHighLowDetector:
         results: Dict[int, Dict[str, Optional[float]]] = {}
         highs = [c.high for c in candles]
         lows = [c.low for c in candles]
+        started = time.perf_counter()
+        last_beat = started
+        total_iters = max(len(candles) - self.right - self.left, 1)
+        beat_every = max(2000, total_iters // 200)  # ~0.5% cadence
 
         for i in range(self.left, len(candles) - self.right):
+            iter_pos = i - self.left + 1
+            if iter_pos % beat_every == 0:
+                now = time.perf_counter()
+                if (now - last_beat) >= 10.0:
+                    done = iter_pos
+                    pct = 100.0 * done / max(total_iters, 1)
+                    elapsed = now - started
+                    rate = done / max(elapsed, 1e-6)
+                    eta = (total_iters - done) / max(rate, 1e-6)
+                    log(
+                        "[SwingHighLowDetector] progress "
+                        f"{done:,}/{total_iters:,} ({pct:.1f}%) "
+                        f"elapsed={self._fmt_duration(elapsed)} eta={self._fmt_duration(eta)}"
+                    )
+                    last_beat = now
             ts = candles[i].timestamp
 
             swing_high = None

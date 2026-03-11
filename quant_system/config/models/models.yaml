@@ -214,3 +214,94 @@ training_preprocessing:
   # Leak-safe winsorization on training folds
   outlier_clip: true
   clip_quantiles: [0.005, 0.995]
+  feature_selection:
+    enabled: true
+    # Drop columns with too many missing values.
+    max_missing_ratio: 0.35
+    # Remove exact duplicate columns.
+    drop_exact_duplicates: true
+    # Pearson absolute correlation pruning threshold for numeric columns.
+    correlation_threshold: 0.90
+    # Always keep at least this many features after hygiene/filtering.
+    min_features: 24
+    # Optional supervised filter (classification targets only).
+    use_mutual_info: true
+    mutual_info_top_k: 120
+    mutual_info_random_state: 42
+
+training_logging:
+  heartbeat_seconds: 60
+
+# =======================================================
+# Deep learning benchmark (TCN specialist classifiers)
+# =======================================================
+tcn_training:
+  default:
+    random_seed: 42
+    hpo_trials: 20
+    hpo_resume: true
+    hpo_storage: null
+    hpo_study_name: null
+    hpo_pruner_warmup_steps: 1
+    hpo_gc_after_trial: true
+    hpo_log_every_n_trials: 1
+    hpo_adaptive_stop: true
+    hpo_adaptive_min_completed_trials: 10
+    hpo_adaptive_no_improve_trials: 6
+    hpo_adaptive_min_delta: 0.001
+    fold_heartbeat: true
+    epoch_heartbeat_seconds: 120
+    progress_snapshot_filename: "hpo_progress.json"
+    progress_events_filename: "hpo_progress.ndjson"
+    cv_splits: 4
+    embargo_bars: 2
+    feature_source: "tree_manifest"   # tree_manifest | auto
+    calibrator: "auto"                # auto | platt | isotonic | empirical | none
+    holdout_frac: 0.15
+    acceptance:
+      enabled: true
+      holdout_frac: 0.10
+      min_rows: 4096
+      max_score_drop: 0.05
+      min_score: null
+      min_precision_at_threshold: 0.10
+    stability:
+      enabled: true
+      seeds: [42, 52, 62]
+      max_std: 0.02
+      max_drop_vs_best: 0.04
+    threshold_tuning:
+      enabled: true
+      metric: "f1"
+      beta: 1.0
+      min_precision: 0.10
+      min_recall: 0.01
+      default_threshold: 0.50
+      max_candidates: 256
+    device: "cpu"
+    torch_num_threads: 1
+    torch_num_interop_threads: 1
+    mkldnn_enabled: false
+    preprocessing:
+      num_imputer: "median"
+      cat_imputer: "most_frequent"
+      scaler: "standard"
+      outlier_clip: true
+      clip_quantiles: [0.005, 0.995]
+    hpo_space:
+      lookback: [24, 96]
+      levels: [1, 3]
+      channels: [16, 64]
+      kernel_size: [2, 5]
+      dropout: [0.0, 0.35]
+      lr: [0.0001, 0.003]
+      weight_decay: [0.00000001, 0.001]
+      batch_size_choices: [64, 128, 256]
+      max_epochs: [8, 24]
+      patience: [3, 7]
+  overrides:
+    momo:
+      hpo_trials: 20
+      hpo_space:
+        lookback: [16, 64]
+        max_epochs: [8, 20]

@@ -18,6 +18,7 @@ Outputs a dict indexed by timestamp with OB metadata per bar.
 """
 
 from typing import List, Dict, Optional
+import time
 import numpy as np
 import pandas as pd
 from quant_system.data.store.datamodel import Candle
@@ -45,6 +46,15 @@ class OrderBlockDetector:
             f"(min_body_pct={min_body_pct}, min_displacement_r={min_displacement_r})."
         )
 
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        total = max(int(seconds), 0)
+        h, rem = divmod(total, 3600)
+        m, s = divmod(rem, 60)
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
     def detect(self, candles: List[Candle]) -> Dict[int, Dict[str, Optional[float]]]:
         log(f"Detecting order blocks for {len(candles):,} candles.")
 
@@ -53,12 +63,30 @@ class OrderBlockDetector:
             return {}
 
         result: Dict[int, Dict[str, Optional[float]]] = {}
+        started = time.perf_counter()
+        last_beat = started
+        beat_every = max(2000, len(candles) // 200)  # ~0.5% cadence
 
         # OB trackers
         demand_blocks = []  # list of dicts {top, bottom, age, quality}
         supply_blocks = []
 
         for i in range(2, len(candles)):
+            if i % beat_every == 0:
+                now = time.perf_counter()
+                if (now - last_beat) >= 10.0:
+                    done = i
+                    total = len(candles)
+                    pct = 100.0 * done / max(total, 1)
+                    elapsed = now - started
+                    rate = done / max(elapsed, 1e-6)
+                    eta = (total - done) / max(rate, 1e-6)
+                    log(
+                        "[OrderBlockDetector] progress "
+                        f"{done:,}/{total:,} ({pct:.1f}%) "
+                        f"elapsed={self._fmt_duration(elapsed)} eta={self._fmt_duration(eta)}"
+                    )
+                    last_beat = now
             c0 = candles[i - 2]
             c1 = candles[i - 1]   # OB candidate
             c2 = candles[i]       # displacement candle

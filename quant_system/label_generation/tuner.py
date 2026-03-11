@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+import time
 import warnings
 
 import numpy as np
@@ -170,6 +172,7 @@ class LabelEmpiricalTuner:
         self.hpo_trials_cfg = deepcopy(self.tuning_cfg.get("model_hpo_trials", {}))
         self.use_hpo = bool(self.tuning_cfg.get("use_hpo", True))
         self.default_hpo_trials = int(self.tuning_cfg.get("default_hpo_trials", 6))
+        self.heartbeat_seconds = max(int(self.tuning_cfg.get("heartbeat_seconds", 60)), 5)
         score_cfg = self.tuning_cfg.get("score", {})
         weights = score_cfg.get("weights", {}) if isinstance(score_cfg, dict) else {}
         self.score_weight_ap = float(weights.get("ap", 0.55))
@@ -186,6 +189,24 @@ class LabelEmpiricalTuner:
         )
         self.require_positive_ci_delta = bool(promo_cfg.get("require_positive_ci_delta", True))
         self.consensus_eps = float(promo_cfg.get("consensus_eps", 1e-9))
+        adaptive_cfg = self.tuning_cfg.get("adaptive_refine", {})
+        self.adaptive_refine_enabled = bool(adaptive_cfg.get("enabled", True))
+        self.adaptive_refine_tasks = {
+            str(task).strip()
+            for task in adaptive_cfg.get("tasks", ["liq_flow", "bos_cont", "eop", "edp", "hazard"])
+            if str(task).strip()
+        }
+        self.adaptive_refine_top_k = max(int(adaptive_cfg.get("top_k", 2)), 1)
+        self.adaptive_refine_max_extra = max(int(adaptive_cfg.get("max_extra_candidates_per_task", 4)), 0)
+        self.adaptive_refine_include_midpoint = bool(adaptive_cfg.get("include_midpoint", True))
+        self.adaptive_refine_neighbor_multipliers = self._coerce_int_list(
+            adaptive_cfg.get("neighbor_multipliers", [-2, -1, 1, 2]),
+            fallback=[-2, -1, 1, 2],
+            drop_zero=True,
+        )
+        self.adaptive_refine_task_steps = self._coerce_task_int_map(adaptive_cfg.get("step_by_task", {}))
+        self.adaptive_refine_task_min = self._coerce_task_int_map(adaptive_cfg.get("min_horizon_by_task", {}))
+        self.adaptive_refine_task_max = self._coerce_task_int_map(adaptive_cfg.get("max_horizon_by_task", {}))
         self.profile_manager = LabelProfileManager()
 
     def tune(
@@ -219,6 +240,7 @@ class LabelEmpiricalTuner:
                 "consensus_gate": self.require_consensus,
                 "consensus_min_models": self.min_models_for_consensus,
                 "ci_gate": self.require_positive_ci_delta,
+                "adaptive_refine": self.adaptive_refine_enabled,
             },
             style="magenta",
         )
@@ -388,8 +410,13 @@ class LabelEmpiricalTuner:
                     if progress_path is None:
                         return
                     progress_state["updated_at"] = self._utc_now_iso()
-                    progress_state["candidates_completed"] = int(progress_state["candidates_completed"]) + 1
                     tstate = progress_state["tasks"][task]
+                    reported_task_total = int(evt.get("candidate_total", tstate.get("candidates_total", 0)) or 0)
+                    if reported_task_total > int(tstate.get("candidates_total", 0)):
+                        tstate["candidates_total"] = reported_task_total
+                    progress_state["candidates_total"] = int(
+                        sum(int(v.get("candidates_total", 0)) for v in progress_state.get("tasks", {}).values())
+                    )
                     tstate["candidates_completed"] = max(
                         int(tstate.get("candidates_completed", 0)),
                         int(evt.get("candidate_index", tstate.get("candidates_completed", 0))),
@@ -408,7 +435,7 @@ class LabelEmpiricalTuner:
                     )
                     progress_state["candidates_completed"] = global_done
                     done = float(global_done)
-                    total = max(float(progress_state["candidates_total"]), 1.0)
+                    total = max(float(progress_state.get("candidates_total", 0)), 1.0)
                     elapsed = max((datetime.now(timezone.utc) - started_wall).total_seconds(), 1e-6)
                     rate = done / elapsed
                     remaining = max(total - done, 0.0)
@@ -419,7 +446,9 @@ class LabelEmpiricalTuner:
                     progress_state["elapsed_hms"] = self._human_duration(elapsed)
                     progress_state["percent_complete"] = float(done / total)
                     progress_state["percent_remaining"] = float(1.0 - progress_state["percent_complete"])
-                    progress_state["candidates_remaining"] = int(max(progress_state["candidates_total"] - progress_state["candidates_completed"], 0))
+                    progress_state["candidates_remaining"] = int(
+                        max(int(progress_state.get("candidates_total", 0)) - progress_state["candidates_completed"], 0)
+                    )
 
                     task_done = int(evt.get("candidate_index", 0))
                     task_total = max(int(evt.get("candidate_total", 0)), 1)
@@ -483,7 +512,9 @@ class LabelEmpiricalTuner:
                     result_df.to_csv(task_final_path, index=False)
                 if task_checkpoint_path is not None and task_checkpoint_path.exists():
                     task_checkpoint_path.unlink()
-                existing_completed_by_task[task] = int(candidate_totals[task])
+                actual_task_total = int(len(result_df))
+                candidate_totals[task] = actual_task_total
+                existing_completed_by_task[task] = actual_task_total
                 results[task] = {
                     "results": result_df.to_dict(orient="records"),
                     "recommended": recommended,
@@ -515,7 +546,8 @@ class LabelEmpiricalTuner:
                     progress_state["current_task"] = None
                     progress_state["updated_at"] = self._utc_now_iso()
                     progress_state["tasks"][task]["status"] = "done"
-                    progress_state["tasks"][task]["candidates_completed"] = int(candidate_totals[task])
+                    progress_state["tasks"][task]["candidates_total"] = int(actual_task_total)
+                    progress_state["tasks"][task]["candidates_completed"] = int(actual_task_total)
                     progress_state["tasks"][task]["recommended"] = recommended.get("candidate_name")
                     progress_state["tasks"][task]["improvement_vs_baseline"] = improvement
                     progress_state["tasks"][task]["promoted"] = bool(should_promote)
@@ -533,10 +565,15 @@ class LabelEmpiricalTuner:
                         )
                     )
                     progress_state["candidates_completed"] = global_done
-                    total = max(float(progress_state["candidates_total"]), 1.0)
+                    progress_state["candidates_total"] = int(
+                        sum(int(v.get("candidates_total", 0)) for v in progress_state.get("tasks", {}).values())
+                    )
+                    total = max(float(progress_state.get("candidates_total", 0)), 1.0)
                     progress_state["percent_complete"] = float(global_done / total)
                     progress_state["percent_remaining"] = float(1.0 - progress_state["percent_complete"])
-                    progress_state["candidates_remaining"] = int(max(total_candidates - global_done, 0))
+                    progress_state["candidates_remaining"] = int(
+                        max(int(progress_state.get("candidates_total", 0)) - global_done, 0)
+                    )
                     elapsed = max((datetime.now(timezone.utc) - started_wall).total_seconds(), 1e-6)
                     progress_state["elapsed_seconds"] = int(elapsed)
                     progress_state["elapsed_hms"] = self._human_duration(elapsed)
@@ -559,7 +596,11 @@ class LabelEmpiricalTuner:
                     if progress_state
                     else len(selected_tasks) - task_idx
                 )
-                candidates_left = max(total_candidates - int(progress_state.get("candidates_completed", 0)), 0) if progress_state else 0
+                candidates_left = (
+                    max(int(progress_state.get("candidates_total", 0)) - int(progress_state.get("candidates_completed", 0)), 0)
+                    if progress_state
+                    else 0
+                )
                 console_stage(
                     "Remaining",
                     f"tasks_left={tasks_left} candidates_left={candidates_left}",
@@ -667,11 +708,9 @@ class LabelEmpiricalTuner:
         dataset_signature: Optional[str] = None,
     ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         base_cfg = deepcopy(self.labels_cfg[task])
-        candidates = self._build_candidates(task, base_cfg)
-        candidate_map = {
-            self._candidate_name(task, patch): patch
-            for patch in candidates
-        }
+        coarse_candidates = self._build_candidates(task, base_cfg)
+        candidates = list(coarse_candidates)
+        candidate_names = {self._candidate_name(task, patch) for patch in candidates}
         rows_by_name: Dict[str, Dict[str, Any]] = {}
 
         if resume:
@@ -692,14 +731,19 @@ class LabelEmpiricalTuner:
             if not existing_df.empty and "candidate_name" in existing_df.columns:
                 for rec in existing_df.to_dict(orient="records"):
                     cname = str(rec.get("candidate_name") or "")
-                    if cname in candidate_map:
-                        rows_by_name[cname] = rec
+                    if not cname:
+                        continue
+                    rec_task = str(rec.get("task") or "")
+                    if rec_task and rec_task != task:
+                        continue
+                    rows_by_name[cname] = rec
 
         console_stage(
             f"Tuning {task}",
             f"candidates={len(candidates)} cached={len(rows_by_name)}",
             status="info",
         )
+
         X_df, valid_cols = self._prepare_feature_matrix(df15)
         base_labels, _ = self._compute_task_labels(df15, task, base_cfg)
         base_labels = base_labels.astype(int)
@@ -713,77 +757,133 @@ class LabelEmpiricalTuner:
             dataset_signature=dataset_signature,
         )
 
-        for idx, patch in enumerate(candidates, start=1):
-            candidate_name = self._candidate_name(task, patch)
-            if resume and candidate_name in rows_by_name:
-                continue
-            cfg = deepcopy(base_cfg)
-            cfg.update(patch)
-            label_series, hazard_time = self._compute_task_labels(df15, task, cfg)
-            positive_rate = float(pd.Series(label_series).mean()) if len(label_series) else 0.0
-            eval_pack = self._baseline_predictability(
-                X_df,
-                label_series,
-                task=task,
-                purge_bars=self._label_span_from_cfg(cfg),
-                positive_rate=positive_rate,
-                model_param_overrides=task_model_params,
-            )
-            primary = eval_pack["primary"]
-            consensus = eval_pack["consensus"]
-            row = {
-                "task": task,
-                "candidate_name": candidate_name,
-                "is_baseline": int(self._is_same_candidate(base_cfg, patch)),
-                **patch,
-                "positive_rate": positive_rate,
-                "positives": int(np.sum(label_series)),
-                "negatives": int(len(label_series) - np.sum(label_series)),
-                "cv_ap": float(primary.get("cv_ap", 0.0)),
-                "cv_auc": float(primary.get("cv_auc", 0.5)),
-                "objective_score": float(consensus.get("objective_score", 0.0)),
-                "objective_ci95_low": float(consensus.get("objective_ci95_low", 0.0)),
-                "objective_ci95_high": float(consensus.get("objective_ci95_high", 0.0)),
-                "consensus_wins": int(consensus.get("consensus_wins", 0)),
-                "model_count": int(consensus.get("model_count", 0)),
-                "primary_model": str(primary.get("model_name", "")),
-                "label_span_bars": int(self._label_span_from_cfg(cfg)),
-                "dataset_signature": dataset_signature,
-                "tuning_schema": self._tuning_schema(),
-            }
-            for model_name, metrics in eval_pack.get("by_model", {}).items():
-                row[f"{model_name}_cv_ap"] = float(metrics.get("cv_ap", 0.0))
-                row[f"{model_name}_cv_auc"] = float(metrics.get("cv_auc", 0.5))
-                row[f"{model_name}_objective_score"] = float(metrics.get("objective_score", 0.0))
-                row[f"{model_name}_objective_ci95_low"] = float(metrics.get("objective_ci95_low", 0.0))
-                row[f"{model_name}_objective_ci95_high"] = float(metrics.get("objective_ci95_high", 0.0))
-                row[f"{model_name}_fold_count"] = int(metrics.get("fold_count", 0))
-            if hazard_time is not None and len(hazard_time):
-                row["median_hazard_time"] = float(np.nanmedian(hazard_time))
-            rows_by_name[candidate_name] = row
-            checkpoint_target = checkpoint_path or resume_path
-            if checkpoint_target is not None:
-                checkpoint_target.parent.mkdir(parents=True, exist_ok=True)
-                pd.DataFrame(list(rows_by_name.values())).to_csv(checkpoint_target, index=False)
-            if progress_hook is not None:
-                progress_hook(
-                    {
-                        "task": task,
-                        "candidate_index": idx,
-                        "candidate_total": len(candidates),
-                        "candidate_name": row["candidate_name"],
-                        "objective_score": row["objective_score"],
-                        "cv_ap": row["cv_ap"],
-                        "cv_auc": row["cv_auc"],
-                        "positive_rate": row["positive_rate"],
-                        "is_baseline": bool(row["is_baseline"]),
-                        "objective_ci95_low": row["objective_ci95_low"],
-                        "objective_ci95_high": row["objective_ci95_high"],
-                        "consensus_wins": row["consensus_wins"],
-                        "model_count": row["model_count"],
-                        "tuning_schema": row["tuning_schema"],
-                    }
+        def _scored_in_scope() -> int:
+            return int(sum(1 for name in candidate_names if name in rows_by_name))
+
+        def _score_candidates(candidate_list: List[Dict[str, Any]], phase: str) -> None:
+            for patch in candidate_list:
+                candidate_name = self._candidate_name(task, patch)
+                if candidate_name not in candidate_names:
+                    candidates.append(patch)
+                    candidate_names.add(candidate_name)
+                if resume and candidate_name in rows_by_name:
+                    continue
+                done_before = _scored_in_scope()
+                candidate_started = time.perf_counter()
+                console_stage(
+                    "Candidate",
+                    f"{task} {done_before + 1}/{len(candidates)} start | {candidate_name} [{phase}]",
+                    status="info",
                 )
+                cfg = deepcopy(base_cfg)
+                cfg.update(patch)
+                label_series, hazard_time = self._compute_task_labels(df15, task, cfg)
+                positive_rate = float(pd.Series(label_series).mean()) if len(label_series) else 0.0
+                console_stage(
+                    "Candidate labels",
+                    (
+                        f"{task} {done_before + 1}/{len(candidates)} "
+                        f"positives={fmt_num(int(np.sum(label_series)))} "
+                        f"rate={positive_rate:.4f}"
+                    ),
+                    status="info",
+                )
+                eval_pack = self._baseline_predictability(
+                    X_df,
+                    label_series,
+                    task=task,
+                    purge_bars=self._label_span_from_cfg(cfg),
+                    positive_rate=positive_rate,
+                    model_param_overrides=task_model_params,
+                )
+                primary = eval_pack["primary"]
+                consensus = eval_pack["consensus"]
+                row = {
+                    "task": task,
+                    "candidate_name": candidate_name,
+                    "is_baseline": int(self._is_same_candidate(base_cfg, patch)),
+                    **patch,
+                    "search_phase": phase,
+                    "positive_rate": positive_rate,
+                    "positives": int(np.sum(label_series)),
+                    "negatives": int(len(label_series) - np.sum(label_series)),
+                    "cv_ap": float(primary.get("cv_ap", 0.0)),
+                    "cv_auc": float(primary.get("cv_auc", 0.5)),
+                    "objective_score": float(consensus.get("objective_score", 0.0)),
+                    "objective_ci95_low": float(consensus.get("objective_ci95_low", 0.0)),
+                    "objective_ci95_high": float(consensus.get("objective_ci95_high", 0.0)),
+                    "consensus_wins": int(consensus.get("consensus_wins", 0)),
+                    "model_count": int(consensus.get("model_count", 0)),
+                    "primary_model": str(primary.get("model_name", "")),
+                    "label_span_bars": int(self._label_span_from_cfg(cfg)),
+                    "dataset_signature": dataset_signature,
+                    "tuning_schema": self._tuning_schema(),
+                }
+                for model_name, metrics in eval_pack.get("by_model", {}).items():
+                    row[f"{model_name}_cv_ap"] = float(metrics.get("cv_ap", 0.0))
+                    row[f"{model_name}_cv_auc"] = float(metrics.get("cv_auc", 0.5))
+                    row[f"{model_name}_objective_score"] = float(metrics.get("objective_score", 0.0))
+                    row[f"{model_name}_objective_ci95_low"] = float(metrics.get("objective_ci95_low", 0.0))
+                    row[f"{model_name}_objective_ci95_high"] = float(metrics.get("objective_ci95_high", 0.0))
+                    row[f"{model_name}_fold_count"] = int(metrics.get("fold_count", 0))
+                if hazard_time is not None and len(hazard_time):
+                    row["median_hazard_time"] = float(np.nanmedian(hazard_time))
+                rows_by_name[candidate_name] = row
+                done_after = _scored_in_scope()
+                console_stage(
+                    "Candidate done",
+                    (
+                        f"{task} {done_after}/{len(candidates)} objective={row['objective_score']:.4f} "
+                        f"elapsed={self._human_duration(time.perf_counter() - candidate_started)}"
+                    ),
+                    status="ok",
+                )
+                checkpoint_target = checkpoint_path or resume_path
+                if checkpoint_target is not None:
+                    checkpoint_target.parent.mkdir(parents=True, exist_ok=True)
+                    pd.DataFrame(list(rows_by_name.values())).to_csv(checkpoint_target, index=False)
+                if progress_hook is not None:
+                    progress_hook(
+                        {
+                            "task": task,
+                            "candidate_index": done_after,
+                            "candidate_total": len(candidates),
+                            "candidate_name": row["candidate_name"],
+                            "objective_score": row["objective_score"],
+                            "cv_ap": row["cv_ap"],
+                            "cv_auc": row["cv_auc"],
+                            "positive_rate": row["positive_rate"],
+                            "is_baseline": bool(row["is_baseline"]),
+                            "objective_ci95_low": row["objective_ci95_low"],
+                            "objective_ci95_high": row["objective_ci95_high"],
+                            "consensus_wins": row["consensus_wins"],
+                            "model_count": row["model_count"],
+                            "search_phase": phase,
+                            "tuning_schema": row["tuning_schema"],
+                        }
+                    )
+
+        _score_candidates(coarse_candidates, phase="coarse")
+
+        refine_candidates = self._build_refined_horizon_candidates(
+            task=task,
+            base_cfg=base_cfg,
+            coarse_candidates=coarse_candidates,
+            rows_by_name=rows_by_name,
+        )
+        if refine_candidates:
+            for patch in refine_candidates:
+                cname = self._candidate_name(task, patch)
+                if cname in candidate_names:
+                    continue
+                candidates.append(patch)
+                candidate_names.add(cname)
+            console_stage(
+                "Adaptive refine",
+                f"{task}: added {len(refine_candidates)} local horizon candidates",
+                status="info",
+            )
+            _score_candidates(refine_candidates, phase="refine")
 
         result_df = pd.DataFrame(list(rows_by_name.values()))
         if result_df.empty:
@@ -813,6 +913,144 @@ class LabelEmpiricalTuner:
             seen.add(key)
             unique.append(item)
         return unique
+
+    def _build_refined_horizon_candidates(
+        self,
+        *,
+        task: str,
+        base_cfg: Dict[str, Any],
+        coarse_candidates: List[Dict[str, Any]],
+        rows_by_name: Dict[str, Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not self.adaptive_refine_enabled or task not in self.adaptive_refine_tasks:
+            return []
+
+        coarse_horizons = sorted(
+            {
+                int(patch.get("horizon_bars"))
+                for patch in coarse_candidates
+                if "horizon_bars" in patch and pd.notna(patch.get("horizon_bars"))
+            }
+        )
+        if not coarse_horizons:
+            return []
+
+        scored_rows: List[Tuple[float, int]] = []
+        existing_horizons = set(coarse_horizons)
+        if "horizon_bars" in base_cfg and pd.notna(base_cfg.get("horizon_bars")):
+            try:
+                existing_horizons.add(int(base_cfg.get("horizon_bars")))
+            except Exception:
+                pass
+
+        for row in rows_by_name.values():
+            try:
+                row_task = str(row.get("task") or task)
+            except Exception:
+                row_task = task
+            if row_task != task:
+                continue
+            raw_h = row.get("horizon_bars")
+            if raw_h is None or pd.isna(raw_h):
+                continue
+            try:
+                horizon = int(round(float(raw_h)))
+            except Exception:
+                continue
+            existing_horizons.add(horizon)
+            try:
+                score = float(row.get("objective_score", 0.0))
+            except Exception:
+                score = 0.0
+            scored_rows.append((score, horizon))
+
+        if not scored_rows:
+            return []
+
+        scored_rows.sort(key=lambda x: x[0], reverse=True)
+        seed_horizons: List[int] = []
+        for _, horizon in scored_rows:
+            if horizon in seed_horizons:
+                continue
+            seed_horizons.append(horizon)
+            if len(seed_horizons) >= self.adaptive_refine_top_k:
+                break
+        if not seed_horizons:
+            return []
+
+        diffs = [
+            int(abs(b - a))
+            for a, b in zip(coarse_horizons[:-1], coarse_horizons[1:])
+            if int(abs(b - a)) > 0
+        ]
+        step = int(self.adaptive_refine_task_steps.get(task, min(diffs) if diffs else 1))
+        step = max(step, 1)
+
+        min_bound = int(self.adaptive_refine_task_min.get(task, max(1, min(coarse_horizons) - step)))
+        max_bound = int(self.adaptive_refine_task_max.get(task, max(coarse_horizons) + step))
+        if min_bound > max_bound:
+            min_bound, max_bound = max_bound, min_bound
+
+        candidate_horizons: List[int] = []
+        for seed in seed_horizons:
+            for mult in self.adaptive_refine_neighbor_multipliers:
+                cand = int(seed + (mult * step))
+                if cand < min_bound or cand > max_bound:
+                    continue
+                if cand in existing_horizons or cand in candidate_horizons:
+                    continue
+                candidate_horizons.append(cand)
+
+        if self.adaptive_refine_include_midpoint and len(seed_horizons) >= 2:
+            midpoint = int(round((seed_horizons[0] + seed_horizons[1]) / 2.0))
+            if (
+                midpoint >= min_bound
+                and midpoint <= max_bound
+                and midpoint not in existing_horizons
+                and midpoint not in candidate_horizons
+            ):
+                candidate_horizons.append(midpoint)
+
+        if not candidate_horizons:
+            return []
+
+        best_seed = int(seed_horizons[0])
+        candidate_horizons = sorted(candidate_horizons, key=lambda h: (abs(h - best_seed), h))
+        if self.adaptive_refine_max_extra > 0:
+            candidate_horizons = candidate_horizons[: self.adaptive_refine_max_extra]
+        return [{"horizon_bars": int(h)} for h in candidate_horizons]
+
+    @staticmethod
+    def _coerce_task_int_map(raw: Any) -> Dict[str, int]:
+        if not isinstance(raw, dict):
+            return {}
+        out: Dict[str, int] = {}
+        for key, value in raw.items():
+            try:
+                out[str(key).strip()] = int(value)
+            except Exception:
+                continue
+        return out
+
+    @staticmethod
+    def _coerce_int_list(
+        raw: Any,
+        *,
+        fallback: List[int],
+        drop_zero: bool = False,
+    ) -> List[int]:
+        source = raw if isinstance(raw, list) else fallback
+        out: List[int] = []
+        for val in source:
+            try:
+                iv = int(val)
+            except Exception:
+                continue
+            if drop_zero and iv == 0:
+                continue
+            if iv not in out:
+                out.append(iv)
+        return out or list(fallback)
 
     @staticmethod
     def _task_partial_path(out_root: Optional[Path], task: str) -> Optional[Path]:
@@ -1072,11 +1310,26 @@ class LabelEmpiricalTuner:
         return True
 
     def _tuning_schema(self) -> str:
+        task_steps = ",".join(
+            f"{k}:{v}" for k, v in sorted(self.adaptive_refine_task_steps.items())
+        ) or "-"
+        task_bounds_min = ",".join(
+            f"{k}:{v}" for k, v in sorted(self.adaptive_refine_task_min.items())
+        ) or "-"
+        task_bounds_max = ",".join(
+            f"{k}:{v}" for k, v in sorted(self.adaptive_refine_task_max.items())
+        ) or "-"
         return (
-            f"v3|models={','.join(self.proxy_models)}|hpo={int(self.use_hpo)}|hpo_default={int(self.default_hpo_trials)}"
+            f"v4|models={','.join(self.proxy_models)}|hpo={int(self.use_hpo)}|hpo_default={int(self.default_hpo_trials)}"
             f"|cv={int(self.cv_splits)}|embargo={int(self.embargo_bars)}"
             f"|consensus={int(self.min_models_for_consensus)}|ci={int(self.require_positive_ci_delta)}"
             f"|score={self.score_weight_ap:.3f},{self.score_weight_auc:.3f},{self.score_weight_balance:.3f},{self.score_weight_topk:.3f}"
+            f"|refine={int(self.adaptive_refine_enabled)}"
+            f"|refine_tasks={','.join(sorted(self.adaptive_refine_tasks))}"
+            f"|refine_topk={int(self.adaptive_refine_top_k)}|refine_extra={int(self.adaptive_refine_max_extra)}"
+            f"|refine_mid={int(self.adaptive_refine_include_midpoint)}"
+            f"|refine_mult={','.join(str(x) for x in self.adaptive_refine_neighbor_multipliers)}"
+            f"|refine_step={task_steps}|refine_min={task_bounds_min}|refine_max={task_bounds_max}"
         )
 
     @staticmethod
@@ -1165,6 +1418,15 @@ class LabelEmpiricalTuner:
                 continue
             default_params = self._default_params_for_model(task, model_name)
             trials = self._hpo_trials_for_model(model_name)
+            model_started = time.perf_counter()
+            console_stage(
+                "Model prep",
+                (
+                    f"{task}/{model_name} | rows={fmt_num(len(X_df))} "
+                    f"cv_folds={len(splits)} hpo_trials={trials if self.use_hpo else 0}"
+                ),
+                status="info",
+            )
             if (
                 self.use_hpo
                 and trials > 0
@@ -1183,8 +1445,15 @@ class LabelEmpiricalTuner:
                     n_trials=trials,
                 )
                 task_params[model_name] = best
+                source = "hpo"
             else:
                 task_params[model_name] = default_params
+                source = "default"
+            console_stage(
+                "Model prep done",
+                f"{task}/{model_name} source={source} elapsed={self._human_duration(time.perf_counter() - model_started)}",
+                status="ok",
+            )
         self.model_params_cache[cache_key] = deepcopy(task_params)
         return task_params
 
@@ -1360,6 +1629,8 @@ class LabelEmpiricalTuner:
         if optuna is None or n_trials <= 0:
             return default_params
 
+        hpo_started = time.perf_counter()
+
         def objective(trial):
             params = self._sample_params_for_model(trial, task, model_name, default_params)
             metrics = self._evaluate_proxy_model(
@@ -1372,6 +1643,25 @@ class LabelEmpiricalTuner:
             )
             return -float(metrics.get("objective_score", 0.0))
 
+        def _on_trial(study, trial):  # pragma: no cover - runtime telemetry
+            done = len(study.trials)
+            best_obj = -float(study.best_value) if study.best_trial is not None else 0.0
+            elapsed = time.perf_counter() - hpo_started
+            eta = None
+            if done > 0:
+                rate = elapsed / done
+                eta = max(int((n_trials - done) * rate), 0)
+            console_stage(
+                "HPO",
+                (
+                    f"{task}/{model_name} trial {done}/{n_trials} "
+                    f"best_objective={best_obj:.4f} "
+                    f"elapsed={self._human_duration(elapsed)} "
+                    f"eta={self._human_duration(eta)}"
+                ),
+                status="info",
+            )
+
         try:
             try:
                 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -1380,7 +1670,12 @@ class LabelEmpiricalTuner:
             study = optuna.create_study(direction="minimize")
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", category=ConvergenceWarning)
-                study.optimize(objective, n_trials=int(n_trials), show_progress_bar=False)
+                study.optimize(
+                    objective,
+                    n_trials=int(n_trials),
+                    callbacks=[_on_trial],
+                    show_progress_bar=False,
+                )
             best = dict(default_params)
             best.update(study.best_params)
             return best
@@ -1667,7 +1962,22 @@ class LabelEmpiricalTuner:
             if not dt_series.empty:
                 first_dt = dt_series.iloc[0].isoformat()
                 last_dt = dt_series.iloc[-1].isoformat()
-        return f"rows={len(df15)}|first_dt={first_dt}|last_dt={last_dt}"
+        # Include schema + sampled content hash so resume caches are invalidated
+        # when engineered feature values change while date span stays identical.
+        schema_blob = "|".join(f"{c}:{str(df15[c].dtype)}" for c in df15.columns)
+        schema_hash = hashlib.sha1(schema_blob.encode("utf-8")).hexdigest()[:12]
+
+        if len(df15) <= 20000:
+            sample = df15
+        else:
+            sample = pd.concat([df15.head(10000), df15.tail(10000)], axis=0, ignore_index=False)
+        sample_hash_values = pd.util.hash_pandas_object(sample, index=True).values
+        sample_hash = hashlib.sha1(sample_hash_values.tobytes()).hexdigest()[:16]
+
+        return (
+            f"rows={len(df15)}|first_dt={first_dt}|last_dt={last_dt}"
+            f"|schema={schema_hash}|sample={sample_hash}"
+        )
 
     def _write_progress_snapshot(self, path: Optional[Path], payload: Dict[str, Any]) -> None:
         if path is None:

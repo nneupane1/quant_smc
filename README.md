@@ -199,7 +199,7 @@ The engineered feature space includes:
 | Volatility | ATR, realized vol, vol z-score, range percent |
 | Liquidity | wick pressure, liquidity proximity, sweep strength, absorption proxies |
 | Regime | `12h` regime state and regime probabilities |
-| Session | session flags, session weights, market-hour context |
+| Session | session flags, session weights, session bucket state, minutes-from-open/to-overlap-close, session-relative volume/range/wick percentiles, Asia/London distance features |
 | Joined HTF state | `1h`, `6h`, and `12h` context projected onto the `15m` spine |
 
 ### Main Feature Artifact
@@ -209,6 +209,8 @@ The canonical BTCUSD feature output is:
 - `artifacts/features/BTCUSD/BTCUSD_features.csv`
 
 This file is the substrate for labels and downstream training.
+
+The session layer is now first-class. Beyond one-hot session flags, the feature graph carries explicit execution-time context such as bucketized market quality (`dead_zone`, `pre_expansion`, `expansion`, `overlap`), time-to/from key opens, overlap breakout markers, and session-relative diagnostics. This allows the runtime to distinguish structurally similar setups that occur in very different liquidity conditions.
 
 ## 8. Labeling And Supervised Targets
 
@@ -269,6 +271,8 @@ The current modeling contract is:
 ### Training Contract
 
 The trained models in this repository are not interchangeable generic classifiers. Each one exists to answer a specific trading question over a specific slice of the engineered state space. The correct way to reason about the stack is therefore model-by-model rather than as a single monolith.
+
+Before model fitting, the trainer now applies a feature-selection hygiene pass: constant/near-constant pruning, high-missingness pruning, exact-duplicate removal, and Pearson-correlation clustering for numeric columns. Optional mutual-information filtering is then applied per classification target. This keeps specialist and stacker inputs cleaner and reduces redundancy propagation into confluence layers.
 
 | Model | Target | Feature Scope | Why It Exists | Main Runtime Use |
 |---|---|---|---|---|
@@ -349,6 +353,17 @@ The current baseline is a ticket-based capital policy:
 | MPC | available but disabled by default |
 
 This means the system compounds during healthy cycles, but it is designed to protect profits and cool down when danger signals intensify.
+
+### Session-Aware Monetization Policy
+
+Execution policy now includes a configurable session layer that modulates:
+
+- confluence score multiplier and threshold offsets by session bucket
+- pre-trade gate strictness by session bucket (flow/hazard/session-weight requirements)
+- position size multipliers by session bucket
+- ticket capital multipliers by session bucket
+
+This keeps the engine running 24/7 for telemetry while explicitly treating overlap and expansion windows as higher-quality monetization periods than dead-hours flow.
 
 ### Profit Ladder And Hazard
 
@@ -586,7 +601,40 @@ These are the human-friendly top-level scripts that make the pipeline explicit:
 - `train_BTCUSD_confluence_model.py`
 - `train_BTCUSD_hazard_model.py`
 - `train_BTCUSD_quantile_model.py`
+- `train_BTCUSD_tcn_model.py` (deep-learning benchmark runner)
+- `train_BTCUSD_all_tcn_models.py` (sequential TCN specialist batch runner)
+- `train_BTCUSD_liq_flow_tcn_model.py`
+- `train_BTCUSD_bos_cont_tcn_model.py`
+- `train_BTCUSD_flow_1h_tcn_model.py`
+- `train_BTCUSD_momo_tcn_model.py`
+- `train_BTCUSD_eop_tcn_model.py`
+- `train_BTCUSD_edp_tcn_model.py`
 - `tune_BTCUSD_label_horizons.py`
+
+TCN launchers require PyTorch in the active interpreter:
+
+```bash
+pip install torch
+```
+
+Batch TCN run across all specialist targets:
+
+```bash
+python train_BTCUSD_all_tcn_models.py --trials 20 --cv-splits 4
+```
+
+TCN HPO now supports SQLite-backed resume by default under each target artifact folder, so interrupted runs can continue without restarting from trial 1.
+
+During long TCN runs, live progress is persisted to:
+
+- `artifacts/train/BTCUSD/<target>_tcn/hpo_progress.json` (latest snapshot)
+- `artifacts/train/BTCUSD/<target>_tcn/hpo_progress.ndjson` (event history)
+
+Example monitor command:
+
+```bash
+tail -f artifacts/train/BTCUSD/flow_1h_tcn/hpo_progress.ndjson
+```
 
 ### One-Command Live-Style Rooms
 
@@ -596,6 +644,7 @@ If you want simple launch commands (no long CLI flags), use:
 python run_BTCUSD_backtest_live_room.py
 python run_BTCUSD_forward_live_room.py
 python run_BTCUSD_paper_live_room.py
+python run_BTCUSD_stress_matrix.py
 ```
 
 These wrappers automatically:
@@ -611,6 +660,23 @@ UI selection can be controlled with:
 - `QUANT_UI_SURFACE=next` (default): React terminal, Streamlit fallback
 - `QUANT_UI_SURFACE=streamlit`: Streamlit only
 - `QUANT_UI_SURFACE=both`: React + Streamlit together
+
+### Deterministic Stress Matrix (No Monte Carlo)
+
+After running backtest, you can run a deterministic scenario matrix:
+
+```bash
+python run_BTCUSD_stress_matrix.py
+```
+
+This runner:
+
+- reads backtest ledger artifacts
+- applies fixed deterministic shock scenarios (cost, latency, fill quality, adverse tails)
+- computes scenario metrics (ending equity, max drawdown, VaR/CVaR, ruin proxy)
+- writes reports to `backtest_outputs/stress_matrix/`
+
+Important: this is an offline validation gate. It does not tighten live signal guardrails unless you explicitly enforce it in your deployment promotion policy.
 
 ## 16. BTCUSD Sequential Runbook
 

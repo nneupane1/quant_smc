@@ -104,6 +104,19 @@ features:
   # -----------------------------------------------------
   session:
     timezone: "Europe/Berlin"
+    pre_expansion_minutes: 60
+    london_open_expansion_minutes: 120
+    ny_open_expansion_minutes: 90
+    relative_window_bars: 96
+    breakout_lookback_bars: 16
+    bucket_quality:
+      dead_zone: 0.75
+      pre_expansion: 0.95
+      expansion: 1.05
+      overlap: 1.15
+    asia:
+      start: "00:00"
+      end: "08:00"
     london:
       start: "08:00"
       end: "17:00"

@@ -98,5 +98,17 @@ class ReasoningAttach:
                     "median_r": evr.get("median_r") if isinstance(evr, dict) else None,
                 },
                 "session": row.get("session"),
+                "session_context": {
+                    "bucket": row.get("session_bucket"),
+                    "bucket_id": row.get("session_bucket_id"),
+                    "quality_multiplier": row.get("session_quality_multiplier"),
+                    "session_weight": row.get("session_weight"),
+                    "minutes_since_london_open": row.get("minutes_since_london_open"),
+                    "minutes_since_ny_open": row.get("minutes_since_ny_open"),
+                    "minutes_to_overlap_close": row.get("minutes_to_overlap_close"),
+                    "session_volume_pct": row.get("session_volume_pct"),
+                    "session_range_pct": row.get("session_range_pct"),
+                    "session_wick_asym_pct": row.get("session_wick_asym_pct"),
+                },
             },
         }

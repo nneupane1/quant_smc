@@ -702,34 +702,295 @@ function MarketPanel({ snapshot }: { snapshot: TerminalSnapshot }) {
 }
 
 function PerformancePanel({ snapshot }: { snapshot: TerminalSnapshot }) {
-  const tableRows = snapshot.performance.tradeTable.slice(0, 30);
-  const [selectedTradeId, setSelectedTradeId] = useState<string | null>(tableRows[0]?.tradeId ?? null);
-  const equityCurve = useMemo(() => {
-    const chronological = [...tableRows].reverse();
-    let running = 20_000;
-    return chronological.map((trade) => {
-      running += trade.pnl;
-      return running;
+  type Lookback = "all" | "30d" | "90d" | "180d" | "365d";
+  type SortKey = "entryTs" | "exitTs" | "pnl" | "r" | "holdMinutes" | "fees" | "slippageBps";
+  const allRows = snapshot.performance.tradeTable;
+  const [selectedTradeId, setSelectedTradeId] = useState<string | null>(allRows[0]?.tradeId ?? null);
+  const [lookback, setLookback] = useState<Lookback>("all");
+  const [sideFilter, setSideFilter] = useState<"all" | "long" | "short">("all");
+  const [tierFilter, setTierFilter] = useState("all");
+  const [modelFilter, setModelFilter] = useState("all");
+  const [sessionFilter, setSessionFilter] = useState("all");
+  const [searchText, setSearchText] = useState("");
+  const [sortBy, setSortBy] = useState<SortKey>("entryTs");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+  const [page, setPage] = useState(0);
+  const pageSize = 32;
+
+  const tierOptions = useMemo(
+    () => ["all", ...Array.from(new Set(allRows.map((trade) => trade.tier).filter((value) => Boolean(value)))).sort()],
+    [allRows],
+  );
+  const modelOptions = useMemo(
+    () => ["all", ...Array.from(new Set(allRows.map((trade) => trade.model || "unknown"))).sort()],
+    [allRows],
+  );
+  const sessionOptions = useMemo(
+    () => ["all", ...Array.from(new Set(allRows.map((trade) => trade.session || "unknown"))).sort()],
+    [allRows],
+  );
+
+  const filteredRows = useMemo(() => {
+    const windowDays = lookback === "all" ? null : Number.parseInt(lookback.replace("d", ""), 10);
+    const cutoff = windowDays ? Date.now() - windowDays * 24 * 60 * 60 * 1000 : Number.NEGATIVE_INFINITY;
+    const query = searchText.trim().toLowerCase();
+
+    return allRows.filter((trade) => {
+      if (sideFilter !== "all" && (trade.side || "long") !== sideFilter) return false;
+      if (tierFilter !== "all" && trade.tier !== tierFilter) return false;
+      if (modelFilter !== "all" && (trade.model || "unknown") !== modelFilter) return false;
+      if (sessionFilter !== "all" && (trade.session || "unknown") !== sessionFilter) return false;
+      if (windowDays !== null) {
+        const tradeTs = tradeTsMs(trade);
+        if (!Number.isFinite(tradeTs) || tradeTs < cutoff) return false;
+      }
+      if (!query) return true;
+      return [
+        trade.tradeId,
+        trade.asset,
+        trade.tier,
+        trade.model || "",
+        trade.session || "",
+        trade.regime || "",
+        trade.reason,
+      ]
+        .join(" ")
+        .toLowerCase()
+        .includes(query);
     });
-  }, [tableRows]);
-  const rSeries = useMemo(() => [...tableRows].reverse().map((trade) => trade.r), [tableRows]);
-  const selectedTrade = tableRows.find((trade) => trade.tradeId === selectedTradeId) ?? tableRows[0];
+  }, [allRows, lookback, modelFilter, searchText, sessionFilter, sideFilter, tierFilter]);
+
+  const sortedRows = useMemo(() => {
+    const rows = [...filteredRows];
+    rows.sort((a, b) => {
+      const dir = sortDir === "asc" ? 1 : -1;
+      if (sortBy === "entryTs" || sortBy === "exitTs") {
+        const aTs = Date.parse((sortBy === "entryTs" ? a.entryTs : (a.exitTs || a.entryTs || "")) || "");
+        const bTs = Date.parse((sortBy === "entryTs" ? b.entryTs : (b.exitTs || b.entryTs || "")) || "");
+        if (!Number.isFinite(aTs) && !Number.isFinite(bTs)) return 0;
+        if (!Number.isFinite(aTs)) return 1 * dir;
+        if (!Number.isFinite(bTs)) return -1 * dir;
+        return (aTs - bTs) * dir;
+      }
+      const aValue = Number(a[sortBy] ?? 0);
+      const bValue = Number(b[sortBy] ?? 0);
+      return (aValue - bValue) * dir;
+    });
+    return rows;
+  }, [filteredRows, sortBy, sortDir]);
+
+  const pageCount = Math.max(1, Math.ceil(sortedRows.length / pageSize));
+  const pageRows = useMemo(
+    () => sortedRows.slice(page * pageSize, page * pageSize + pageSize),
+    [page, sortedRows],
+  );
 
   useEffect(() => {
-    if (!tableRows.length) {
+    setPage((current) => Math.min(current, pageCount - 1));
+  }, [pageCount]);
+
+  useEffect(() => {
+    if (!sortedRows.length) {
       setSelectedTradeId(null);
       return;
     }
-    if (!selectedTradeId || !tableRows.some((trade) => trade.tradeId === selectedTradeId)) {
-      setSelectedTradeId(tableRows[0].tradeId);
+    if (!selectedTradeId || !sortedRows.some((trade) => trade.tradeId === selectedTradeId)) {
+      setSelectedTradeId(sortedRows[0].tradeId);
     }
-  }, [selectedTradeId, tableRows]);
+  }, [selectedTradeId, sortedRows]);
+
+  const selectedTrade = sortedRows.find((trade) => trade.tradeId === selectedTradeId) ?? pageRows[0];
+
+  const chronological = useMemo(
+    () => [...sortedRows].sort((a, b) => {
+      const aTs = tradeTsMs(a);
+      const bTs = tradeTsMs(b);
+      if (!Number.isFinite(aTs) && !Number.isFinite(bTs)) return 0;
+      if (!Number.isFinite(aTs)) return 1;
+      if (!Number.isFinite(bTs)) return -1;
+      return aTs - bTs;
+    }),
+    [sortedRows],
+  );
+
+  const equitySeries = useMemo(() => {
+    let running = 20_000;
+    let peak = running;
+    return chronological.map((trade, index) => {
+      running += trade.pnl;
+      peak = Math.max(peak, running);
+      const drawdown = running - peak;
+      return {
+        label: fmtTs(trade.exitTs || trade.entryTs || ""),
+        pnl: trade.pnl,
+        equity: running,
+        drawdown,
+        trades: index + 1,
+      };
+    });
+  }, [chronological]);
+
+  const equityValues = useMemo(() => equitySeries.map((point) => point.equity), [equitySeries]);
+  const drawdownValues = useMemo(() => equitySeries.map((point) => point.drawdown), [equitySeries]);
+  const pnlSequence = useMemo(() => chronological.map((trade) => trade.pnl), [chronological]);
+  const rSequence = useMemo(() => chronological.map((trade) => trade.r), [chronological]);
+  const sequenceLabels = useMemo(
+    () => chronological.map((trade) => fmtTs(trade.exitTs || trade.entryTs || "")),
+    [chronological],
+  );
+
+  const bucketFromRows = (selector: (trade: AuditTrade) => string, limit = 8): Array<{ label: string; pnl: number; trades: number; winRate: number }> => {
+    const map = new Map<string, { pnl: number; trades: number; wins: number }>();
+    for (const trade of sortedRows) {
+      const key = selector(trade) || "unknown";
+      const slot = map.get(key) ?? { pnl: 0, trades: 0, wins: 0 };
+      slot.pnl += trade.pnl;
+      slot.trades += 1;
+      if (trade.pnl > 0) slot.wins += 1;
+      map.set(key, slot);
+    }
+    return [...map.entries()]
+      .map(([label, slot]) => ({
+        label,
+        pnl: slot.pnl,
+        trades: slot.trades,
+        winRate: slot.trades ? (slot.wins / slot.trades) * 100 : 0,
+      }))
+      .sort((a, b) => b.pnl - a.pnl)
+      .slice(0, limit);
+  };
+
+  const byAsset = useMemo(() => bucketFromRows((trade) => trade.asset), [sortedRows]);
+  const byTier = useMemo(() => bucketFromRows((trade) => trade.tier), [sortedRows]);
+  const byModel = useMemo(() => bucketFromRows((trade) => trade.model || "unknown"), [sortedRows]);
+  const bySession = useMemo(() => bucketFromRows((trade) => trade.session || "unknown"), [sortedRows]);
+  const byRegime = useMemo(() => bucketFromRows((trade) => trade.regime || "unknown"), [sortedRows]);
+  const byHold = useMemo(() => {
+    const defs = [
+      { label: "<15m", min: 0, max: 15 },
+      { label: "15m-1h", min: 15, max: 60 },
+      { label: "1h-4h", min: 60, max: 240 },
+      { label: "4h-12h", min: 240, max: 720 },
+      { label: ">12h", min: 720, max: Number.POSITIVE_INFINITY },
+    ];
+    const map = new Map<string, { pnl: number; trades: number; wins: number }>();
+    for (const def of defs) map.set(def.label, { pnl: 0, trades: 0, wins: 0 });
+    for (const trade of sortedRows) {
+      const holdMinutes = Math.max(0, Number(trade.holdMinutes || 0));
+      const bucket = defs.find((def) => holdMinutes >= def.min && holdMinutes < def.max);
+      if (!bucket) continue;
+      const slot = map.get(bucket.label)!;
+      slot.pnl += trade.pnl;
+      slot.trades += 1;
+      if (trade.pnl > 0) slot.wins += 1;
+    }
+    return defs.map((def) => {
+      const slot = map.get(def.label)!;
+      return {
+        label: def.label,
+        pnl: slot.pnl,
+        trades: slot.trades,
+        winRate: slot.trades ? (slot.wins / slot.trades) * 100 : 0,
+      };
+    });
+  }, [sortedRows]);
+
+  const byHour = useMemo(() => {
+    const map = new Map<string, { pnl: number; trades: number; wins: number }>();
+    for (let hour = 0; hour < 24; hour += 1) {
+      map.set(`${String(hour).padStart(2, "0")}:00`, { pnl: 0, trades: 0, wins: 0 });
+    }
+    for (const trade of sortedRows) {
+      const parsed = tradeTsMs(trade);
+      if (!Number.isFinite(parsed)) continue;
+      const hour = new Date(parsed).getUTCHours();
+      const key = `${String(hour).padStart(2, "0")}:00`;
+      const slot = map.get(key)!;
+      slot.pnl += trade.pnl;
+      slot.trades += 1;
+      if (trade.pnl > 0) slot.wins += 1;
+    }
+    return [...map.entries()].map(([label, slot]) => ({
+      label,
+      pnl: slot.pnl,
+      trades: slot.trades,
+      winRate: slot.trades ? (slot.wins / slot.trades) * 100 : 0,
+    }));
+  }, [sortedRows]);
+
+  const weekdayRows = useMemo(() => {
+    const order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const map = new Map<string, { pnl: number; trades: number; wins: number }>();
+    for (const day of order) map.set(day, { pnl: 0, trades: 0, wins: 0 });
+    for (const trade of sortedRows) {
+      const parsed = tradeTsMs(trade);
+      if (!Number.isFinite(parsed)) continue;
+      const weekday = (new Date(parsed).getUTCDay() + 6) % 7;
+      const key = order[weekday];
+      const slot = map.get(key)!;
+      slot.pnl += trade.pnl;
+      slot.trades += 1;
+      if (trade.pnl > 0) slot.wins += 1;
+    }
+    return order.map((label) => {
+      const slot = map.get(label)!;
+      return {
+        label,
+        pnl: slot.pnl,
+        trades: slot.trades,
+        winRate: slot.trades ? (slot.wins / slot.trades) * 100 : 0,
+      };
+    });
+  }, [sortedRows]);
+
+  const monthlyTimeline = useMemo(() => {
+    const map = new Map<string, { pnl: number; trades: number; wins: number; rSum: number }>();
+    for (const trade of chronological) {
+      const parsed = tradeTsMs(trade);
+      if (!Number.isFinite(parsed)) continue;
+      const dt = new Date(parsed);
+      const key = `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}`;
+      const slot = map.get(key) ?? { pnl: 0, trades: 0, wins: 0, rSum: 0 };
+      slot.pnl += trade.pnl;
+      slot.trades += 1;
+      if (trade.pnl > 0) slot.wins += 1;
+      slot.rSum += trade.r;
+      map.set(key, slot);
+    }
+    return [...map.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([label, slot]) => ({
+        label,
+        pnl: slot.pnl,
+        trades: slot.trades,
+        winRate: slot.trades ? (slot.wins / slot.trades) * 100 : 0,
+        avgR: slot.trades ? slot.rSum / slot.trades : 0,
+      }));
+  }, [chronological]);
+
+  const topWinners = useMemo(() => [...sortedRows].sort((a, b) => b.pnl - a.pnl).slice(0, 8), [sortedRows]);
+  const topLosers = useMemo(() => [...sortedRows].sort((a, b) => a.pnl - b.pnl).slice(0, 8), [sortedRows]);
+  const expectancy = useMemo(() => {
+    const pnls = sortedRows.map((trade) => trade.pnl);
+    const rs = sortedRows.map((trade) => trade.r);
+    const winsOnly = pnls.filter((value) => value > 0);
+    const lossesOnly = pnls.filter((value) => value < 0);
+    const avgWin = winsOnly.length ? winsOnly.reduce((a, b) => a + b, 0) / winsOnly.length : 0;
+    const avgLoss = lossesOnly.length ? lossesOnly.reduce((a, b) => a + b, 0) / lossesOnly.length : 0;
+    return {
+      expectancyR: sortedRows.length ? rs.reduce((a, b) => a + b, 0) / sortedRows.length : 0,
+      avgWin,
+      avgLoss,
+      payoffRatio: avgLoss < 0 ? avgWin / Math.abs(avgLoss) : 0,
+      maxDrawdown: Math.abs(drawdownValues.reduce((acc, value) => Math.min(acc, value), 0)),
+    };
+  }, [drawdownValues, sortedRows]);
 
   return (
     <div className="space-y-5">
       <div className="glass-panel p-5">
         <div className="section-kicker">Performance Intelligence</div>
-        <h2 className="mt-2 text-xl font-semibold text-white">PnL, risk-to-reward, and execution quality in one control surface</h2>
+        <h2 className="mt-2 text-xl font-semibold text-white">PnL, attribution, and execution quality at multi-timeframe depth</h2>
         <p className="mt-3 text-sm leading-6 text-slate-300/75">{snapshot.performance.summary}</p>
       </div>
 
@@ -739,18 +1000,144 @@ function PerformancePanel({ snapshot }: { snapshot: TerminalSnapshot }) {
         ))}
       </div>
 
+      <div className="glass-panel p-5">
+        <div className="section-kicker">Trade Lens</div>
+        <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-7">
+          <label className="rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-2">
+            <div className="text-[0.62rem] uppercase tracking-[0.18em] text-slate-400">Lookback</div>
+            <select value={lookback} onChange={(event) => setLookback(event.target.value as Lookback)} className="mt-1 w-full bg-transparent text-sm text-white outline-none">
+              <option value="all">All</option>
+              <option value="30d">30d</option>
+              <option value="90d">90d</option>
+              <option value="180d">180d</option>
+              <option value="365d">365d</option>
+            </select>
+          </label>
+          <label className="rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-2">
+            <div className="text-[0.62rem] uppercase tracking-[0.18em] text-slate-400">Side</div>
+            <select value={sideFilter} onChange={(event) => setSideFilter(event.target.value as "all" | "long" | "short")} className="mt-1 w-full bg-transparent text-sm text-white outline-none">
+              <option value="all">All</option>
+              <option value="long">Long</option>
+              <option value="short">Short</option>
+            </select>
+          </label>
+          <label className="rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-2">
+            <div className="text-[0.62rem] uppercase tracking-[0.18em] text-slate-400">Tier</div>
+            <select value={tierFilter} onChange={(event) => setTierFilter(event.target.value)} className="mt-1 w-full bg-transparent text-sm text-white outline-none">
+              {tierOptions.map((option) => (
+                <option key={option} value={option}>{option}</option>
+              ))}
+            </select>
+          </label>
+          <label className="rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-2">
+            <div className="text-[0.62rem] uppercase tracking-[0.18em] text-slate-400">Model</div>
+            <select value={modelFilter} onChange={(event) => setModelFilter(event.target.value)} className="mt-1 w-full bg-transparent text-sm text-white outline-none">
+              {modelOptions.map((option) => (
+                <option key={option} value={option}>{option}</option>
+              ))}
+            </select>
+          </label>
+          <label className="rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-2">
+            <div className="text-[0.62rem] uppercase tracking-[0.18em] text-slate-400">Session</div>
+            <select value={sessionFilter} onChange={(event) => setSessionFilter(event.target.value)} className="mt-1 w-full bg-transparent text-sm text-white outline-none">
+              {sessionOptions.map((option) => (
+                <option key={option} value={option}>{option}</option>
+              ))}
+            </select>
+          </label>
+          <label className="rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-2">
+            <div className="text-[0.62rem] uppercase tracking-[0.18em] text-slate-400">Sort</div>
+            <select value={sortBy} onChange={(event) => setSortBy(event.target.value as SortKey)} className="mt-1 w-full bg-transparent text-sm text-white outline-none">
+              <option value="entryTs">Entry Time</option>
+              <option value="exitTs">Exit Time</option>
+              <option value="pnl">PnL</option>
+              <option value="r">R Multiple</option>
+              <option value="holdMinutes">Hold</option>
+              <option value="fees">Fees</option>
+              <option value="slippageBps">Slippage</option>
+            </select>
+          </label>
+          <label className="rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-2">
+            <div className="text-[0.62rem] uppercase tracking-[0.18em] text-slate-400">Search</div>
+            <input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="trade / reason / regime" className="mt-1 w-full bg-transparent text-sm text-white placeholder:text-slate-500 outline-none" />
+          </label>
+        </div>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <button
+            onClick={() => {
+              setLookback("all");
+              setSideFilter("all");
+              setTierFilter("all");
+              setModelFilter("all");
+              setSessionFilter("all");
+              setSearchText("");
+              setSortBy("entryTs");
+              setSortDir("desc");
+              setPage(0);
+            }}
+            className="rounded-full border border-cyan/30 bg-cyan/10 px-3 py-1 text-xs uppercase tracking-[0.2em] text-cyan transition hover:border-cyan/50"
+          >
+            Reset Lens
+          </button>
+          <button
+            onClick={() => setSortDir((current) => (current === "asc" ? "desc" : "asc"))}
+            className="rounded-full border border-white/15 bg-white/[0.03] px-3 py-1 text-xs uppercase tracking-[0.2em] text-slate-300 transition hover:border-cyan/35 hover:text-cyan"
+          >
+            Order: {sortDir === "asc" ? "Ascending" : "Descending"}
+          </button>
+          <div className="rounded-full border border-white/10 bg-white/[0.03] px-3 py-1 text-xs uppercase tracking-[0.16em] text-slate-400">
+            Showing {sortedRows.length} / {allRows.length} trades
+          </div>
+        </div>
+      </div>
+
       <div className="grid gap-4 xl:grid-cols-2">
-        <ChartCard
-          title="Equity Curve"
-          subtitle="Simulated equity trajectory from closed trades"
-        >
-          <LineSurface values={equityCurve} color="#52d7ff" fill="rgba(82, 215, 255, 0.14)" />
+        <ChartCard title="Equity Curve (Filtered)" subtitle="Hover for exact timestamp and equity level">
+          <InteractiveLineSurface
+            values={equityValues}
+            labels={sequenceLabels}
+            color="#52d7ff"
+            fill="rgba(82, 215, 255, 0.14)"
+            valueFormatter={(value) => fmtUsd(value)}
+          />
         </ChartCard>
-        <ChartCard
-          title="R-Multiple Distribution"
-          subtitle="Chronological trade R outcomes"
-        >
-          <BarSurface values={rSeries} positiveColor="#2ae6b8" negativeColor="#ff6b88" />
+        <ChartCard title="Drawdown Surface (Filtered)" subtitle="Underwater profile from running equity highs">
+          <InteractiveLineSurface
+            values={drawdownValues}
+            labels={sequenceLabels}
+            color="#ff6b88"
+            fill="rgba(255, 107, 136, 0.16)"
+            valueFormatter={(value) => fmtSignedUsd(value)}
+          />
+        </ChartCard>
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-3">
+        <ChartCard title="PnL Sequence" subtitle="Chronological trade-by-trade result">
+          <InteractiveBarSurface
+            values={pnlSequence}
+            labels={sequenceLabels}
+            positiveColor="#2ae6b8"
+            negativeColor="#ff6b88"
+            valueFormatter={(value) => fmtSignedUsd(value)}
+          />
+        </ChartCard>
+        <ChartCard title="R Sequence" subtitle="Risk-adjusted distribution over time">
+          <InteractiveBarSurface
+            values={rSequence}
+            labels={sequenceLabels}
+            positiveColor="#52d7ff"
+            negativeColor="#f6b63c"
+            valueFormatter={(value) => `${value.toFixed(2)}R`}
+          />
+        </ChartCard>
+        <ChartCard title="Hourly Edge (UTC)" subtitle="PnL attribution by execution hour">
+          <BarSurface
+            values={byHour.map((row) => row.pnl)}
+            labels={byHour.map((row) => row.label.slice(0, 2))}
+            positiveColor="#2ae6b8"
+            negativeColor="#ff6b88"
+          />
         </ChartCard>
       </div>
 
@@ -770,27 +1157,100 @@ function PerformancePanel({ snapshot }: { snapshot: TerminalSnapshot }) {
         ))}
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-2">
-        <BucketPanel title="By Asset" rows={snapshot.performance.byAsset} />
-        <BucketPanel title="By Tier" rows={snapshot.performance.byTier} />
+      <div className="grid gap-4 xl:grid-cols-3">
+        <BucketPanel title="By Asset" rows={byAsset} />
+        <BucketPanel title="By Tier" rows={byTier} />
+        <BucketPanel title="By Model" rows={byModel} />
+        <BucketPanel title="By Session" rows={bySession} />
+        <BucketPanel title="By Regime" rows={byRegime} />
+        <BucketPanel title="By Hold Bucket" rows={byHold} />
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-2">
+        <ChartCard title="Monthly PnL Timeline" subtitle="Aggregated month-on-month edge profile">
+          <BarSurface
+            values={monthlyTimeline.map((row) => row.pnl)}
+            labels={monthlyTimeline.map((row) => row.label.slice(5))}
+            positiveColor="#2ae6b8"
+            negativeColor="#ff6b88"
+          />
+        </ChartCard>
+        <ChartCard title="Weekday Edge" subtitle="Execution quality by day-of-week">
+          <BarSurface
+            values={weekdayRows.map((row) => row.pnl)}
+            labels={weekdayRows.map((row) => row.label)}
+            positiveColor="#52d7ff"
+            negativeColor="#ff6b88"
+          />
+        </ChartCard>
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <MetricCard metric={{ label: "Expectancy", value: `${expectancy.expectancyR.toFixed(3)}R`, tone: expectancy.expectancyR >= 0 ? "teal" : "rose", delta: "avg R / trade" }} />
+        <MetricCard metric={{ label: "Avg Win", value: fmtSignedUsd(expectancy.avgWin), tone: "teal", delta: "winning trades" }} />
+        <MetricCard metric={{ label: "Avg Loss", value: fmtSignedUsd(expectancy.avgLoss), tone: "rose", delta: "losing trades" }} />
+        <MetricCard metric={{ label: "Payoff", value: expectancy.payoffRatio.toFixed(2), tone: expectancy.payoffRatio >= 1 ? "teal" : "amber", delta: "avg win / avg loss" }} />
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-2">
+        <div className="glass-panel p-5">
+          <div className="section-kicker">Top Winners</div>
+          <div className="mt-3 space-y-2">
+            {topWinners.length ? topWinners.map((trade) => (
+              <button
+                key={`winner-${trade.tradeId}-${trade.entryTs}`}
+                onClick={() => setSelectedTradeId(trade.tradeId)}
+                className={`w-full rounded-2xl border px-3 py-2 text-left transition hover:border-teal/40 hover:bg-teal/10 ${
+                  trade.tradeId === selectedTradeId ? "border-cyan/40 bg-cyan/10" : "border-white/10 bg-white/[0.03]"
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="font-mono text-xs text-slate-300">{trade.tradeId}</div>
+                  <div className="text-sm text-teal">{fmtSignedUsd(trade.pnl)}</div>
+                </div>
+                <div className="mt-1 text-xs text-slate-400">{trade.asset} • {trade.model || "unknown"} • {trade.r.toFixed(2)}R</div>
+              </button>
+            )) : <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-3 text-sm text-slate-400">No winners in current filter.</div>}
+          </div>
+        </div>
+        <div className="glass-panel p-5">
+          <div className="section-kicker">Top Losers</div>
+          <div className="mt-3 space-y-2">
+            {topLosers.length ? topLosers.map((trade) => (
+              <button
+                key={`loser-${trade.tradeId}-${trade.entryTs}`}
+                onClick={() => setSelectedTradeId(trade.tradeId)}
+                className={`w-full rounded-2xl border px-3 py-2 text-left transition hover:border-rose/40 hover:bg-rose/10 ${
+                  trade.tradeId === selectedTradeId ? "border-cyan/40 bg-cyan/10" : "border-white/10 bg-white/[0.03]"
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="font-mono text-xs text-slate-300">{trade.tradeId}</div>
+                  <div className="text-sm text-rose">{fmtSignedUsd(trade.pnl)}</div>
+                </div>
+                <div className="mt-1 text-xs text-slate-400">{trade.asset} • {trade.model || "unknown"} • {trade.r.toFixed(2)}R</div>
+              </button>
+            )) : <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-3 text-sm text-slate-400">No losers in current filter.</div>}
+          </div>
+        </div>
       </div>
 
       <div className="glass-panel overflow-hidden">
         <div className="border-b border-white/10 px-5 py-4">
           <div className="section-kicker">Trade Table</div>
-          <div className="mt-2 text-sm text-slate-300">Full trade details for PnL attribution, R-multiple behavior, and execution quality.</div>
+          <div className="mt-2 text-sm text-slate-300">Click any row for full drilldown. Table reflects current filters and sort settings.</div>
         </div>
         <div className="overflow-x-auto">
           <table className="min-w-full text-left text-sm">
-            <thead className="border-b border-white/10 bg-white/[0.03] text-xs uppercase tracking-[0.18em] text-slate-400">
+            <thead className="sticky top-0 z-10 border-b border-white/10 bg-[#08131f]/95 text-xs uppercase tracking-[0.18em] text-slate-400 backdrop-blur">
               <tr>
-                {["Trade", "Asset", "Side", "Tier", "PnL", "R", "Qty", "Notional", "Entry", "Exit", "Hold", "Fees", "Slip", "Reason"].map((header) => (
+                {["Trade", "Asset", "Side", "Tier", "Model", "Session", "Regime", "PnL", "R", "Hold", "Fees", "Slip", "Entry", "Exit", "Reason"].map((header) => (
                   <th key={header} className="px-3 py-3 font-medium">{header}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {tableRows.map((trade) => (
+              {pageRows.map((trade) => (
                 <tr
                   key={`${trade.tradeId}-${trade.entryTs}`}
                   onClick={() => setSelectedTradeId(trade.tradeId)}
@@ -802,39 +1262,69 @@ function PerformancePanel({ snapshot }: { snapshot: TerminalSnapshot }) {
                   <td className="px-3 py-3 font-medium text-white">{trade.asset}</td>
                   <td className={`px-3 py-3 ${trade.side === "short" ? "text-rose" : "text-teal"}`}>{trade.side ?? "long"}</td>
                   <td className="px-3 py-3 text-amber">{trade.tier}</td>
+                  <td className="px-3 py-3 text-slate-200">{trade.model || "-"}</td>
+                  <td className="px-3 py-3 text-slate-300">{trade.session || "-"}</td>
+                  <td className="px-3 py-3 text-slate-300">{trade.regime || "-"}</td>
                   <td className={`px-3 py-3 font-medium ${trade.pnl >= 0 ? "text-teal" : "text-rose"}`}>{fmtSignedUsd(trade.pnl)}</td>
                   <td className="px-3 py-3 text-cyan">{trade.r.toFixed(2)}R</td>
-                  <td className="px-3 py-3 text-slate-200">{trade.qty ? trade.qty.toFixed(4) : "-"}</td>
-                  <td className="px-3 py-3 text-slate-200">{trade.notional ? fmtUsd(trade.notional) : "-"}</td>
-                  <td className="px-3 py-3 text-slate-400">{fmtTs(trade.entryTs)}</td>
-                  <td className="px-3 py-3 text-slate-400">{fmtTs(trade.exitTs || "")}</td>
                   <td className="px-3 py-3 text-slate-300">{trade.holdMinutes ? `${Math.round(trade.holdMinutes)}m` : "-"}</td>
                   <td className="px-3 py-3 text-amber">{trade.fees ? fmtUsd(trade.fees) : "-"}</td>
                   <td className="px-3 py-3 text-slate-300">{trade.slippageBps ? `${trade.slippageBps.toFixed(2)} bps` : "-"}</td>
-                  <td className="px-3 py-3 text-slate-400">{trade.reason}</td>
+                  <td className="px-3 py-3 text-slate-400">{fmtTs(trade.entryTs)}</td>
+                  <td className="px-3 py-3 text-slate-400">{fmtTs(trade.exitTs || "")}</td>
+                  <td className="max-w-[360px] truncate px-3 py-3 text-slate-400" title={trade.reason}>{trade.reason}</td>
                 </tr>
               ))}
-              {tableRows.length === 0 ? (
+              {pageRows.length === 0 ? (
                 <tr>
-                  <td colSpan={14} className="px-4 py-6 text-center text-slate-400">No trade rows available yet.</td>
+                  <td colSpan={15} className="px-4 py-6 text-center text-slate-400">No trade rows available for the current lens.</td>
                 </tr>
               ) : null}
             </tbody>
           </table>
+        </div>
+        <div className="flex items-center justify-between border-t border-white/10 px-5 py-3 text-xs text-slate-400">
+          <div>Page {Math.min(page + 1, pageCount)} / {pageCount}</div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setPage((current) => Math.max(0, current - 1))}
+              disabled={page <= 0}
+              className="rounded-full border border-white/15 px-3 py-1 transition disabled:cursor-not-allowed disabled:opacity-40 hover:border-cyan/40 hover:text-cyan"
+            >
+              Prev
+            </button>
+            <button
+              onClick={() => setPage((current) => Math.min(pageCount - 1, current + 1))}
+              disabled={page >= pageCount - 1}
+              className="rounded-full border border-white/15 px-3 py-1 transition disabled:cursor-not-allowed disabled:opacity-40 hover:border-cyan/40 hover:text-cyan"
+            >
+              Next
+            </button>
+          </div>
         </div>
       </div>
 
       {selectedTrade ? (
         <div className="glass-panel p-5">
           <div className="section-kicker">Selected Trade Drilldown</div>
-          <div className="mt-3 grid gap-3 md:grid-cols-4">
+          <div className="mt-3 grid gap-3 md:grid-cols-5">
             <DrillValue label="Trade" value={selectedTrade.tradeId} />
             <DrillValue label="Asset" value={selectedTrade.asset} />
+            <DrillValue label="Side" value={selectedTrade.side || "long"} tone={selectedTrade.side === "short" ? "rose" : "teal"} />
+            <DrillValue label="Tier" value={selectedTrade.tier} />
+            <DrillValue label="Model" value={selectedTrade.model || "-"} />
+            <DrillValue label="Session" value={selectedTrade.session || "-"} />
+            <DrillValue label="Regime" value={selectedTrade.regime || "-"} />
             <DrillValue label="PnL" value={fmtSignedUsd(selectedTrade.pnl)} tone={selectedTrade.pnl >= 0 ? "teal" : "rose"} />
             <DrillValue label="R Multiple" value={`${selectedTrade.r.toFixed(2)}R`} tone="cyan" />
+            <DrillValue label="Notional" value={selectedTrade.notional ? fmtUsd(selectedTrade.notional) : "-"} />
+            <DrillValue label="Risk USD" value={selectedTrade.riskUsd ? fmtUsd(selectedTrade.riskUsd) : "-"} />
+            <DrillValue label="Hold" value={selectedTrade.holdMinutes ? `${Math.round(selectedTrade.holdMinutes)}m` : "-"} />
+            <DrillValue label="Fees" value={selectedTrade.fees ? fmtUsd(selectedTrade.fees) : "-"} />
+            <DrillValue label="Slippage" value={selectedTrade.slippageBps ? `${selectedTrade.slippageBps.toFixed(2)} bps` : "-"} />
+            <DrillValue label="MAE / MFE" value={`${(selectedTrade.mae || 0).toFixed(2)} / ${(selectedTrade.mfe || 0).toFixed(2)}`} />
             <DrillValue label="Entry" value={fmtTs(selectedTrade.entryTs)} />
             <DrillValue label="Exit" value={fmtTs(selectedTrade.exitTs || "")} />
-            <DrillValue label="Notional" value={selectedTrade.notional ? fmtUsd(selectedTrade.notional) : "-"} />
             <DrillValue label="Reason" value={selectedTrade.reason} />
           </div>
         </div>
@@ -1599,6 +2089,164 @@ function ChartCard({
   );
 }
 
+function InteractiveLineSurface({
+  values,
+  labels,
+  color,
+  fill,
+  valueFormatter,
+}: {
+  values: number[];
+  labels?: string[];
+  color: string;
+  fill?: string;
+  valueFormatter?: (value: number) => string;
+}) {
+  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+  if (!values.length) {
+    return <div className="h-[190px] text-sm text-slate-400">No series yet.</div>;
+  }
+
+  const width = 640;
+  const height = 190;
+  const minValue = Math.min(...values);
+  const maxValue = Math.max(...values);
+  const pad = (maxValue - minValue) * 0.08 || Math.max(Math.abs(maxValue) * 0.02, 1);
+  const minY = minValue - pad;
+  const maxY = maxValue + pad;
+  const span = Math.max(1e-9, maxY - minY);
+  const points = values
+    .map((value, idx) => {
+      const x = (idx / (values.length - 1 || 1)) * width;
+      const y = height - ((value - minY) / span) * height;
+      return `${x},${y}`;
+    })
+    .join(" ");
+  const area = `0,${height} ${points} ${width},${height}`;
+  const activeIndex = hoverIndex ?? (values.length - 1);
+  const activeValue = values[activeIndex] ?? values[values.length - 1];
+  const activeLabel = labels?.[activeIndex] ?? `#${activeIndex + 1}`;
+  const activeX = (activeIndex / (values.length - 1 || 1)) * width;
+  const activeY = height - ((activeValue - minY) / span) * height;
+  const tooltipLeft = `${(activeIndex / (values.length - 1 || 1)) * 100}%`;
+  const gradientId = `surface-interactive-${color.replace(/[^a-zA-Z0-9]/g, "")}`;
+  const zeroY = height - ((0 - minY) / span) * height;
+
+  return (
+    <div className="relative">
+      <div
+        className="pointer-events-none absolute top-2 z-20 -translate-x-1/2 rounded-lg border border-white/15 bg-[#06111d]/95 px-2 py-1 text-xs text-slate-200 shadow-[0_8px_24px_rgba(0,0,0,0.45)]"
+        style={{ left: tooltipLeft }}
+      >
+        <div className="font-mono text-cyan">{valueFormatter ? valueFormatter(activeValue) : activeValue.toFixed(3)}</div>
+        <div className="text-[10px] uppercase tracking-[0.16em] text-slate-400">{activeLabel}</div>
+      </div>
+      <svg
+        width="100%"
+        viewBox={`0 0 ${width} ${height}`}
+        preserveAspectRatio="none"
+        className="h-[190px] w-full"
+        onMouseMove={(event) => {
+          const rect = event.currentTarget.getBoundingClientRect();
+          const ratio = (event.clientX - rect.left) / Math.max(rect.width, 1);
+          const clamped = Math.max(0, Math.min(1, ratio));
+          setHoverIndex(Math.round(clamped * (values.length - 1)));
+        }}
+        onMouseLeave={() => setHoverIndex(null)}
+      >
+        <defs>
+          <linearGradient id={gradientId} x1="0%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stopColor={fill ?? `${color}66`} />
+            <stop offset="100%" stopColor="rgba(0,0,0,0)" />
+          </linearGradient>
+        </defs>
+        <polyline fill={`url(#${gradientId})`} points={area} />
+        <polyline fill="none" stroke={color} strokeWidth="2.4" points={points} vectorEffect="non-scaling-stroke" />
+        <line x1={0} y1={zeroY} x2={width} y2={zeroY} stroke="rgba(148,163,184,0.22)" strokeDasharray="5 4" />
+        <line x1={activeX} y1={0} x2={activeX} y2={height} stroke="rgba(82,215,255,0.42)" strokeDasharray="4 3" />
+        <circle cx={activeX} cy={activeY} r={4.2} fill={color} stroke="rgba(255,255,255,0.85)" strokeWidth="1.1" />
+      </svg>
+    </div>
+  );
+}
+
+function InteractiveBarSurface({
+  values,
+  labels,
+  positiveColor,
+  negativeColor,
+  valueFormatter,
+}: {
+  values: number[];
+  labels?: string[];
+  positiveColor: string;
+  negativeColor: string;
+  valueFormatter?: (value: number) => string;
+}) {
+  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+  if (!values.length) {
+    return <div className="h-[190px] text-sm text-slate-400">No bars yet.</div>;
+  }
+  const width = 640;
+  const height = 190;
+  const maxAbs = Math.max(...values.map((value) => Math.abs(value)), 1);
+  const barWidth = width / values.length;
+  const zeroY = height / 2;
+  const activeIndex = hoverIndex ?? (values.length - 1);
+  const activeValue = values[activeIndex] ?? values[values.length - 1];
+  const activeLabel = labels?.[activeIndex] ?? `#${activeIndex + 1}`;
+  const tooltipLeft = `${((activeIndex + 0.5) / values.length) * 100}%`;
+
+  return (
+    <div className="relative">
+      <div
+        className="pointer-events-none absolute top-2 z-20 -translate-x-1/2 rounded-lg border border-white/15 bg-[#06111d]/95 px-2 py-1 text-xs text-slate-200 shadow-[0_8px_24px_rgba(0,0,0,0.45)]"
+        style={{ left: tooltipLeft }}
+      >
+        <div className={activeValue >= 0 ? "font-mono text-teal" : "font-mono text-rose"}>
+          {valueFormatter ? valueFormatter(activeValue) : activeValue.toFixed(3)}
+        </div>
+        <div className="text-[10px] uppercase tracking-[0.16em] text-slate-400">{activeLabel}</div>
+      </div>
+      <svg
+        width="100%"
+        viewBox={`0 0 ${width} ${height}`}
+        preserveAspectRatio="none"
+        className="h-[190px] w-full"
+        onMouseMove={(event) => {
+          const rect = event.currentTarget.getBoundingClientRect();
+          const ratio = (event.clientX - rect.left) / Math.max(rect.width, 1);
+          const clamped = Math.max(0, Math.min(1, ratio));
+          setHoverIndex(Math.min(values.length - 1, Math.floor(clamped * values.length)));
+        }}
+        onMouseLeave={() => setHoverIndex(null)}
+      >
+        <line x1={0} y1={zeroY} x2={width} y2={zeroY} stroke="rgba(148,163,184,0.28)" strokeDasharray="4 3" />
+        {values.map((value, idx) => {
+          const barHeight = (Math.abs(value) / maxAbs) * (height * 0.42);
+          const x = idx * barWidth + barWidth * 0.14;
+          const y = value >= 0 ? zeroY - barHeight : zeroY;
+          const isActive = idx === activeIndex;
+          return (
+            <rect
+              key={`${idx}-${value}`}
+              x={x}
+              y={y}
+              width={Math.max(2, barWidth * 0.72)}
+              height={Math.max(2, barHeight)}
+              fill={value >= 0 ? positiveColor : negativeColor}
+              opacity={isActive ? 1 : 0.84}
+              rx={2}
+              stroke={isActive ? "rgba(255,255,255,0.75)" : "none"}
+              strokeWidth={isActive ? 1 : 0}
+            />
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
 function LineSurface({
   values,
   color,
@@ -1784,6 +2432,11 @@ function DrillValue({
       <div className={`mt-2 text-sm ${toneClasses[tone].split(" ")[0]}`}>{value}</div>
     </div>
   );
+}
+
+function tradeTsMs(trade: AuditTrade): number {
+  const parsed = Date.parse(trade.exitTs || trade.entryTs || "");
+  return Number.isFinite(parsed) ? parsed : Number.NaN;
 }
 
 function fmtUsd(value: number): string {

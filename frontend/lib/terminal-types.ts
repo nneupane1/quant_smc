@@ -60,6 +60,8 @@ export type AuditTrade = {
   tier: string;
   pnl: number;
   r: number;
+  session?: string;
+  regime?: string;
   entryPrice?: number;
   exitPrice?: number;
   qty?: number;
@@ -67,6 +69,8 @@ export type AuditTrade = {
   riskUsd?: number;
   fees?: number;
   slippageBps?: number;
+  mae?: number;
+  mfe?: number;
   holdMinutes?: number;
   status?: "open" | "closed";
   model?: string;
@@ -101,6 +105,29 @@ export type PerformanceBucket = {
   pnl: number;
   trades: number;
   winRate: number;
+};
+
+export type PerformanceTimelinePoint = {
+  label: string;
+  ts?: string;
+  pnl: number;
+  trades: number;
+  winRate?: number;
+  avgR?: number;
+  equity?: number;
+  drawdown?: number;
+};
+
+export type PerformanceExpectancy = {
+  expectancyR: number;
+  avgWin: number;
+  avgLoss: number;
+  payoffRatio: number;
+  medianPnl: number;
+  medianR: number;
+  maxConsecutiveWins: number;
+  maxConsecutiveLosses: number;
+  maxDrawdown: number;
 };
 
 export type MarketCandle = {
@@ -199,6 +226,20 @@ export type TerminalSnapshot = {
     periods: PerformancePeriod[];
     byAsset: PerformanceBucket[];
     byTier: PerformanceBucket[];
+    byModel?: PerformanceBucket[];
+    bySession?: PerformanceBucket[];
+    byRegime?: PerformanceBucket[];
+    byWeekday?: PerformanceBucket[];
+    byHour?: PerformanceBucket[];
+    byHold?: PerformanceBucket[];
+    topWinners?: AuditTrade[];
+    topLosers?: AuditTrade[];
+    expectancy?: PerformanceExpectancy;
+    timeline?: {
+      equity?: PerformanceTimelinePoint[];
+      daily?: PerformanceTimelinePoint[];
+      monthly?: PerformanceTimelinePoint[];
+    };
     tradeTable: AuditTrade[];
   };
   market: MarketSnapshot;

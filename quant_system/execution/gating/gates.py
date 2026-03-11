@@ -21,6 +21,7 @@ class GateEvaluator:
     def __init__(self, config: Union[Dict[str, Any], Any]):
         cfg = _as_dict(config)
         self.gates = cfg.get("execution", {}).get("gates", {})
+        self.session_policy = cfg.get("execution", {}).get("session_policy", {}).get("gates", {})
         self.strict_mode = bool(self.gates.get("strict_mode", False))
 
         # Sensible defaults if not provided
@@ -55,6 +56,19 @@ class GateEvaluator:
                 "volume_z_min": 0.80,
                 "freshness_bars": 4,
             }
+
+    @staticmethod
+    def _session_bucket(row: pd.Series) -> str:
+        raw = str(row.get("session_bucket", "") or "").strip().lower()
+        if raw in {"dead_zone", "pre_expansion", "expansion", "overlap"}:
+            return raw
+        if bool(row.get("session_overlap", 0)):
+            return "overlap"
+        if bool(row.get("session_pre_expansion", 0)):
+            return "pre_expansion"
+        if bool(row.get("session_expansion", 0)) or bool(row.get("session_london", 0)) or bool(row.get("session_ny", 0)):
+            return "expansion"
+        return "dead_zone"
 
     @staticmethod
     def _get(row: pd.Series, keys, default=None):
@@ -155,6 +169,46 @@ class GateEvaluator:
 
         return True
 
+    def _session_ok(self, row: pd.Series, reasons: list) -> bool:
+        if not isinstance(self.session_policy, dict) or not self.session_policy:
+            return True
+        bucket = self._session_bucket(row)
+        policy = self.session_policy.get(bucket, {})
+        if not isinstance(policy, dict):
+            return True
+
+        if bool(policy.get("observe_only", False)):
+            reasons.append("session_observe_only")
+            return False
+
+        min_weight = policy.get("min_session_weight")
+        if min_weight is not None:
+            try:
+                w = float(row.get("session_weight", 0.0))
+                if w < float(min_weight):
+                    reasons.append("session_weight_low")
+                    return False
+            except Exception:
+                if self.strict_mode:
+                    reasons.append("session_weight_missing")
+                    return False
+
+        flow_prob_min = policy.get("flow_prob_min")
+        if flow_prob_min is not None:
+            flow_prob = self._get(row, ["p_flow_1h", "prob_flow_1h"], None)
+            if flow_prob is None or float(flow_prob) < float(flow_prob_min):
+                reasons.append("session_flow_prob_low")
+                return False
+
+        hazard_max = policy.get("hazard_max")
+        if hazard_max is not None:
+            hazard = self._get(row, ["hazard_score", "hazard"], None)
+            if hazard is not None and float(hazard) > float(hazard_max):
+                reasons.append("session_hazard_high")
+                return False
+
+        return True
+
     def evaluate(self, row_like: Union[pd.Series, Dict[str, Any]], side: str) -> Dict[str, Any]:
         row = row_like if isinstance(row_like, pd.Series) else pd.Series(row_like)
         reasons = []
@@ -162,11 +216,12 @@ class GateEvaluator:
         ocean = self._ocean_ok(row, side, reasons)
         waves = self._waves_ok(row, side, reasons)
         flow = self._flow_ok(row, reasons)
+        session_ok = self._session_ok(row, reasons)
 
-        passed = ocean and waves and flow
+        passed = ocean and waves and flow and session_ok
         return {
             "passed": passed,
             "reasons": reasons,
-            "checks": {"ocean_12h": ocean, "waves_6h": waves, "flow_1h": flow},
+            "checks": {"ocean_12h": ocean, "waves_6h": waves, "flow_1h": flow, "session": session_ok},
             "allow": passed,
         }
