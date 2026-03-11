@@ -41,6 +41,7 @@ The central design promise of the project is research-to-execution parity. The s
 - [8. Labeling And Supervised Targets](#8-labeling-and-supervised-targets)
 - [9. Model Stack](#9-model-stack)
 - [9A. TCN Specialist Benchmark Stack](#9a-tcn-specialist-benchmark-stack)
+- [9B. TCN Design Rationale And Learning Mechanics](#9b-tcn-design-rationale-and-learning-mechanics)
 - [10. Execution, Risk, And Capital Logic](#10-execution-risk-and-capital-logic)
 - [11. Runtime Modes](#11-runtime-modes)
 - [12. Dashboards, Terminal, And Telemetry](#12-dashboards-terminal-and-telemetry)
@@ -456,6 +457,114 @@ For each completed TCN specialist run:
 - `model_state.json` and `train_manifest.json` in target artifact folder
 
 This means trained TCN outputs are inference-ready and version-tracked, not just trial logs.
+
+## 9B. TCN Design Rationale And Learning Mechanics
+
+This section explains, at model-mechanics level, how TCN is used in this repo and why it was selected as the deep-learning challenger.
+
+### Why TCN Instead Of Defaulting To LSTM/GRU
+
+TCN was chosen because it gives a better operational tradeoff for this stack:
+
+1. Causal convolutions make leakage control explicit.
+2. Dilations capture long context without recurrent state propagation.
+3. Training is generally more stable and parallelizable than recurrent unrolling.
+4. It works naturally on the already-engineered `15m` decision frame.
+5. It scales well with high-dimensional tabular-plus-context feature matrices.
+
+TCN is not assumed to always beat trees or LSTM. It is the preferred deep candidate for this repository's data contract and runtime constraints.
+
+### What Happens To Data Before Training
+
+For each target, training operates on the merged feature+label frame. The flow is:
+
+1. Resolve feature columns (prefer tree-manifest-selected features for fair A/B comparison).
+2. Apply leak-safe preprocessing per fold:
+   - imputation
+   - optional clipping
+   - optional scaling
+   - one-hot for categoricals
+3. Convert transformed rows into rolling sequences of shape `[B, T, F]`.
+4. Use endpoint label at index `t` for each sequence ending at `t`.
+
+So the model learns from feature trajectories through time, not independent static rows.
+
+### How Multi-Timeframe Information Enters TCN
+
+Multi-timeframe handling occurs in two layers:
+
+1. Feature engineering aligns `1h`, `6h`, and `12h` context onto each `15m` row.
+2. TCN learns temporal interactions across those aligned rows.
+
+This means cross-timeframe effects are available both as instantaneous context (`15m` row fields) and as temporal evolution across the lookback window.
+
+### Long-Term Dependency Handling
+
+TCN handles long-range dependencies via:
+
+- increasing dilation by block depth
+- stacked temporal blocks
+- residual skip paths
+
+Compared with plain CNN stacks, dilation expands receptive field quickly. Compared with recurrent models, it avoids long-chain hidden-state transport and associated gradient instability.
+
+### How "Neurons" Behave In This TCN
+
+At implementation level, each 1D conv filter acts as a learned time-pattern detector over feature channels. Typical detector behavior:
+
+- short-term filters: local impulse/liquidity/session transitions
+- deeper dilated filters: slower structural/regime flow interactions
+
+After each conv:
+
+- `ReLU` keeps nonlinear capacity
+- dropout regularizes
+- residual adds optimization stability
+
+The final head reads the last temporal state and outputs a logit, then sigmoid probability.
+
+### How Training Actually Proceeds
+
+Per target, the pipeline runs:
+
+1. time-series CV with embargo
+2. Optuna HPO over architecture + optimizer + training knobs
+3. pruner-based early culling of weak trials
+4. best-config re-evaluation + seed-stability checks
+5. final fit on development split
+6. probability calibration
+7. threshold tuning with precision/recall constraints
+8. acceptance gate checks
+9. model + metrics + manifests persisted to registry/artifacts
+
+### High-Dimensional Feature Behavior: TCN vs Trees
+
+For this repo, high-dimensional engineered features include numeric structure metrics, session/regime context, and categorical expansions.
+
+Why TCN can work well:
+
+- temporal filters can learn cross-feature interactions over time directly
+- shared filters across timesteps provide parameter efficiency
+- sequence modeling can capture order-sensitive motifs that row-wise trees only see via handcrafted lags
+
+Why trees still remain strong:
+
+- excellent tabular bias
+- fast iteration
+- robust with smaller compute budgets
+
+Practical policy here: treat tree stack as baseline, TCN as challenger, and promote by measured out-of-sample/stability/acceptance evidence rather than architecture preference.
+
+### TCN vs Tree vs LSTM (Project-Specific View)
+
+| Axis | Trees (`LGBM/XGB`) | TCN | LSTM/GRU |
+|---|---|---|---|
+| Tabular baseline strength | high | medium-high | medium |
+| Native sequence modeling | low (needs lag engineering) | high | high |
+| Long-context efficiency | medium | high (dilation) | medium |
+| Parallel training efficiency | high | high | lower |
+| Runtime/ops simplicity | high | medium | medium-low |
+| Fit for this repo's current contract | baseline production | primary deep challenger | optional deep alternative |
 
 ## 10. Execution, Risk, And Capital Logic
 
