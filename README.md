@@ -40,6 +40,7 @@ The central design promise of the project is research-to-execution parity. The s
 - [7. Feature Engineering](#7-feature-engineering)
 - [8. Labeling And Supervised Targets](#8-labeling-and-supervised-targets)
 - [9. Model Stack](#9-model-stack)
+- [9A. TCN Specialist Benchmark Stack](#9a-tcn-specialist-benchmark-stack)
 - [10. Execution, Risk, And Capital Logic](#10-execution-risk-and-capital-logic)
 - [11. Runtime Modes](#11-runtime-modes)
 - [12. Dashboards, Terminal, And Telemetry](#12-dashboards-terminal-and-telemetry)
@@ -47,6 +48,7 @@ The central design promise of the project is research-to-execution parity. The s
 - [14. Environment And Secrets](#14-environment-and-secrets)
 - [15. Main Entry Points](#15-main-entry-points)
 - [16. BTCUSD Sequential Runbook](#16-btcusd-sequential-runbook)
+- [16A. BTCUSD TCN-Only Sequential Runbook](#16a-btcusd-tcn-only-sequential-runbook)
 - [17. Label Horizon Governance](#17-label-horizon-governance)
 - [18. Expected Artifacts By Stage](#18-expected-artifacts-by-stage)
 - [19. Project Layout](#19-project-layout)
@@ -324,6 +326,137 @@ On top of the specialist layer, the repo trains:
 
 At inference time, the predictor is expected to return a structured output rather than a single scalar. The downstream execution layer expects specialist probabilities, meta probability, confluence probability, hazard shape, and quantile outputs in a schema-stable form. That is why model registry artifacts persist their feature lists and why the predictor reads those persisted feature contracts instead of guessing from column names at runtime.
 
+## 9A. TCN Specialist Benchmark Stack
+
+The repository now includes a full deep-learning specialist benchmark path based on a Temporal Convolutional Network (TCN). It is not a side notebook path. It is integrated into the same training artifact, registry, and telemetry contract used by the tabular stack.
+
+### Why TCN Is Added
+
+TCN is used as a sequence-aware challenger to tabular specialists on the same engineered feature frame and labels. The intent is not to replace the stack blindly, but to evaluate whether a causal sequence model can extract extra edge from the time-ordered feature state that tree models might compress away.
+
+### Architecture
+
+The TCN trainer is implemented in [`quant_system/ml/training/tcn_trainer.py`](./quant_system/ml/training/tcn_trainer.py). Core model structure:
+
+- causal dilated 1D convolutions
+- residual temporal blocks
+- configurable depth (`levels`)
+- configurable channel width (`channels`)
+- configurable kernel (`kernel_size`)
+- dropout regularization
+- sigmoid binary head
+
+Each sample is a rolling lookback window ending at decision bar `t`. The model predicts probability for the label at that endpoint, preserving causality.
+
+### Data, Features, And Labels
+
+TCN runs consume the same merged training frame as tree models:
+
+- features: `artifacts/features/BTCUSD/BTCUSD_features.csv`
+- labels: `artifacts/labels/BTCUSD/BTCUSD_labels.csv`
+
+Target mapping:
+
+| TCN Target | Label Column |
+|---|---|
+| `liq_flow` | `label_liq_flow` |
+| `bos_cont` | `label_bos_cont` |
+| `momo` | `label_momo` |
+| `flow_1h` | `label_flow_1h` |
+| `eop` | `label_eop` |
+| `edp` | `label_edp` |
+
+Feature scope defaults to `tree_manifest` alignment, meaning TCN can inherit selected feature columns from the corresponding tree manifest for fair comparison. If unavailable, it falls back to a safe auto feature set.
+
+### Preprocessing Contract
+
+Inside each fold, preprocessing is fit on training indices only (leak-safe):
+
+- numeric imputation (`median` default)
+- categorical imputation (`most_frequent` default)
+- optional quantile clipping (winsorization)
+- optional scaling (`standard`, `robust`, or none)
+- one-hot encoding for categorical features
+
+This preprocessing is implemented with a `ColumnTransformer` pipeline and serialized into the persisted inference bundle.
+
+### CV, Embargo, And Objective
+
+TCN HPO uses time-series CV (`TimeSeriesSplit`) with embargo bars to reduce leakage around split boundaries. For each trial:
+
+1. sample params from Optuna search space
+2. run purged/embargoed fold evaluations
+3. report partial fold objective to Optuna
+4. allow trial pruning when underperforming
+
+Primary objective is classification quality over out-of-fold probabilities (AP/AUC-derived score, task-dependent safety fallbacks for degenerate folds).
+
+### HPO Search Space And Runtime Controls
+
+The default TCN search space is in `quant_system/config/models/models.yaml` under `tcn_training.default.hpo_space`, including:
+
+- `lookback`
+- `levels`
+- `channels`
+- `kernel_size`
+- `dropout`
+- `lr`
+- `weight_decay`
+- `batch_size`
+- `max_epochs`
+- `patience`
+
+Current default TCN policy:
+
+- `hpo_trials: 20`
+- `cv_splits: 4`
+- `hpo_adaptive_stop: true`
+- `hpo_adaptive_min_completed_trials: 10`
+- `hpo_adaptive_no_improve_trials: 6`
+- `hpo_adaptive_min_delta: 0.001`
+
+### Resume, Checkpointing, And Progress Files
+
+Each target writes to its own isolated artifact root:
+
+- `artifacts/train/BTCUSD/<target>_tcn/`
+
+Per-target HPO persistence:
+
+- SQLite Optuna storage: `optuna_<target>.db`
+- latest progress snapshot: `hpo_progress.json`
+- append-only event stream: `hpo_progress.ndjson`
+
+This allows interruption-safe resume without recomputing completed trials.
+
+### Adaptive Plateau Stop (Automatic Early Stop)
+
+If adaptive stop is enabled, HPO stops when both conditions hold:
+
+1. completed trials >= `hpo_adaptive_min_completed_trials`
+2. no best-score improvement of at least `hpo_adaptive_min_delta` for `hpo_adaptive_no_improve_trials`
+
+This is budget-aware stopping, not score-target stopping. It is designed to avoid burning compute in flat search regions while still allowing exploration.
+
+### Post-HPO Training Gates
+
+After best-trial selection, the trainer runs additional safeguards:
+
+- stability check across multiple seeds
+- acceptance holdout gate with score-drop and precision constraints
+- probability calibration (`auto`/Platt/isotonic/empirical)
+- threshold tuning for deployment decision cutoff (F1/precision/recall constrained)
+
+### Saved Model Artifacts
+
+For each completed TCN specialist run:
+
+- registry model saved as `BTCUSD_<target>_tcn` and alias `<target>_tcn`
+- versioned metrics saved in registry
+- `model_state.json` and `train_manifest.json` in target artifact folder
+
+This means trained TCN outputs are inference-ready and version-tracked, not just trial logs.
+
 ## 10. Execution, Risk, And Capital Logic
 
 ### Decision Flow
@@ -447,6 +580,14 @@ The terminal is organized into six domains:
 4. `Signal Intelligence`
 5. `Risk Radar`
 6. `Research & Audit`
+
+The performance domain now includes richer analytics payloads from telemetry:
+
+- attribution by model/session/regime/hour/hold bucket
+- expectancy metrics (avg win/loss, payoff, streaks, max drawdown)
+- top winners/losers
+- equity, daily, and monthly timelines
+- expanded trade table with session/regime/MAE/MFE context
 
 ### Reasoning Payloads
 
@@ -623,6 +764,12 @@ Batch TCN run across all specialist targets:
 python train_BTCUSD_all_tcn_models.py --trials 20 --cv-splits 4
 ```
 
+Single-target TCN default run (now defaults to `flow_1h`):
+
+```bash
+python train_BTCUSD_tcn_model.py
+```
+
 TCN HPO now supports SQLite-backed resume by default under each target artifact folder, so interrupted runs can continue without restarting from trial 1.
 
 During long TCN runs, live progress is persisted to:
@@ -708,6 +855,38 @@ The cleanest manual workflow is:
 | 11 | `python train_BTCUSD_confluence_model.py` | Trains the confluence stacker. | `artifacts/train/BTCUSD/confluence_model/` |
 | 12 | `python train_BTCUSD_hazard_model.py` | Trains the hazard timing layer. | `artifacts/train/BTCUSD/hazard/` |
 | 13 | `python train_BTCUSD_quantile_model.py` | Trains the quantile forecaster. | `artifacts/train/BTCUSD/quantile/` |
+
+## 16A. BTCUSD TCN-Only Sequential Runbook
+
+If you are running TCN specialists only (no tree retraining in the same cycle), use this sequence:
+
+| Step | Run | Output Folder |
+|---|---|---|
+| 1 | `python train_BTCUSD_tcn_model.py` | `artifacts/train/BTCUSD/flow_1h_tcn/` |
+| 2 | `python train_BTCUSD_liq_flow_tcn_model.py` | `artifacts/train/BTCUSD/liq_flow_tcn/` |
+| 3 | `python train_BTCUSD_bos_cont_tcn_model.py` | `artifacts/train/BTCUSD/bos_cont_tcn/` |
+| 4 | `python train_BTCUSD_momo_tcn_model.py` | `artifacts/train/BTCUSD/momo_tcn/` |
+| 5 | `python train_BTCUSD_eop_tcn_model.py` | `artifacts/train/BTCUSD/eop_tcn/` |
+| 6 | `python train_BTCUSD_edp_tcn_model.py` | `artifacts/train/BTCUSD/edp_tcn/` |
+| 7 | `python run_BTCUSD_stress_matrix.py` | `backtest_outputs/stress_matrix/` |
+
+If you want one command for all TCN specialists:
+
+```bash
+python train_BTCUSD_all_tcn_models.py --trials 20 --cv-splits 4
+```
+
+During any long run:
+
+```bash
+tail -f artifacts/train/BTCUSD/<target>_tcn/hpo_progress.ndjson
+```
+
+and inspect latest compact snapshot:
+
+```bash
+cat artifacts/train/BTCUSD/<target>_tcn/hpo_progress.json
+```
 
 ### Recommended Interpretation Of The Sequence
 
@@ -814,8 +993,10 @@ This is governed promotion, not uncontrolled mutation. The intent is:
 | Features | `artifacts/features/BTCUSD/BTCUSD_features.csv` |
 | Labels | `artifacts/labels/BTCUSD/BTCUSD_labels.csv` |
 | Training | per-model `artifacts/train/BTCUSD/<model_name>/` manifests and registry artifacts |
+| TCN training | per-target `artifacts/train/BTCUSD/<target>_tcn/` with `optuna_<target>.db`, `hpo_progress.json`, `hpo_progress.ndjson`, manifests, and model state |
 | Label tuning | `artifacts/label_tuning/BTCUSD/` reports |
 | Promoted labels | `artifacts/label_profiles/active_label_profile.json` |
+| Deterministic stress | `backtest_outputs/stress_matrix/` reports |
 
 If those expected files are missing, the correct move is usually to go back one stage rather than trying to force the next stage to run.
 
@@ -857,6 +1038,7 @@ Current tagged baseline: `v0.1.0`
 
 - This repo still contains overlapping generations of code in some areas, even though the main runtime paths have been repaired.
 - The fetch layer is correct for deep history, but full-history Kraken trades bootstrap can take a long time.
+- TCN HPO can run for many hours depending on trial budget, fold count, and sampled epoch settings; use adaptive stop + progress files to control runtime.
 - Artifact fallback still exists in some surfaces, though the preferred live transport is now `FastAPI + WebSocket`.
 - Default label horizons are baseline values, not mathematically guaranteed optima.
 - `NARX` remains intentionally outside the main runtime path for now.
