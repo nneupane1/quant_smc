@@ -825,6 +825,13 @@ The configuration system merges a base config, module configs, overrides, and en
 3. environment values can override placeholders
 4. runtime components read the merged contract rather than one-off local files
 
+High-impact config files now also use Pydantic validation at load time:
+
+- `quant_system/config/models/models.yaml`
+- `quant_system/config/labels/labels.yaml`
+
+This catches schema mistakes early (invalid horizon bounds, unsupported scaler/calibrator values, malformed quantile bounds, missing core sections) before long tuning/training runs start.
+
 This matters because the repo is trying to avoid per-script drift. Data, training, execution, and telemetry should all read the same resolved configuration model.
 
 ## 15. Main Entry Points
@@ -864,6 +871,7 @@ These are the human-friendly top-level scripts that make the pipeline explicit:
 - `train_BTCUSD_quantile_model.py`
 - `train_BTCUSD_tcn_model.py` (Temporal Convolutional Network benchmark runner)
 - `train_BTCUSD_all_tcn_models.py` (sequential Temporal Convolutional Network specialist batch runner)
+- `train_BTCUSD_all_tree_models.py` (sequential tree-based specialist batch runner)
 - `train_BTCUSD_liq_flow_tcn_model.py`
 - `train_BTCUSD_bos_cont_tcn_model.py`
 - `train_BTCUSD_flow_1h_tcn_model.py`
@@ -881,13 +889,25 @@ pip install torch
 Batch Temporal Convolutional Network (TCN) run across all specialist targets:
 
 ```bash
-python train_BTCUSD_all_tcn_models.py --trials 20 --cv-splits 4
+python train_BTCUSD_all_tcn_models.py
 ```
 
 Single-target Temporal Convolutional Network (TCN) default run (now defaults to `flow_1h`):
 
 ```bash
 python train_BTCUSD_tcn_model.py
+```
+
+Batch tree-model run across core specialists:
+
+```bash
+python train_BTCUSD_all_tree_models.py
+```
+
+Optional tree batch extension (adds `meta_model`, `confluence_model`, `hazard`, `quantile`):
+
+```bash
+python train_BTCUSD_all_tree_models.py --include-extended
 ```
 
 Temporal Convolutional Network (TCN) HPO now supports SQLite-backed resume by default under each target artifact folder, so interrupted runs can continue without restarting from trial 1.
@@ -993,7 +1013,13 @@ If you are running Temporal Convolutional Network (TCN) specialists only (no tre
 If you want one command for all Temporal Convolutional Network (TCN) specialists:
 
 ```bash
-python train_BTCUSD_all_tcn_models.py --trials 20 --cv-splits 4
+python train_BTCUSD_all_tcn_models.py
+```
+
+If you want one command for all core tree specialists:
+
+```bash
+python train_BTCUSD_all_tree_models.py
 ```
 
 During any long run:
@@ -1162,6 +1188,7 @@ Current tagged baseline: `v0.1.0`
 - Artifact fallback still exists in some surfaces, though the preferred live transport is now `FastAPI + WebSocket`.
 - Default label horizons are baseline values, not mathematically guaranteed optima.
 - `NARX` remains intentionally outside the main runtime path for now.
+- `flow_1h` tree and TCN trainers now emit feature-dominance audit diagnostics (metrics + warnings) to flag over-dominant predictors early; this is diagnostic and does not auto-drop features.
 
 ### Summary
 
