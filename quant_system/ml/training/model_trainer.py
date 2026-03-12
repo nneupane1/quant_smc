@@ -1271,6 +1271,123 @@ class ModelTrainer:
         top = ser.head(max(top_n, 1))
         return {"top_features": {k: float(v) for k, v in top.items()}}
 
+    def _feature_dominance_audit(
+        self,
+        model: Any,
+        X_df: pd.DataFrame,
+        y: np.ndarray,
+        model_name: str,
+    ) -> Dict[str, Any]:
+        cfg = self.feature_sel_cfg if isinstance(self.feature_sel_cfg, dict) else {}
+        audit_cfg = cfg.get("dominance_audit", {}) if isinstance(cfg.get("dominance_audit", {}), dict) else {}
+        if not bool(audit_cfg.get("enabled", False)):
+            return {}
+
+        monitor_by_model = audit_cfg.get("monitor_features_by_model", {})
+        monitor_features: List[str] = []
+        if isinstance(monitor_by_model, dict):
+            raw = monitor_by_model.get(model_name, [])
+            if isinstance(raw, list):
+                monitor_features = [str(x) for x in raw if str(x) in X_df.columns]
+        if not monitor_features:
+            return {}
+
+        min_rows = max(int(audit_cfg.get("min_rows", 4096)), 256)
+        if len(X_df) < min_rows or len(X_df.columns) <= 1:
+            return {}
+
+        sample_rows = max(int(audit_cfg.get("sample_rows", 20000)), min_rows)
+        random_state = int(audit_cfg.get("random_state", 42))
+        min_top_drop = float(audit_cfg.get("min_top_drop", 0.01))
+        warn_share = float(audit_cfg.get("dominance_share_warn", 0.55))
+
+        if len(X_df) > sample_rows:
+            X_eval = X_df.tail(sample_rows).copy()
+            y_eval = y[-sample_rows:]
+        else:
+            X_eval = X_df.copy()
+            y_eval = y
+
+        if pd.Series(y_eval).nunique() < 2:
+            return {}
+
+        try:
+            p_base = self._positive_class_proba(model, X_eval)
+            base_ap = float(average_precision_score(y_eval, p_base))
+        except Exception as exc:
+            LOG.warning("[ModelTrainer] dominance audit skipped for %s: %s", model_name, exc)
+            return {}
+
+        rng = np.random.default_rng(random_state)
+        rows: List[Dict[str, Any]] = []
+        for idx, feat in enumerate(monitor_features):
+            X_perm = X_eval.copy()
+            values = X_perm[feat].to_numpy()
+            perm = rng.permutation(len(values))
+            X_perm[feat] = values[perm]
+            try:
+                p_perm = self._positive_class_proba(model, X_perm)
+                ap_perm = float(average_precision_score(y_eval, p_perm))
+            except Exception:
+                ap_perm = base_ap
+            drop = float(base_ap - ap_perm)
+            corr_val: Optional[float] = None
+            try:
+                feat_num = pd.to_numeric(X_eval[feat], errors="coerce")
+                corr_tmp = feat_num.corr(pd.Series(y_eval))
+                if pd.notna(corr_tmp):
+                    corr_val = float(corr_tmp)
+            except Exception:
+                corr_val = None
+            rows.append(
+                {
+                    "feature": feat,
+                    "ap_drop": drop,
+                    "ap_permuted": ap_perm,
+                    "label_corr": corr_val,
+                    "rank_seed_offset": idx,
+                }
+            )
+
+        if not rows:
+            return {}
+
+        rows_sorted = sorted(rows, key=lambda r: r["ap_drop"], reverse=True)
+        positive_sum = float(sum(max(float(r["ap_drop"]), 0.0) for r in rows_sorted))
+        top = rows_sorted[0]
+        dominance_share = (float(top["ap_drop"]) / positive_sum) if positive_sum > 0 else None
+        warn = bool(
+            dominance_share is not None
+            and float(top["ap_drop"]) >= min_top_drop
+            and float(dominance_share) >= warn_share
+        )
+        if warn:
+            LOG.warning(
+                "[ModelTrainer] dominance audit %s top_feature=%s ap_drop=%.4f share=%.3f (threshold=%.3f)",
+                model_name,
+                top["feature"],
+                float(top["ap_drop"]),
+                float(dominance_share),
+                float(warn_share),
+            )
+
+        return {
+            "enabled": True,
+            "model": model_name,
+            "rows_evaluated": int(len(X_eval)),
+            "base_ap": base_ap,
+            "monitored_features": monitor_features,
+            "ranked_drops": rows_sorted,
+            "top_feature": top["feature"],
+            "top_ap_drop": float(top["ap_drop"]),
+            "top_dominance_share": float(dominance_share) if dominance_share is not None else None,
+            "warn": warn,
+            "warn_thresholds": {
+                "min_top_drop": float(min_top_drop),
+                "dominance_share_warn": float(warn_share),
+            },
+        }
+
     @staticmethod
     def _infer_timeframe(col: str) -> Optional[str]:
         match = re.search(r"_(15m|1h|6h|12h)$", col)
@@ -1445,6 +1562,7 @@ class ModelTrainer:
             metrics["selected_feature_cols"] = list(X_df.columns)
             metrics["feature_selection"] = mi_report
             metrics["model_importance"] = self._extract_model_importance(model)
+            metrics["feature_dominance_audit"] = {}
             return model, metrics
 
         LOG.info(f"[ModelTrainer] HPO for {name} algo={algo} trials={n_trials} splits={cv_splits}")
@@ -1636,6 +1754,7 @@ class ModelTrainer:
                     "feature_selection": mi_report,
                     "model_importance": self._extract_model_importance(final_model),
                     "permutation_importance": self._permutation_importance_audit(final_model, X_df, y),
+                    "feature_dominance_audit": self._feature_dominance_audit(final_model, X_df, y, name),
                 }
                 return final_model, metrics
             with self._suppress_low_signal_warnings():
@@ -1674,6 +1793,7 @@ class ModelTrainer:
             "feature_selection": mi_report,
             "model_importance": importance_report,
             "permutation_importance": perm_report,
+            "feature_dominance_audit": self._feature_dominance_audit(final_model, X_df, y, name),
         }
         return final_model, metrics
 

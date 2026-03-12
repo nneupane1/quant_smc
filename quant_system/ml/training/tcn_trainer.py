@@ -101,6 +101,17 @@ DEFAULT_TCN_CFG: Dict[str, Any] = {
         "default_threshold": 0.50,
         "max_candidates": 256,
     },
+    "feature_dominance_audit": {
+        "enabled": True,
+        "min_rows": 4096,
+        "sample_rows": 20000,
+        "random_state": 42,
+        "min_top_drop": 0.01,
+        "dominance_share_warn": 0.55,
+        "monitor_features_by_target": {
+            "flow_1h": ["flow_age_bars_1h", "flow_ok_1h", "flow_signal_1h"],
+        },
+    },
     "device": "cpu",
     "torch_num_threads": 1,
     "torch_num_interop_threads": 1,
@@ -675,6 +686,119 @@ class TCNSpecialistTrainer:
             "f1_at_threshold": f1,
             "positive_rate_at_threshold": float(np.mean(y_hat) if len(y_hat) else 0.0),
             "threshold": float(threshold),
+        }
+
+    def _feature_dominance_audit(
+        self,
+        model: Any,
+        X_df: pd.DataFrame,
+        y: np.ndarray,
+    ) -> Dict[str, Any]:
+        cfg = deepcopy(self.cfg.get("feature_dominance_audit", {}))
+        if not bool(cfg.get("enabled", False)):
+            return {}
+
+        monitor_map = cfg.get("monitor_features_by_target", {})
+        monitor_features: List[str] = []
+        if isinstance(monitor_map, dict):
+            raw = monitor_map.get(self.target, [])
+            if isinstance(raw, list):
+                monitor_features = [str(x) for x in raw if str(x) in X_df.columns]
+        if not monitor_features:
+            return {}
+
+        min_rows = max(int(cfg.get("min_rows", 4096)), 256)
+        if len(X_df) < min_rows:
+            return {}
+        if pd.Series(y).nunique() < 2:
+            return {}
+
+        sample_rows = max(int(cfg.get("sample_rows", 20000)), min_rows)
+        random_state = int(cfg.get("random_state", 42))
+        min_top_drop = float(cfg.get("min_top_drop", 0.01))
+        warn_share = float(cfg.get("dominance_share_warn", 0.55))
+
+        if len(X_df) > sample_rows:
+            X_eval = X_df.tail(sample_rows).copy()
+            y_eval = y[-sample_rows:]
+        else:
+            X_eval = X_df.copy()
+            y_eval = y
+
+        try:
+            p_base = model.predict_proba(X_eval)[:, 1]
+            base_ap = float(average_precision_score(y_eval, p_base))
+        except Exception as exc:
+            LOG.warning("[TCN] dominance audit skipped for %s: %s", self.target, exc)
+            return {}
+
+        rng = np.random.default_rng(random_state)
+        rows: List[Dict[str, Any]] = []
+        for idx, feat in enumerate(monitor_features):
+            X_perm = X_eval.copy()
+            values = X_perm[feat].to_numpy()
+            X_perm[feat] = values[rng.permutation(len(values))]
+            try:
+                p_perm = model.predict_proba(X_perm)[:, 1]
+                ap_perm = float(average_precision_score(y_eval, p_perm))
+            except Exception:
+                ap_perm = base_ap
+            drop = float(base_ap - ap_perm)
+            corr_val: Optional[float] = None
+            try:
+                feat_num = pd.to_numeric(X_eval[feat], errors="coerce")
+                corr_tmp = feat_num.corr(pd.Series(y_eval))
+                if pd.notna(corr_tmp):
+                    corr_val = float(corr_tmp)
+            except Exception:
+                corr_val = None
+            rows.append(
+                {
+                    "feature": feat,
+                    "ap_drop": drop,
+                    "ap_permuted": ap_perm,
+                    "label_corr": corr_val,
+                    "rank_seed_offset": idx,
+                }
+            )
+
+        if not rows:
+            return {}
+
+        rows_sorted = sorted(rows, key=lambda r: r["ap_drop"], reverse=True)
+        positive_sum = float(sum(max(float(r["ap_drop"]), 0.0) for r in rows_sorted))
+        top = rows_sorted[0]
+        dominance_share = (float(top["ap_drop"]) / positive_sum) if positive_sum > 0 else None
+        warn = bool(
+            dominance_share is not None
+            and float(top["ap_drop"]) >= min_top_drop
+            and float(dominance_share) >= warn_share
+        )
+        if warn:
+            LOG.warning(
+                "[TCN] dominance audit %s top_feature=%s ap_drop=%.4f share=%.3f (threshold=%.3f)",
+                self.target,
+                top["feature"],
+                float(top["ap_drop"]),
+                float(dominance_share),
+                float(warn_share),
+            )
+
+        return {
+            "enabled": True,
+            "target": self.target,
+            "rows_evaluated": int(len(X_eval)),
+            "base_ap": base_ap,
+            "monitored_features": monitor_features,
+            "ranked_drops": rows_sorted,
+            "top_feature": top["feature"],
+            "top_ap_drop": float(top["ap_drop"]),
+            "top_dominance_share": float(dominance_share) if dominance_share is not None else None,
+            "warn": warn,
+            "warn_thresholds": {
+                "min_top_drop": float(min_top_drop),
+                "dominance_share_warn": float(warn_share),
+            },
         }
 
     def _tune_threshold(self, y_true: np.ndarray, p: np.ndarray) -> Dict[str, Any]:
@@ -1539,6 +1663,8 @@ class TCNSpecialistTrainer:
                 "min_precision_at_threshold": min_precision,
             }
 
+        dominance_report = self._feature_dominance_audit(final_fit["model"], X_dev, y_dev)
+
         tree_baseline = None
         if self.tree_manifest_path is not None and self.tree_manifest_path.exists():
             try:
@@ -1574,6 +1700,7 @@ class TCNSpecialistTrainer:
             "threshold_tuning": final_fit["threshold_tuning"],
             "stability": stability_report,
             "acceptance": acceptance_report,
+            "feature_dominance_audit": dominance_report,
             "tree_baseline_cv_score": tree_baseline,
             "delta_vs_tree_cv_score": (
                 float(cv_best["score_mean"]) - tree_baseline if tree_baseline is not None else None
@@ -1598,6 +1725,7 @@ class TCNSpecialistTrainer:
                 "delta_vs_tree_cv_score": metrics.get("delta_vs_tree_cv_score"),
                 "acceptance_gate": (metrics.get("acceptance", {}) or {}).get("gate"),
                 "stability_gate": (metrics.get("stability", {}) or {}).get("gate"),
+                "dominance_audit": (metrics.get("feature_dominance_audit") or {}),
                 "study_name": study_name,
                 "hpo_storage": storage_uri,
                 "best_params": best_params,

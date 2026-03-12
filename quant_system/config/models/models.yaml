@@ -228,6 +228,17 @@ training_preprocessing:
     use_mutual_info: true
     mutual_info_top_k: 120
     mutual_info_random_state: 42
+    # Target-specific dominance diagnostics on critical features.
+    # This does not change training outputs; it only records warnings/metrics.
+    dominance_audit:
+      enabled: true
+      min_rows: 4096
+      sample_rows: 20000
+      random_state: 42
+      min_top_drop: 0.01
+      dominance_share_warn: 0.55
+      monitor_features_by_model:
+        flow_1h: ["flow_age_bars_1h", "flow_ok_1h", "flow_signal_1h"]
 
 training_logging:
   heartbeat_seconds: 60
@@ -278,6 +289,15 @@ tcn_training:
       min_recall: 0.01
       default_threshold: 0.50
       max_candidates: 256
+    feature_dominance_audit:
+      enabled: true
+      min_rows: 4096
+      sample_rows: 20000
+      random_state: 42
+      min_top_drop: 0.01
+      dominance_share_warn: 0.55
+      monitor_features_by_target:
+        flow_1h: ["flow_age_bars_1h", "flow_ok_1h", "flow_signal_1h"]
     device: "cpu"
     torch_num_threads: 1
     torch_num_interop_threads: 1
