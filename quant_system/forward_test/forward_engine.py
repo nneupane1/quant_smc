@@ -152,8 +152,25 @@ class ForwardEngine:
             self.registry,
             prefer_tcn_specialists=self.prefer_tcn_specialists,
         )
+        resolved_specialists = self.predictor.warmup_specialists(
+            ["liq_flow", "bos_cont", "flow_1h", "momo", "eop", "edp"]
+        )
+        LOG.info(
+            "[ForwardEngine] Inference source mode=%s specialist_routes=%s",
+            self.predictor.source_mode(),
+            resolved_specialists,
+        )
         if self.dashboard:
-            self.dashboard.log_event("models_loaded", None, {"version": version})
+            self.dashboard.log_event(
+                "models_loaded",
+                None,
+                {
+                    "version": version,
+                    "prefer_tcn_specialists": self.prefer_tcn_specialists,
+                    "inference_source_mode": self.predictor.source_mode(),
+                    "specialist_model_source": resolved_specialists,
+                },
+            )
 
     # ----------------------------------------------------------------------
     # MAIN ENTRYPOINT — receives aggregated TF rows (15m close)
@@ -576,6 +593,8 @@ class ForwardEngine:
         return self.state_snapshot()
 
     def state_snapshot(self) -> Dict[str, Any]:
+        source_mode = self.predictor.source_mode() if self.predictor is not None else "unknown"
+        specialist_source = self.predictor.specialist_source_map() if self.predictor is not None else {}
         return {
             "timestamp": self.last_timestamp,
             "starting_capital": self.exec_cfg.get("starting_equity", 0.0),
@@ -590,6 +609,9 @@ class ForwardEngine:
             "closed_trades": self.closed_trades,
             "exposures": self.exposure.current_exposures(self.equity),
             "manual_alert_only": self.manual_alert_only,
+            "prefer_tcn_specialists": self.prefer_tcn_specialists,
+            "inference_source_mode": source_mode,
+            "specialist_model_source": specialist_source,
         }
 
     def _register_exposure(self, pos) -> None:

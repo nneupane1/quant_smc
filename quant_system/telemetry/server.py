@@ -8,9 +8,8 @@ from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from quant_system.dashboard.data_access import (
-    load_backtest_bundle,
-    load_forward_bundle,
     load_model_registry_summary,
+    resolve_mode_bundles,
     serialize_backtest_bundle,
     serialize_forward_bundle,
     serialize_model_summary,
@@ -69,25 +68,37 @@ def create_app(repo_root: str | Path | None = None) -> FastAPI:
     async def dashboard_context(
         backtest_dir: Optional[str] = Query(None),
         forward_dir: Optional[str] = Query(None),
+        live_dir: Optional[str] = Query(None),
         model_dir: Optional[str] = Query(None),
+        mode: str = Query("auto"),
     ) -> dict:
         raw_snapshot = hub.raw_snapshot()
         bt_root = _resolve_dir(root, backtest_dir, "backtest_outputs")
         fwd_root = _resolve_dir(root, forward_dir, "forward_outputs")
+        live_root = _resolve_dir(root, live_dir, "live_outputs")
         mdl_root = _resolve_dir(root, model_dir, "models")
 
-        backtest = load_backtest_bundle(base_dir=bt_root, snapshot=raw_snapshot)
-        forward = load_forward_bundle(base_dir=fwd_root, snapshot=raw_snapshot)
+        bundles = resolve_mode_bundles(
+            mode=mode,
+            backtest_root=bt_root,
+            forward_root=fwd_root,
+            live_root=live_root,
+            snapshot=raw_snapshot,
+            adapter=None,
+        )
         model_summary = load_model_registry_summary(mdl_root)
         model_version = model_summary["version"].max() if not model_summary.empty else "unavailable"
         return {
             "transport": "telemetry_api",
+            "requested_mode": str(bundles["requested_mode"]),
+            "resolved_mode": str(bundles["resolved_mode"]),
             "backtest_dir": str(bt_root),
             "forward_dir": str(fwd_root),
+            "live_dir": str(live_root),
             "model_dir": str(mdl_root),
             "model_version": str(model_version),
-            "backtest": serialize_backtest_bundle(backtest),
-            "forward": serialize_forward_bundle(forward),
+            "backtest": serialize_backtest_bundle(bundles["backtest"]),
+            "forward": serialize_forward_bundle(bundles["forward"]),
             "model_summary": serialize_model_summary(model_summary),
         }
 

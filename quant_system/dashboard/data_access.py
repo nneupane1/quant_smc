@@ -43,6 +43,7 @@ CANONICAL_TRADE_COLUMNS = [
 ]
 
 DEFAULT_TELEMETRY_URL = os.environ.get("QUANT_TERMINAL_API_BASE", "").strip()
+DASHBOARD_MODES = {"auto", "backtest", "forward", "live"}
 
 
 def _safe_json(path: Path) -> Any:
@@ -238,6 +239,242 @@ def summarize_trades(trades: pd.DataFrame, starting_equity: float = 20_000.0) ->
         "win_rate": float((trades["pnl"] > 0).mean()) if not trades.empty else 0.0,
         "avg_r": float(trades["r"].mean()) if not trades.empty else 0.0,
         "max_drawdown": float(equity_curve["drawdown"].min()) if not equity_curve.empty else 0.0,
+    }
+
+
+def _forward_closed_trades_df(state: Dict[str, Any]) -> pd.DataFrame:
+    closed = state.get("closed_trades")
+    rows: list[dict[str, Any]] = []
+    if isinstance(closed, dict):
+        for trade_id, payload in closed.items():
+            if isinstance(payload, dict):
+                row = dict(payload)
+                row.setdefault("trade_id", str(trade_id))
+                rows.append(row)
+    elif isinstance(closed, list):
+        for i, payload in enumerate(closed):
+            if isinstance(payload, dict):
+                row = dict(payload)
+                row.setdefault("trade_id", str(row.get("trade_id") or f"closed_{i}"))
+                rows.append(row)
+    return normalize_trade_frame(pd.DataFrame(rows))
+
+
+def _forward_has_activity(bundle: Dict[str, Any]) -> bool:
+    if not isinstance(bundle, dict):
+        return False
+    state = dict(bundle.get("state", {}) or {})
+    events = list(bundle.get("events", []) or [])
+    candles = bundle.get("candles", pd.DataFrame())
+    if events:
+        return True
+    if isinstance(candles, pd.DataFrame) and not candles.empty:
+        return True
+    open_trades = state.get("open_trades", {})
+    if isinstance(open_trades, dict) and len(open_trades) > 0:
+        return True
+    closed = state.get("closed_trades", {})
+    if isinstance(closed, dict) and len(closed) > 0:
+        return True
+    if isinstance(closed, list) and len(closed) > 0:
+        return True
+    try:
+        equity = float(state.get("equity", 20_000.0) or 20_000.0)
+        if abs(equity - 20_000.0) > 1e-6:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _bundle_snapshot_mtime(root: Path) -> float:
+    candidates = (
+        "snapshot.json",
+        "state.json",
+        "events.json",
+        "events.csv",
+        "candles.csv",
+        "bars.csv",
+    )
+    latest = 0.0
+    for rel in candidates:
+        path = root / rel
+        if path.exists():
+            latest = max(latest, float(path.stat().st_mtime))
+    return latest
+
+
+def _resolve_runtime_mode(
+    requested_mode: str,
+    *,
+    forward_bundle: Dict[str, Any],
+    live_bundle: Dict[str, Any],
+    forward_root: Path,
+    live_root: Path,
+    snapshot_present: bool,
+) -> str:
+    mode = str(requested_mode or "auto").strip().lower()
+    if mode in {"backtest", "forward", "live"}:
+        return mode
+
+    live_active = _forward_has_activity(live_bundle)
+    forward_active = _forward_has_activity(forward_bundle)
+    if live_active and not forward_active:
+        return "live"
+    if forward_active and not live_active:
+        return "forward"
+    if live_active and forward_active:
+        return "live" if _bundle_snapshot_mtime(live_root) >= _bundle_snapshot_mtime(forward_root) else "forward"
+    if snapshot_present:
+        return "forward"
+    return "backtest"
+
+
+def _backtest_to_forward(backtest_bundle: Dict[str, Any], *, root: Optional[Path] = None) -> Dict[str, Any]:
+    summary = dict(backtest_bundle.get("summary", {}) or {})
+    trades = normalize_trade_frame(backtest_bundle.get("trades", pd.DataFrame()))
+    starting = float(summary.get("starting_equity", 20_000.0) or 20_000.0)
+    ending = float(summary.get("ending_equity", starting) or starting)
+    closed_map: Dict[str, Any] = {}
+    for row in trades.to_dict(orient="records"):
+        trade_id = str(row.get("trade_id") or f"trade_{len(closed_map)+1}")
+        closed_map[trade_id] = _jsonable(row)
+
+    events: list[dict[str, Any]] = []
+    for row in trades.tail(200).to_dict(orient="records"):
+        ts = row.get("exit_ts") or row.get("entry_ts")
+        events.append(
+            {
+                "timestamp": _jsonable(ts),
+                "event_type": "backtest_trade",
+                "trade_id": str(row.get("trade_id") or ""),
+                "payload": {
+                    "asset": row.get("asset"),
+                    "side": row.get("side"),
+                    "tier": row.get("tier"),
+                    "pnl": row.get("pnl"),
+                    "r": row.get("r"),
+                    "reason": row.get("reason"),
+                },
+            }
+        )
+
+    state = {
+        "starting_capital": starting,
+        "equity": ending,
+        "free_capital": ending,
+        "locked_profit": max(ending - starting, 0.0),
+        "max_drawdown": float(summary.get("max_drawdown", 0.0) or 0.0),
+        "risk_mode": "backtest",
+        "hedge_ratio": 0.0,
+        "cooling_to": None,
+        "open_trades": {},
+        "closed_trades": closed_map,
+        "mode_source": "backtest",
+    }
+    candles = _coerce_frame(backtest_bundle.get("candles"), parse_dates=["timestamp", "dt"])
+    return {
+        "root": root if root is not None else backtest_bundle.get("root"),
+        "state": state,
+        "events": events,
+        "candles": candles,
+        "tf_bars": {},
+    }
+
+
+def _forward_to_backtest(forward_bundle: Dict[str, Any], *, root: Optional[Path] = None) -> Dict[str, Any]:
+    state = dict(forward_bundle.get("state", {}) or {})
+    events = list(forward_bundle.get("events", []) or [])
+    candles = _coerce_frame(forward_bundle.get("candles"), parse_dates=["timestamp", "dt"])
+    trades = _forward_closed_trades_df(state)
+
+    starting = float(state.get("starting_capital", 20_000.0) or 20_000.0)
+    summary = summarize_trades(trades, starting_equity=starting)
+    if "equity" in state and state.get("equity") is not None:
+        try:
+            summary["ending_equity"] = float(state.get("equity"))
+            if trades.empty:
+                summary["total_pnl"] = float(summary["ending_equity"] - starting)
+            summary["max_drawdown"] = float(state.get("max_drawdown", summary["max_drawdown"]) or summary["max_drawdown"])
+        except Exception:
+            pass
+
+    grouped = _group_reports(trades)
+    execution_log = _coerce_frame(events, parse_dates=["timestamp", "entry_ts", "exit_ts"])
+    if execution_log.empty and not trades.empty:
+        execution_log = trades.copy()
+
+    reasoning: Dict[str, Any] = {}
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        trade_id = str(event.get("trade_id") or payload.get("trade_id") or "")
+        if not trade_id:
+            continue
+        reason_obj = payload.get("reasoning") or payload
+        reasoning[trade_id] = _jsonable(reason_obj)
+
+    return {
+        "root": root if root is not None else forward_bundle.get("root"),
+        "summary": summary,
+        "trades": trades,
+        "equity_curve": build_equity_curve(trades, starting_equity=starting),
+        "execution_log": execution_log,
+        "candles": candles,
+        "smc_features": pd.DataFrame(),
+        "daily": grouped["daily"],
+        "monthly": grouped["monthly"],
+        "reasoning": reasoning,
+    }
+
+
+def resolve_mode_bundles(
+    *,
+    mode: str,
+    backtest_root: Path,
+    forward_root: Path,
+    live_root: Path,
+    adapter: Any = None,
+    snapshot: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    requested_mode = str(mode or "auto").strip().lower()
+    if requested_mode not in DASHBOARD_MODES:
+        requested_mode = "auto"
+
+    backtest_base = load_backtest_bundle(base_dir=backtest_root, snapshot=snapshot if requested_mode == "backtest" else None)
+    forward_base = load_forward_bundle(adapter=adapter, base_dir=forward_root)
+    live_base = load_forward_bundle(base_dir=live_root)
+
+    resolved_mode = _resolve_runtime_mode(
+        requested_mode,
+        forward_bundle=forward_base,
+        live_bundle=live_base,
+        forward_root=forward_root,
+        live_root=live_root,
+        snapshot_present=isinstance(snapshot, dict) and len(snapshot) > 0,
+    )
+
+    if resolved_mode == "backtest":
+        active_backtest = backtest_base
+        active_forward = _backtest_to_forward(backtest_base, root=backtest_root)
+    else:
+        active_root = forward_root if resolved_mode == "forward" else live_root
+        if isinstance(snapshot, dict) and snapshot:
+            active_forward = load_forward_bundle(
+                adapter=adapter if resolved_mode == "forward" else None,
+                base_dir=active_root,
+                snapshot=snapshot,
+            )
+        else:
+            active_forward = forward_base if resolved_mode == "forward" else live_base
+        active_backtest = _forward_to_backtest(active_forward, root=active_root)
+
+    return {
+        "requested_mode": requested_mode,
+        "resolved_mode": resolved_mode,
+        "backtest": active_backtest,
+        "forward": active_forward,
     }
 
 
@@ -529,8 +766,11 @@ class DashboardContext:
     theme_choice: str
     model_version: str
     transport: str
+    requested_mode: str
+    resolved_mode: str
     backtest_dir: Path
     forward_dir: Path
+    live_dir: Path
     model_dir: Path
     backtest: Dict[str, Any]
     forward: Dict[str, Any]
@@ -542,9 +782,11 @@ def build_context(
     *,
     backtest_dir: Optional[str] = None,
     forward_dir: Optional[str] = None,
+    live_dir: Optional[str] = None,
     model_dir: Optional[str] = None,
     adapter: Any = None,
     telemetry_url: Optional[str] = None,
+    mode: str = "auto",
 ) -> DashboardContext:
     cfg = ConfigLoader("quant_system/config").load()
     model_root = Path(
@@ -561,13 +803,22 @@ def build_context(
         Path.cwd() / "forward_outputs",
         Path.cwd() / "live_outputs",
     )
+    live_root = Path(live_dir) if live_dir else _discover_first(
+        Path.cwd() / "live_outputs",
+        Path.cwd() / "forward_outputs",
+    )
+    requested_mode = str(mode or "auto").strip().lower()
+    if requested_mode not in DASHBOARD_MODES:
+        requested_mode = "auto"
     telemetry_base = (telemetry_url if telemetry_url is not None else DEFAULT_TELEMETRY_URL).strip()
     if telemetry_base:
         query = urllib_parse.urlencode(
             {
                 "backtest_dir": str(bt_root),
                 "forward_dir": str(fwd_root),
+                "live_dir": str(live_root),
                 "model_dir": str(model_root),
+                "mode": requested_mode,
             }
         )
         payload = _safe_http_json(f"{telemetry_base.rstrip('/')}/dashboard/context?{query}")
@@ -579,8 +830,11 @@ def build_context(
                 theme_choice=theme_choice,
                 model_version=model_version,
                 transport="telemetry_api",
+                requested_mode=str(payload.get("requested_mode") or requested_mode),
+                resolved_mode=str(payload.get("resolved_mode") or requested_mode),
                 backtest_dir=Path(payload.get("backtest_dir") or bt_root),
                 forward_dir=Path(payload.get("forward_dir") or fwd_root),
+                live_dir=Path(payload.get("live_dir") or live_root),
                 model_dir=Path(payload.get("model_dir") or model_root),
                 backtest=deserialize_backtest_bundle(payload.get("backtest", {})),
                 forward=deserialize_forward_bundle(payload.get("forward", {})),
@@ -589,15 +843,26 @@ def build_context(
 
     model_summary = load_model_registry_summary(model_root)
     model_version = model_summary["version"].max() if not model_summary.empty else "unavailable"
+    bundles = resolve_mode_bundles(
+        mode=requested_mode,
+        backtest_root=bt_root,
+        forward_root=fwd_root,
+        live_root=live_root,
+        adapter=adapter,
+        snapshot=None,
+    )
     return DashboardContext(
         config=cfg,
         theme_choice=theme_choice,
         model_version=str(model_version),
         transport="artifacts",
+        requested_mode=str(bundles["requested_mode"]),
+        resolved_mode=str(bundles["resolved_mode"]),
         backtest_dir=bt_root,
         forward_dir=fwd_root,
+        live_dir=live_root,
         model_dir=model_root,
-        backtest=load_backtest_bundle(bt_root),
-        forward=load_forward_bundle(adapter=adapter, base_dir=fwd_root),
+        backtest=bundles["backtest"],
+        forward=bundles["forward"],
         model_summary=model_summary,
     )

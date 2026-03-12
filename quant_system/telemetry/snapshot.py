@@ -1029,6 +1029,18 @@ def build_terminal_snapshot(
         free_capital = equity
 
     model_version = _discover_model_version(repo_root_path)
+    prefer_tcn_specialists = bool(state.get("prefer_tcn_specialists", False))
+    inference_source_mode = str(
+        state.get("inference_source_mode")
+        or ("tcn_first" if prefer_tcn_specialists else "tree_first")
+    )
+    specialist_model_source = (
+        dict(state.get("specialist_model_source", {}))
+        if isinstance(state.get("specialist_model_source"), dict)
+        else {}
+    )
+    route_parts = [f"{k}:{v}" for k, v in sorted(specialist_model_source.items())]
+    route_detail = ", ".join(route_parts) if route_parts else "not resolved yet"
 
     signals = _signal_candidates(raw_snapshot, fallback)
     events = _recent_events(raw_snapshot, fallback)
@@ -1057,6 +1069,8 @@ def build_terminal_snapshot(
             "repoRoot": str(repo_root_path),
             "modelVersion": str(model_version),
             "transport": "fastapi + websocket event plane",
+            "preferTcnSpecialists": prefer_tcn_specialists,
+            "inferenceSourceMode": inference_source_mode,
         },
         "mission": {
             "headline": "Live terminal wired to the shared telemetry plane",
@@ -1076,6 +1090,12 @@ def build_terminal_snapshot(
                 {"label": "Capital Cycle", "value": "Compounding" if locked_profit > 0 else "Base ticket", "detail": "Cycle capital, vaulting, and cooling remain explicit state variables.", "tone": "amber"},
                 {"label": "Execution Posture", "value": "Guarded" if state.get("cooling_to") else "Eligible", "detail": "Cooling status and open-position posture are surfaced directly from runtime state.", "tone": "teal" if not state.get("cooling_to") else "rose"},
                 {"label": "Model Surface", "value": str(model_version), "detail": "Latest discovered model registry version.", "tone": "cyan"},
+                {
+                    "label": "Inference Route",
+                    "value": inference_source_mode,
+                    "detail": route_detail,
+                    "tone": "teal" if inference_source_mode == "tcn_first" else "amber",
+                },
                 {"label": "Decision Tape", "value": f"{len(events)} events", "detail": "Event payloads are emitted by the shared telemetry adapter.", "tone": "teal"},
             ],
             "latestReasoning": latest_reasoning,

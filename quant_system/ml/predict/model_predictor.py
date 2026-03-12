@@ -29,6 +29,12 @@ class ModelPredictor:
         self._resolved_specialist_names: Dict[str, str] = {}
         log(f"ModelPredictor initialized. prefer_tcn_specialists={self.prefer_tcn_specialists}")
 
+    def source_mode(self) -> str:
+        return "tcn_first" if self.prefer_tcn_specialists else "tree_first"
+
+    def specialist_source_map(self) -> Dict[str, str]:
+        return dict(self._resolved_specialist_names)
+
     @staticmethod
     def _is_asset_specific(name: str) -> bool:
         return "_" in name and name.split("_", 1)[0].isupper()
@@ -52,8 +58,12 @@ class ModelPredictor:
         requested = str(model_name)
         cached = self._resolved_specialist_names.get(requested)
         if cached is not None:
-            clf, cal, cfg = self.registry.load_latest_bundle(cached)
-            return clf, cal, cfg, cached
+            try:
+                clf, cal, cfg = self.registry.load_latest_bundle(cached)
+                return clf, cal, cfg, cached
+            except Exception:
+                # stale cache entry (artifact rotation/deletion) -> re-resolve
+                self._resolved_specialist_names.pop(requested, None)
 
         last_exc: Optional[Exception] = None
         for candidate in self._candidate_specialist_names(requested):
@@ -70,6 +80,15 @@ class ModelPredictor:
         if last_exc is not None:
             raise last_exc
         raise RuntimeError(f"No model candidate resolved for specialist '{requested}'.")
+
+    def warmup_specialists(self, specialist_list: Optional[List[str]] = None) -> Dict[str, str]:
+        names = specialist_list or sorted(self.SPECIALIST_MODELS)
+        for model_name in names:
+            try:
+                _clf, _cal, _cfg, _resolved = self._load_specialist_bundle(model_name)
+            except Exception:
+                continue
+        return self.specialist_source_map()
 
     @staticmethod
     def _row_frame(row_like, feature_cols: List[str]):
