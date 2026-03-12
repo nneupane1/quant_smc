@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from copy import deepcopy
 
 from quant_system.utils.logger import log
+from quant_system.config.schema_validation import validate_known_config_file
 
 
 class ConfigLoader:
@@ -42,7 +43,10 @@ class ConfigLoader:
         if not os.path.exists(path):
             return {}
         with open(path, "r") as f:
-            return yaml.safe_load(f) or {}
+            data = yaml.safe_load(f) or {}
+        filename = os.path.basename(path)
+        data = validate_known_config_file(filename, data)
+        return data
 
     def _merge(self, base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
         """
