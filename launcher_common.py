@@ -8,9 +8,10 @@ from python_bootstrap import ensure_runtime
 
 ensure_runtime(("pandas",))
 
+import json
 from pathlib import Path
 import time
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from quant_system.cli.common import load_or_build_features, load_or_build_labels, read_frame
 from quant_system.config.config_loader import ConfigLoader
@@ -40,6 +41,52 @@ def default_labels_csv() -> str:
 
 def default_training_root(model_name: str) -> Path:
     return Path("artifacts/train") / ASSET / model_name
+
+
+def _read_json(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _extract_manifest_cv_score(manifest: Dict[str, Any], model_name: str) -> Optional[float]:
+    metrics = (manifest.get("metrics", {}) or {}).get("by_model", {}) or {}
+    metric_keys = [model_name]
+    for key in metric_keys:
+        row = metrics.get(key, {})
+        score = row.get("cv_score") if isinstance(row, dict) else None
+        if isinstance(score, (int, float)):
+            return float(score)
+    return None
+
+
+def inspect_training_artifacts(model_name: str) -> Dict[str, Any]:
+    root = default_training_root(model_name)
+    manifest_path = root / "train_manifest.json"
+    model_state_path = root / "model_state.json"
+    merged_path = root / "training_frame.csv"
+    manifest = _read_json(manifest_path)
+    version = str(manifest.get("version") or "")
+    cv_score = _extract_manifest_cv_score(manifest, model_name)
+    return {
+        "model": model_name,
+        "artifact_root": str(root),
+        "manifest_path": str(manifest_path),
+        "model_state_path": str(model_state_path),
+        "training_frame_path": str(merged_path),
+        "manifest_exists": manifest_path.exists(),
+        "model_state_exists": model_state_path.exists(),
+        "training_frame_exists": merged_path.exists(),
+        "manifest_mtime": manifest_path.stat().st_mtime if manifest_path.exists() else None,
+        "version": version or "-",
+        "cv_score": cv_score,
+        "trained_models": manifest.get("trained_models", []) if isinstance(manifest, dict) else [],
+        "dependency_models": manifest.get("dependency_models", []) if isinstance(manifest, dict) else [],
+    }
 
 
 def _is_up_to_date(target: Path, sources: list[Path]) -> bool:
@@ -179,6 +226,28 @@ def train_model(
         features_csv = features_csv or default_features_csv()
         labels_csv = labels_csv or default_labels_csv()
         root = default_training_root(model_name)
+        pre_status = inspect_training_artifacts(model_name)
+        console_rule(f"Train Model | {ASSET} | {model_name}", style="green")
+        console_kv(
+            "Model Launch Plan",
+            {
+                "asset": ASSET,
+                "model": model_name,
+                "artifact_root": root,
+                "manifest": pre_status["manifest_path"],
+                "training_frame": pre_status["training_frame_path"],
+                "features_csv": features_csv,
+                "labels_csv": labels_csv,
+                "resume": bool(resume),
+                "existing_version": pre_status["version"],
+                "existing_cv_score": (
+                    f"{float(pre_status['cv_score']):.4f}"
+                    if isinstance(pre_status.get("cv_score"), (int, float))
+                    else "-"
+                ),
+            },
+            style="green",
+        )
         orchestrator = TrainOrchestrator(conf_dir=CONFIG_DIR, artifact_root=str(root))
         manifest = orchestrator.run_asset(
             asset=ASSET,
@@ -193,10 +262,37 @@ def train_model(
             models=[model_name],
             resume=resume,
         )
+        post_status = inspect_training_artifacts(model_name)
+        outcome = "trained"
+        if (
+            resume
+            and bool(pre_status.get("manifest_exists"))
+            and bool(post_status.get("manifest_exists"))
+            and pre_status.get("manifest_mtime") == post_status.get("manifest_mtime")
+            and pre_status.get("version") == post_status.get("version")
+        ):
+            outcome = "resume_hit"
         console_stage(
             "Model launcher complete",
-            f"model={model_name} version={manifest['version']}",
+            f"model={model_name} version={manifest['version']} outcome={outcome}",
             status="ok",
+        )
+        console_kv(
+            "Model Launch Summary",
+            {
+                "model": model_name,
+                "outcome": outcome,
+                "version": post_status["version"],
+                "cv_score": (
+                    f"{float(post_status['cv_score']):.4f}"
+                    if isinstance(post_status.get("cv_score"), (int, float))
+                    else "-"
+                ),
+                "trained_models": ", ".join(post_status.get("trained_models", [])) or "-",
+                "dependency_models": ", ".join(post_status.get("dependency_models", [])) or "-",
+                "manifest": post_status["manifest_path"],
+            },
+            style="green",
         )
         return manifest
     finally:

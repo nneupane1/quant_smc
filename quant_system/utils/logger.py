@@ -65,9 +65,21 @@ def fmt_seconds(value) -> str:
     if value is None:
         return "-"
     try:
-        return f"{float(value):.1f}s"
+        total = float(value)
     except Exception:
         return str(value)
+    total = max(total, 0.0)
+    if total < 60.0:
+        return f"{total:.1f}s"
+    rounded = int(round(total))
+    days, rem = divmod(rounded, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d {hours:02d}h {minutes:02d}m"
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m {seconds:02d}s"
+    return f"{minutes}m {seconds:02d}s"
 
 
 def console_rule(title: str, *, style: str = "cyan"):
