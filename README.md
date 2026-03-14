@@ -43,6 +43,7 @@ The central design promise of the project is research-to-execution parity. The s
 - [9A. Temporal Convolutional Network (TCN) Specialist Benchmark Stack](#9a-temporal-convolutional-network-tcn-specialist-benchmark-stack)
 - [9B. Temporal Convolutional Network (TCN) Design Rationale And Learning Mechanics](#9b-temporal-convolutional-network-tcn-design-rationale-and-learning-mechanics)
 - [10. Execution, Risk, And Capital Logic](#10-execution-risk-and-capital-logic)
+- [10A. Operator Guide: Reading Confluence, EVR, And Hazard Together](#10a-operator-guide-reading-confluence-evr-and-hazard-together)
 - [11. Runtime Modes](#11-runtime-modes)
 - [12. Dashboards, Terminal, And Telemetry](#12-dashboards-terminal-and-telemetry)
 - [13. Installation](#13-installation)
@@ -626,6 +627,247 @@ The repaired runtime now supports a more explicit trade-management structure:
 - profit ladder logic
 - hazard-based trailing
 - longer hold bias for stronger continuation conditions
+
+## 10A. Operator Guide: Reading Confluence, EVR, And Hazard Together
+
+This is the operator-facing interpretation layer for the three most important runtime decision variables:
+
+- `confluence`
+- `EVR`
+- `hazard`
+
+They do not mean the same thing and they should not be read independently.
+
+### What Each Number Actually Means
+
+| Variable | What It Measures | Plain-English Meaning | Primary Use |
+|---|---|---|---|
+| `confluence` | agreement and setup quality across rule logic and model context | “Does the setup look coherent enough to trust?” | entry quality / ranking |
+| `EVR` | expectancy-style reward profile | “If this works, is the payoff profile worth the risk?” | opportunity quality / trade worthiness |
+| `hazard` | near-term adverse-event risk | “How likely is this to go wrong soon?” | fragility, trailing, exits, cooling |
+
+The shortest useful mental model is:
+
+- `confluence` = quality
+- `EVR` = payoff
+- `hazard` = danger
+
+If you only remember one line, remember that one.
+
+### How To Read Them Together
+
+The system is not asking for one magic number. It is asking for a structured answer:
+
+1. Is the setup coherent?
+2. Is the payoff worth taking?
+3. Is the environment too fragile to trust?
+
+That is why the runtime keeps these surfaces separate instead of collapsing everything into one opaque score.
+
+### Practical Interpretation Matrix
+
+| Confluence | EVR | Hazard | Operator Read |
+|---|---|---|---|
+| high | high | low | best case; strong setup, worthwhile payoff, limited fragility |
+| high | high | high | attractive but dangerous; size/hold logic must stay defensive |
+| high | low | low | coherent but not worth much; a clean-looking mediocre trade is still mediocre |
+| low | high | low | tempting but weakly aligned; often the trade that looks clever after the fact and annoying in real time |
+| low | low | low | no edge, no urgency, no reason |
+| high | low | high | worst kind of false friend; looks organized, pays badly, fails easily |
+
+### Confluence: What It Should Mean To An Operator
+
+Confluence is not “up probability.” It is setup coherence.
+
+It tells you whether the decision stack is seeing:
+
+- agreement between specialists
+- reasonable structural context
+- acceptable rule-based execution state
+- enough supporting context to take the setup seriously
+
+Operationally:
+
+- high confluence means the setup is internally consistent
+- mediocre confluence means signals are mixed, incomplete, or thin
+- low confluence means the market is not presenting a convincing execution-grade picture
+
+Confluence should make you ask:
+
+- “Is this worth paying attention to?”
+
+It should not make you say:
+
+- “This must win.”
+
+That confusion is expensive.
+
+### EVR: Why A Good Setup Still May Not Be Worth Taking
+
+EVR is the trade-worthiness layer.
+
+It asks whether the projected reward profile is attractive enough relative to the risk and distribution shape. In practice, EVR helps separate:
+
+- clean but small setups
+- noisy but asymmetric setups
+- genuinely high-quality payoff situations
+
+Operationally:
+
+- high EVR means the upside profile is meaningful
+- mediocre EVR means the trade may work but does not pay enough
+- low EVR means the opportunity is not worth much even if the chart looks organized
+
+This is the variable that stops the operator from taking every “nice-looking” setup.
+
+### Hazard: The System’s Fragility Meter
+
+Hazard is the danger model.
+
+It does not answer:
+
+- “Will price go up?”
+
+It answers:
+
+- “How likely is an adverse event soon?”
+
+In this repository, hazard is built from future stop-like failure and opposite-structure-event timing. At runtime, the predictor produces a hazard curve and then compresses that curve into a single `hazard_score` with higher weight on earlier bars. That means the score cares more about danger soon than danger eventually.
+
+Operationally:
+
+- low hazard means the trade has room to breathe
+- rising hazard means the setup is becoming fragile
+- high hazard means the system should protect capital, tighten, partial, or exit
+
+Hazard influences:
+
+- trade tiering
+- entry strictness
+- position risk mode
+- hedge ratio
+- cooling / profit locking
+- trailing and forced exit behavior
+
+If confluence is the “why enter?” voice, hazard is the “do not get stubborn” voice.
+
+### The Correct Operator Workflow
+
+The correct reading order is:
+
+1. Check `confluence`
+2. Check `EVR`
+3. Check `hazard`
+4. Only then decide whether the setup is worth acting on
+
+This avoids the two classic operator mistakes:
+
+- taking a coherent but low-payoff trade
+- holding a high-payoff-looking trade after hazard has already turned against it
+
+### Recommended Operator Rules
+
+Use the variables like this:
+
+- High `confluence` and high `EVR` with low `hazard`: this is the cleanest actionable state.
+- High `confluence` and high `EVR` with medium/high `hazard`: allow the setup to exist, but expect tighter risk handling and lower tolerance for drift.
+- High `confluence` with low `EVR`: do not confuse orderliness with profitability.
+- Low `confluence` with high `EVR`: treat this as a speculative outlier, not a core process trade.
+- Rising `hazard` after entry: stop asking whether the original thesis was beautiful. Start asking whether capital now needs defending.
+
+### What Not To Do
+
+Do not use these values incorrectly:
+
+- do not read `hazard` as a directional short signal; it is a fragility signal
+- do not read `confluence` as guaranteed win probability
+- do not read `EVR` as permission to ignore risk
+- do not compare raw scores across different model targets as if they are on the same task scale
+
+### Example Reads
+
+#### Example 1: Strong Candidate
+
+- `confluence` high
+- `EVR` high
+- `hazard` low
+
+Read:
+
+- the setup is coherent
+- the payoff looks worthwhile
+- the environment is not yet screaming “protect immediately”
+
+This is the type of setup the system is designed to prioritize.
+
+#### Example 2: Good Looking, Fragile
+
+- `confluence` high
+- `EVR` high
+- `hazard` high
+
+Read:
+
+- the setup may still be attractive
+- but the market is also telling you the failure clock is active
+
+This should lead to stricter sizing, faster trailing, or quicker partial behavior, not blind confidence.
+
+#### Example 3: Pretty But Cheap
+
+- `confluence` high
+- `EVR` low
+- `hazard` low
+
+Read:
+
+- the setup is orderly
+- but the upside distribution is weak
+
+This is the kind of trade that fills journals and does not move equity much.
+
+#### Example 4: Tempting But Undisciplined
+
+- `confluence` low
+- `EVR` high
+- `hazard` low
+
+Read:
+
+- payoff might be interesting
+- but setup agreement is weak
+
+This is where discretionary operators often start narrating. The system is correct to stay stricter than the operator’s imagination.
+
+### How This Maps To The Dashboard
+
+On the operator surfaces:
+
+- `confluence` should be read as setup coherence
+- `EVR` should be read as trade economics
+- `hazard` should be read as fragility and exit pressure
+
+If the dashboard shows all three in one place, the operator should be able to answer:
+
+- “Is this good enough to act on?”
+- “Is it worth enough to act on?”
+- “Is it stable enough to hold?”
+
+That is the real job of the stack.
+
+### Final Operator Summary
+
+When the three are aligned:
+
+- high `confluence`
+- high `EVR`
+- low `hazard`
+
+the system has both permission and economic reason to care.
+
+When they disagree, believe the disagreement. The disagreement is information, not clutter.
+
+That is the point of building a layered trading system instead of a single glowing button.
 
 ## 11. Runtime Modes
 
