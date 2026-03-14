@@ -221,13 +221,13 @@ def train_model(
 ):
     started_at = time.perf_counter()
     try:
-        _, cfg = load_cfg()
-        tf_dir = tf_dir or default_tf_dir(cfg)
-        features_csv = features_csv or default_features_csv()
-        labels_csv = labels_csv or default_labels_csv()
         root = default_training_root(model_name)
         pre_status = inspect_training_artifacts(model_name)
         console_rule(f"Train Model | {ASSET} | {model_name}", style="green")
+        orchestrator = TrainOrchestrator(conf_dir=CONFIG_DIR, artifact_root=str(root))
+        tf_dir = tf_dir or default_tf_dir(orchestrator.cfg)
+        features_csv = features_csv or default_features_csv()
+        labels_csv = labels_csv or default_labels_csv()
         console_kv(
             "Model Launch Plan",
             {
@@ -248,7 +248,6 @@ def train_model(
             },
             style="green",
         )
-        orchestrator = TrainOrchestrator(conf_dir=CONFIG_DIR, artifact_root=str(root))
         manifest = orchestrator.run_asset(
             asset=ASSET,
             tf_dir=tf_dir,

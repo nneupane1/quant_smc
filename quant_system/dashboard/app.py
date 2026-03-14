@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import os
 from pathlib import Path
 
@@ -27,12 +28,26 @@ if "dashboard_adapter" not in st.session_state:
 
 theme_manager = ThemeManager()
 
+
+def _render_sidebar_logo(path: Path) -> None:
+    image_kwargs = {}
+    try:
+        signature = inspect.signature(st.image)
+        if "use_container_width" in signature.parameters:
+            image_kwargs["use_container_width"] = True
+        elif "use_column_width" in signature.parameters:
+            image_kwargs["use_column_width"] = True
+    except Exception:
+        image_kwargs["use_column_width"] = True
+    st.image(str(path), **image_kwargs)
+
 PAGE_REGISTRY = {
     "Mission Control": ("quant_system.dashboard.pages.apps.mission_control", "render_mission_control"),
     "ML Intelligence": ("quant_system.dashboard.pages.apps.ml_intelligence", "render_ml_intelligence"),
     "Insights": ("quant_system.dashboard.pages.apps.insights", "render_insights"),
     "Regime Briefings": ("quant_system.dashboard.pages.apps.regime_briefings", "render_regime_briefings"),
     "Signal Intelligence": ("quant_system.dashboard.pages.apps.signal_intelligence", "render_signal_intelligence"),
+    "Confluence Studio": ("quant_system.dashboard.pages.apps.confluence_studio", "render_confluence_studio"),
     "Decision Trace": ("quant_system.dashboard.pages.apps.decision_trace", "render_decision_trace"),
     "Performance Intelligence": ("quant_system.dashboard.pages.apps.trade_log", "render_trade_log"),
     "Risk Radar": ("quant_system.dashboard.pages.apps.risk_radar", "render_risk_radar"),
@@ -60,6 +75,7 @@ DOMAIN_CAPTIONS = {
     "Insights": "Causal trace, feature graph, structural state, execution eligibility",
     "Regime Briefings": "12h state, persistence, transition risk, structural stability",
     "Signal Intelligence": "Comparative ranking, confluence vectors, candidate coherence",
+    "Confluence Studio": "Rule confluence, ML confluence, specialist alignment, routing and execution coherence",
     "Decision Trace": "Per-alert causal chain, entry/exit rationale, lifecycle reconstruction",
     "Performance Intelligence": "Per-trade ledger, PnL decomposition, win-rate and ML attribution surfaces",
     "Risk Radar": "Stress gates, fragility, liquidity degradation, readiness control",
@@ -186,7 +202,7 @@ def _render_mode_switch() -> str:
 
 with st.sidebar:
     if LOGO_PATH.exists():
-        st.image(str(LOGO_PATH), use_container_width=True)
+        _render_sidebar_logo(LOGO_PATH)
     st.title("Quant Terminal")
     theme_choice = st.selectbox("Theme", ["bloomberg", "dark", "minimal", "high_contrast"], index=0)
     theme_manager.apply_theme(theme_choice)

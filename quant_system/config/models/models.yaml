@@ -239,6 +239,16 @@ training_preprocessing:
       dominance_share_warn: 0.55
       monitor_features_by_model:
         flow_1h: ["flow_age_bars_1h", "flow_ok_1h", "flow_signal_1h"]
+  threshold_tuning:
+    enabled: true
+    holdout_frac: 0.15
+    min_rows: 4096
+    min_holdout_rows: 512
+    metric: "f1"
+    min_precision: 0.10
+    min_recall: 0.01
+    default_threshold: 0.50
+    max_candidates: 256
 
 training_logging:
   heartbeat_seconds: 60
@@ -327,9 +337,15 @@ tcn_training:
         max_epochs: [8, 20]
 
 # -------------------------------------------------------
-# Runtime inference source preference for specialist models
+# Runtime inference routing
 # -------------------------------------------------------
 inference_preference:
-  # True = try <specialist>_tcn first, then fallback to tree specialist.
-  # False = try tree specialist first, then fallback to <specialist>_tcn.
-  prefer_tcn_specialists: true
+  # Active family route used by backtest / forward / live runtimes.
+  # tree = tree specialists + tree stacks
+  # tcn = TCN specialists + TCN stacks
+  # hybrid_explicit = mixed specialists + dedicated hybrid stacks
+  routing_mode: tree
+  # Dashboard / ops reference route. Informational until challenger deployment is enabled.
+  challenger_mode: tcn
+  # Hybrid stays disabled until dedicated *_hybrid stack artifacts exist.
+  allow_hybrid_explicit: false

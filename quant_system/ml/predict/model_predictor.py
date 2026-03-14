@@ -3,12 +3,42 @@ Predictor for specialist models, meta-model, confluence, and hazard.
 Uses ModelRegistry artifacts (clf.joblib + optional cal.joblib).
 """
 
+from pathlib import Path
 import numpy as np
 import pandas as pd
 from typing import Dict, Any, List, Tuple, Optional
 
 from quant_system.utils.logger import log
 from quant_system.ml.registry.model_registry import ModelRegistry
+
+
+INFERENCE_ROUTING_MODES = {"tree", "tcn", "hybrid_explicit"}
+
+
+def _normalize_routing_mode(value: Any, *, default: str) -> str:
+    raw = str(value or "").strip().lower()
+    return raw if raw in INFERENCE_ROUTING_MODES else default
+
+
+def resolve_inference_preference(pref_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    pref = pref_cfg if isinstance(pref_cfg, dict) else {}
+    requested = pref.get("routing_mode")
+    legacy = pref.get("prefer_tcn_specialists")
+    if requested is None:
+        if isinstance(legacy, bool):
+            requested = "tcn" if legacy else "tree"
+        else:
+            requested = "tree"
+
+    routing_mode = _normalize_routing_mode(requested, default="tree")
+    challenger_mode = _normalize_routing_mode(pref.get("challenger_mode", "tcn"), default="tcn")
+    allow_hybrid_explicit = bool(pref.get("allow_hybrid_explicit", False))
+
+    return {
+        "routing_mode": routing_mode,
+        "challenger_mode": challenger_mode,
+        "allow_hybrid_explicit": allow_hybrid_explicit,
+    }
 
 
 class ModelPredictor:
@@ -22,22 +52,100 @@ class ModelPredictor:
     """
 
     SPECIALIST_MODELS = {"liq_flow", "bos_cont", "flow_1h", "momo", "eop", "edp"}
+    STACK_MODELS = {"meta_model", "confluence_model"}
 
-    def __init__(self, registry: ModelRegistry, *, prefer_tcn_specialists: bool = True):
+    def __init__(
+        self,
+        registry: ModelRegistry,
+        *,
+        routing_mode: str = "tree",
+        challenger_mode: str = "tcn",
+        allow_hybrid_explicit: bool = False,
+        active_slot: str = "production",
+        prefer_tcn_specialists: Optional[bool] = None,
+    ):
         self.registry = registry
-        self.prefer_tcn_specialists = bool(prefer_tcn_specialists)
+        if prefer_tcn_specialists is not None:
+            routing_mode = "tcn" if bool(prefer_tcn_specialists) else "tree"
+        self.requested_routing_mode = _normalize_routing_mode(routing_mode, default="tree")
+        self.challenger_routing_mode = _normalize_routing_mode(challenger_mode, default="tcn")
+        self.allow_hybrid_explicit = bool(allow_hybrid_explicit)
+        self.active_slot = str(active_slot or "production")
         self._resolved_specialist_names: Dict[str, str] = {}
-        log(f"ModelPredictor initialized. prefer_tcn_specialists={self.prefer_tcn_specialists}")
+        self._resolved_stack_names: Dict[str, str] = {}
+        self._resolved_specialist_meta: Dict[str, Dict[str, Any]] = {}
+        self._resolved_stack_meta: Dict[str, Dict[str, Any]] = {}
+        self._routing_note = ""
+        self._effective_routing_mode = self._resolve_effective_routing_mode()
+        log(
+            "ModelPredictor initialized. "
+            f"requested_route={self.requested_routing_mode} "
+            f"effective_route={self._effective_routing_mode} "
+            f"challenger={self.challenger_routing_mode} "
+            f"active_slot={self.active_slot} "
+            f"allow_hybrid_explicit={self.allow_hybrid_explicit} "
+            f"note={self._routing_note or 'ready'}"
+        )
 
     def source_mode(self) -> str:
-        return "tcn_first" if self.prefer_tcn_specialists else "tree_first"
+        return self._effective_routing_mode
+
+    def routing_status(self) -> Dict[str, Any]:
+        return {
+            "requested_mode": self.requested_routing_mode,
+            "effective_mode": self._effective_routing_mode,
+            "challenger_mode": self.challenger_routing_mode,
+            "active_slot": self.active_slot,
+            "allow_hybrid_explicit": self.allow_hybrid_explicit,
+            "note": self._routing_note,
+        }
 
     def specialist_source_map(self) -> Dict[str, str]:
         return dict(self._resolved_specialist_names)
 
+    def stack_source_map(self) -> Dict[str, str]:
+        return dict(self._resolved_stack_names)
+
+    def specialist_bundle_map(self) -> Dict[str, Dict[str, Any]]:
+        return {k: dict(v) for k, v in self._resolved_specialist_meta.items()}
+
+    def stack_bundle_map(self) -> Dict[str, Dict[str, Any]]:
+        return {k: dict(v) for k, v in self._resolved_stack_meta.items()}
+
     @staticmethod
     def _is_asset_specific(name: str) -> bool:
         return "_" in name and name.split("_", 1)[0].isupper()
+
+    def _model_exists(self, model_name: str) -> bool:
+        model_root = Path(self.registry.base_dir) / str(model_name)
+        if not model_root.exists() or not model_root.is_dir():
+            return False
+        return any(child.is_dir() for child in model_root.iterdir())
+
+    def _stack_family_ready(self, suffix: str) -> bool:
+        suffix = str(suffix).strip()
+        required = [f"{name}_{suffix}" for name in sorted(self.STACK_MODELS)]
+        return all(self._model_exists(name) or self._model_exists(f"BTCUSD_{name}") for name in required)
+
+    def _resolve_effective_routing_mode(self) -> str:
+        requested = self.requested_routing_mode
+        if requested == "tree":
+            return "tree"
+        if requested == "hybrid_explicit":
+            if not self.allow_hybrid_explicit:
+                self._routing_note = "hybrid_explicit requested but disabled; falling back to tree"
+                return "tree"
+            if not self._stack_family_ready("hybrid"):
+                self._routing_note = "hybrid stack artifacts missing; falling back to tree"
+                return "tree"
+            return "hybrid_explicit"
+        if requested == "tcn":
+            if not self._stack_family_ready("tcn"):
+                self._routing_note = "tcn stack artifacts missing; falling back to tree"
+                return "tree"
+            return "tcn"
+        self._routing_note = f"unknown routing mode '{requested}'; falling back to tree"
+        return "tree"
 
     def _candidate_specialist_names(self, model_name: str) -> List[str]:
         name = str(model_name)
@@ -48,31 +156,60 @@ class ModelPredictor:
         if name not in self.SPECIALIST_MODELS:
             return [name]
 
-        # Keep canonical downstream naming (prob_liq_flow etc.) while allowing
-        # model source routing to prefer TCN artifacts by default.
-        if self.prefer_tcn_specialists:
+        mode = self.source_mode()
+        if mode == "tcn":
+            return [f"{name}_tcn", f"BTCUSD_{name}_tcn"]
+        if mode == "hybrid_explicit":
             return [f"{name}_tcn", name, f"BTCUSD_{name}_tcn", f"BTCUSD_{name}"]
-        return [name, f"{name}_tcn", f"BTCUSD_{name}", f"BTCUSD_{name}_tcn"]
+        return [name, f"BTCUSD_{name}"]
 
     def _load_specialist_bundle(self, model_name: str) -> Tuple[Any, Any, Dict[str, Any], str]:
         requested = str(model_name)
         cached = self._resolved_specialist_names.get(requested)
         if cached is not None:
             try:
-                clf, cal, cfg = self.registry.load_latest_bundle(cached)
+                cached_meta = self._resolved_specialist_meta.get(requested, {})
+                version = str(cached_meta.get("version") or "").strip()
+                if version:
+                    clf, cal, cfg = self.registry.load_bundle(cached, version)
+                else:
+                    clf, cal, cfg, meta = self.registry.load_preferred_bundle(
+                        cached,
+                        requested_model=requested,
+                        slot=self.active_slot,
+                    )
+                    self._resolved_specialist_meta[requested] = {
+                        **meta,
+                        "decision_threshold": cfg.get("decision_threshold"),
+                    }
                 return clf, cal, cfg, cached
             except Exception:
                 # stale cache entry (artifact rotation/deletion) -> re-resolve
                 self._resolved_specialist_names.pop(requested, None)
+                self._resolved_specialist_meta.pop(requested, None)
 
         last_exc: Optional[Exception] = None
         for candidate in self._candidate_specialist_names(requested):
             try:
-                clf, cal, cfg = self.registry.load_latest_bundle(candidate)
-                self._resolved_specialist_names[requested] = candidate
-                if candidate != requested:
-                    log(f"ModelPredictor specialist route: {requested} -> {candidate}")
-                return clf, cal, cfg, candidate
+                clf, cal, cfg, meta = self.registry.load_preferred_bundle(
+                    candidate,
+                    requested_model=requested,
+                    slot=self.active_slot,
+                )
+                resolved_name = str(meta.get("model_id") or candidate)
+                self._resolved_specialist_names[requested] = resolved_name
+                self._resolved_specialist_meta[requested] = {
+                    **meta,
+                    "decision_threshold": cfg.get("decision_threshold"),
+                }
+                if resolved_name != requested:
+                    log(
+                        "ModelPredictor specialist route: "
+                        f"{requested} -> {resolved_name} "
+                        f"version={meta.get('version')} "
+                        f"source={meta.get('selection_source', 'best')}"
+                    )
+                return clf, cal, cfg, resolved_name
             except Exception as exc:
                 last_exc = exc
                 continue
@@ -80,6 +217,72 @@ class ModelPredictor:
         if last_exc is not None:
             raise last_exc
         raise RuntimeError(f"No model candidate resolved for specialist '{requested}'.")
+
+    def _candidate_stack_names(self, model_name: str) -> List[str]:
+        name = str(model_name)
+        if self._is_asset_specific(name):
+            return [name]
+
+        mode = self.source_mode()
+        if mode == "tcn":
+            return [f"{name}_tcn", f"BTCUSD_{name}_tcn"]
+        if mode == "hybrid_explicit":
+            return [f"{name}_hybrid", f"BTCUSD_{name}_hybrid"]
+        return [name, f"BTCUSD_{name}"]
+
+    def _load_stack_bundle(self, model_name: str) -> Tuple[Any, Any, Dict[str, Any], str]:
+        requested = str(model_name)
+        cached = self._resolved_stack_names.get(requested)
+        if cached is not None:
+            try:
+                cached_meta = self._resolved_stack_meta.get(requested, {})
+                version = str(cached_meta.get("version") or "").strip()
+                if version:
+                    clf, cal, cfg = self.registry.load_bundle(cached, version)
+                else:
+                    clf, cal, cfg, meta = self.registry.load_preferred_bundle(
+                        cached,
+                        requested_model=requested,
+                        slot=self.active_slot,
+                    )
+                    self._resolved_stack_meta[requested] = {
+                        **meta,
+                        "decision_threshold": cfg.get("decision_threshold"),
+                    }
+                return clf, cal, cfg, cached
+            except Exception:
+                self._resolved_stack_names.pop(requested, None)
+                self._resolved_stack_meta.pop(requested, None)
+
+        last_exc: Optional[Exception] = None
+        for candidate in self._candidate_stack_names(requested):
+            try:
+                clf, cal, cfg, meta = self.registry.load_preferred_bundle(
+                    candidate,
+                    requested_model=requested,
+                    slot=self.active_slot,
+                )
+                resolved_name = str(meta.get("model_id") or candidate)
+                self._resolved_stack_names[requested] = resolved_name
+                self._resolved_stack_meta[requested] = {
+                    **meta,
+                    "decision_threshold": cfg.get("decision_threshold"),
+                }
+                if resolved_name != requested:
+                    log(
+                        "ModelPredictor stack route: "
+                        f"{requested} -> {resolved_name} "
+                        f"version={meta.get('version')} "
+                        f"source={meta.get('selection_source', 'best')}"
+                    )
+                return clf, cal, cfg, resolved_name
+            except Exception as exc:
+                last_exc = exc
+                continue
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"No model candidate resolved for stack '{requested}'.")
 
     def warmup_specialists(self, specialist_list: Optional[List[str]] = None) -> Dict[str, str]:
         names = specialist_list or sorted(self.SPECIALIST_MODELS)
@@ -89,6 +292,15 @@ class ModelPredictor:
             except Exception:
                 continue
         return self.specialist_source_map()
+
+    def warmup_stacks(self, stack_list: Optional[List[str]] = None) -> Dict[str, str]:
+        names = stack_list or sorted(self.STACK_MODELS)
+        for model_name in names:
+            try:
+                _clf, _cal, _cfg, _resolved = self._load_stack_bundle(model_name)
+            except Exception:
+                continue
+        return self.stack_source_map()
 
     @staticmethod
     def _row_frame(row_like, feature_cols: List[str]):
@@ -136,7 +348,7 @@ class ModelPredictor:
         return float(p)
 
     def _predict_stack(self, model_name: str, specialist_probs: Dict[str, float]) -> Optional[float]:
-        clf, _cal, cfg = self.registry.load_latest_bundle(model_name)
+        clf, _cal, cfg, _resolved_name = self._load_stack_bundle(model_name)
         stack_inputs = cfg.get("stack_inputs", list(specialist_probs.keys()))
         if not stack_inputs:
             return None

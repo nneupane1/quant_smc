@@ -72,6 +72,15 @@ def _scan_model_registry(model_root: Path) -> pd.DataFrame:
                 "cv_score": float(cv_score) if cv_score is not None else None,
                 "cv_auc": float(cv_auc) if cv_auc is not None else None,
                 "cv_ap": float(cv_ap) if cv_ap is not None else None,
+                "decision_threshold": (
+                    float(cfg.get("decision_threshold"))
+                    if isinstance(cfg.get("decision_threshold"), (int, float))
+                    else (
+                        float((metrics.get("threshold_tuning") or {}).get("threshold"))
+                        if isinstance((metrics.get("threshold_tuning") or {}).get("threshold"), (int, float))
+                        else None
+                    )
+                ),
                 "hpo_trials": metrics.get("hpo_trials"),
                 "hpo_trials_completed": metrics.get("hpo_trials_completed"),
                 "pos_rate": counts["pos_rate"],
@@ -191,6 +200,7 @@ def _scan_train_manifests(train_root: Path) -> pd.DataFrame:
                 "version": payload.get("version"),
                 "rows": payload.get("rows"),
                 "cv_score": metric_obj.get("cv_score"),
+                "decision_threshold": metric_obj.get("decision_threshold"),
                 "hpo_trials": metric_obj.get("hpo_trials"),
                 "feature_count": len(metric_obj.get("selected_feature_cols", []) or []),
                 "manifest_path": str(path),
@@ -206,8 +216,53 @@ def _scan_train_manifests(train_root: Path) -> pd.DataFrame:
     return df.sort_values("updated_at", ascending=False).reset_index(drop=True)
 
 
+def _scan_active_routes(model_root: Path) -> pd.DataFrame:
+    payload = _safe_json(model_root / "active_models.json")
+    if not payload:
+        return pd.DataFrame()
+    rows: List[Dict[str, Any]] = []
+    for slot, slot_payload in sorted(payload.items()):
+        if not isinstance(slot_payload, dict):
+            continue
+        routes = slot_payload.get("routes", {})
+        if isinstance(routes, dict):
+            for requested, entry in sorted(routes.items()):
+                if not isinstance(entry, dict):
+                    continue
+                model_id = str(entry.get("model_id") or "")
+                version = str(entry.get("version") or "")
+                cfg = _safe_json(model_root / model_id / version / "config.json") if model_id and version else {}
+                rows.append(
+                    {
+                        "slot": slot,
+                        "requested_model": requested,
+                        "model_id": model_id,
+                        "version": version,
+                        "decision_threshold": cfg.get("decision_threshold"),
+                        "selected_metric": entry.get("selected_metric"),
+                        "selected_score": entry.get("selected_score"),
+                        "updated_at": pd.to_datetime(entry.get("updated_at"), unit="s", utc=True, errors="coerce"),
+                    }
+                )
+        elif slot_payload.get("model_id"):
+            rows.append(
+                {
+                    "slot": slot,
+                    "requested_model": "*",
+                    "model_id": str(slot_payload.get("model_id")),
+                    "version": None,
+                    "decision_threshold": None,
+                    "selected_metric": None,
+                    "selected_score": None,
+                    "updated_at": pd.to_datetime(slot_payload.get("updated_at"), unit="s", utc=True, errors="coerce"),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def _render_route_table(state: Dict[str, Any], model_root: Path) -> None:
     routes = state.get("specialist_model_source", {}) if isinstance(state.get("specialist_model_source"), dict) else {}
+    bundles = state.get("specialist_model_bundle", {}) if isinstance(state.get("specialist_model_bundle"), dict) else {}
     if not routes:
         inject_page_notice("No specialist route map found yet. It will appear after models load in forward/live runtime.")
         return
@@ -215,16 +270,27 @@ def _render_route_table(state: Dict[str, Any], model_root: Path) -> None:
     for specialist, resolved in sorted(routes.items()):
         meta = _target_and_family(str(resolved))
         exists = (model_root / str(resolved)).exists()
+        bundle = bundles.get(str(specialist), {}) if isinstance(bundles.get(str(specialist)), dict) else {}
         rows.append(
             {
                 "specialist": specialist,
                 "resolved_model": resolved,
+                "version": bundle.get("version"),
                 "family": meta["family"],
+                "selection_source": bundle.get("selection_source"),
+                "decision_threshold": bundle.get("decision_threshold"),
                 "model_dir_exists": bool(exists),
             }
         )
     route_df = pd.DataFrame(rows)
     st.dataframe(route_df, use_container_width=True, hide_index=True)
+
+
+def _render_active_routes(active_df: pd.DataFrame) -> None:
+    if active_df.empty:
+        st.info("No active-route manifest found yet. Predictor will fall back to best-scoring version selection.")
+        return
+    st.dataframe(active_df, use_container_width=True, hide_index=True)
 
 
 def _render_family_comparison(models_df: pd.DataFrame) -> None:
@@ -259,7 +325,7 @@ def _render_family_comparison(models_df: pd.DataFrame) -> None:
             x=alt.X("target:N", title="Target"),
             y=alt.Y("cv_score:Q", title="CV score"),
             color=alt.Color("family:N", scale=alt.Scale(domain=["tcn", "tree"], range=["#4ac7ff", "#ffb000"])),
-            tooltip=["target", "family", "cv_score", "version", "feature_count", "hpo_trials"],
+            tooltip=["target", "family", "cv_score", "decision_threshold", "version", "feature_count", "hpo_trials"],
         )
         .properties(height=300)
     )
@@ -326,7 +392,7 @@ def _render_feature_footprint(models_df: pd.DataFrame) -> None:
             x=alt.X("feature_count:Q", title="Feature count"),
             y=alt.Y("cv_score:Q", title="CV score"),
             color=alt.Color("family:N", scale=alt.Scale(domain=["tcn", "tree"], range=["#4ac7ff", "#ffb000"])),
-            tooltip=["model", "target", "family", "version", "feature_count", "transform_dim", "cv_score", "cv_auc", "cv_ap", "pos_rate"],
+            tooltip=["model", "target", "family", "version", "feature_count", "transform_dim", "cv_score", "cv_auc", "cv_ap", "decision_threshold", "pos_rate"],
         )
         .properties(height=300)
     )
@@ -364,12 +430,15 @@ def render_ml_intelligence(theme_choice: str, model_version: str, *, context: Da
     models_df = _scan_model_registry(model_root)
     manifests_df = _scan_train_manifests(train_root)
     running_df = _scan_hpo_progress(train_root)
+    active_df = _scan_active_routes(model_root)
 
     tcn_count = int((models_df["family"] == "tcn").sum()) if not models_df.empty else 0
     tree_count = int((models_df["family"] == "tree").sum()) if not models_df.empty else 0
     best_score = float(models_df["cv_score"].max()) if (not models_df.empty and models_df["cv_score"].notna().any()) else float("nan")
+    threshold_count = int(models_df["decision_threshold"].notna().sum()) if (not models_df.empty and "decision_threshold" in models_df.columns) else 0
     source_mode = str(state.get("inference_source_mode") or ("tcn_first" if state.get("prefer_tcn_specialists") else "tree_first"))
     routes = state.get("specialist_model_source", {}) if isinstance(state.get("specialist_model_source"), dict) else {}
+    active_slot = str(state.get("active_slot") or "production")
 
     metric_grid(
         [
@@ -379,8 +448,13 @@ def render_ml_intelligence(theme_choice: str, model_version: str, *, context: Da
             {"label": "Best CV Score", "value": f"{best_score:.4f}" if pd.notna(best_score) else "--"},
             {"label": "Inference Route", "value": source_mode},
             {"label": "Resolved Specialists", "value": f"{len(routes)}"},
+            {"label": "Active Slot", "value": active_slot},
+            {"label": "Thresholded Models", "value": f"{threshold_count}"},
         ]
     )
+
+    section_title("Active Slot Registry", "Pinned production routes. If empty, runtime uses best-scoring available versions.")
+    _render_active_routes(active_df)
 
     section_title("Inference Routing", "Live route map used by forward/live prediction layer")
     _render_route_table(state, model_root)
@@ -394,7 +468,7 @@ def render_ml_intelligence(theme_choice: str, model_version: str, *, context: Da
         if manifests_df.empty:
             st.info("No training manifests found yet.")
         else:
-            show_cols = [c for c in ("asset", "target", "family", "version", "rows", "cv_score", "hpo_trials", "feature_count", "updated_at") if c in manifests_df.columns]
+            show_cols = [c for c in ("asset", "target", "family", "version", "rows", "cv_score", "decision_threshold", "hpo_trials", "feature_count", "updated_at") if c in manifests_df.columns]
             st.dataframe(manifests_df[show_cols], use_container_width=True, hide_index=True)
 
     section_title("HPO Live Monitor", "Current/last run snapshots + best-score timeline")

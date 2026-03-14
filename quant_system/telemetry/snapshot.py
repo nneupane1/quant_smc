@@ -1030,17 +1030,28 @@ def build_terminal_snapshot(
 
     model_version = _discover_model_version(repo_root_path)
     prefer_tcn_specialists = bool(state.get("prefer_tcn_specialists", False))
+    routing_mode_requested = str(state.get("routing_mode_requested") or ("tcn" if prefer_tcn_specialists else "tree"))
+    challenger_mode = str(state.get("challenger_mode") or "tcn")
+    allow_hybrid_explicit = bool(state.get("allow_hybrid_explicit", False))
+    routing_note = str(state.get("routing_note") or "")
     inference_source_mode = str(
         state.get("inference_source_mode")
-        or ("tcn_first" if prefer_tcn_specialists else "tree_first")
+        or routing_mode_requested
     )
     specialist_model_source = (
         dict(state.get("specialist_model_source", {}))
         if isinstance(state.get("specialist_model_source"), dict)
         else {}
     )
+    stack_model_source = (
+        dict(state.get("stack_model_source", {}))
+        if isinstance(state.get("stack_model_source"), dict)
+        else {}
+    )
     route_parts = [f"{k}:{v}" for k, v in sorted(specialist_model_source.items())]
-    route_detail = ", ".join(route_parts) if route_parts else "not resolved yet"
+    stack_parts = [f"{k}:{v}" for k, v in sorted(stack_model_source.items())]
+    route_detail = ", ".join(route_parts) if route_parts else "specialists not resolved yet"
+    stack_detail = ", ".join(stack_parts) if stack_parts else "stacks not resolved yet"
 
     signals = _signal_candidates(raw_snapshot, fallback)
     events = _recent_events(raw_snapshot, fallback)
@@ -1070,6 +1081,9 @@ def build_terminal_snapshot(
             "modelVersion": str(model_version),
             "transport": "fastapi + websocket event plane",
             "preferTcnSpecialists": prefer_tcn_specialists,
+            "requestedInferenceMode": routing_mode_requested,
+            "challengerMode": challenger_mode,
+            "allowHybridExplicit": allow_hybrid_explicit,
             "inferenceSourceMode": inference_source_mode,
         },
         "mission": {
@@ -1093,8 +1107,8 @@ def build_terminal_snapshot(
                 {
                     "label": "Inference Route",
                     "value": inference_source_mode,
-                    "detail": route_detail,
-                    "tone": "teal" if inference_source_mode == "tcn_first" else "amber",
+                    "detail": f"{route_detail} | {stack_detail}" + (f" | note={routing_note}" if routing_note else ""),
+                    "tone": "teal" if inference_source_mode == "tcn" else ("cyan" if inference_source_mode == "hybrid_explicit" else "amber"),
                 },
                 {"label": "Decision Tape", "value": f"{len(events)} events", "detail": "Event payloads are emitted by the shared telemetry adapter.", "tone": "teal"},
             ],

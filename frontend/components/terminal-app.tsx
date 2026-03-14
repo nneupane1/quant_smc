@@ -24,7 +24,7 @@ import {
   ShieldCheck,
 } from "lucide-react";
 
-import type { AuditEvent, AuditTrade, Guardrail, InsightNode, MetricTile, ReasoningTree, SignalCandidate, TerminalSnapshot } from "@/lib/terminal-types";
+import type { AuditEvent, AuditTrade, Guardrail, InsightNode, MetricTile, ReasoningTree, SignalCandidate, TerminalMode, TerminalSnapshot } from "@/lib/terminal-types";
 import { MarketCanvas } from "@/components/market-canvas";
 
 const DOMAINS = [
@@ -34,11 +34,19 @@ const DOMAINS = [
   { id: "insights", label: "Insights", caption: "Causal trace, structure, eligibility", icon: BrainCircuit },
   { id: "regime", label: "Regime Briefings", caption: "12h state, persistence, transition risk", icon: Orbit },
   { id: "signals", label: "Signal Intelligence", caption: "Ranked candidates, confluence, coherence", icon: AudioWaveform },
+  { id: "confluence", label: "Confluence Studio", caption: "Rule vs ML confluence, stack alignment, decision quality", icon: Gauge },
   { id: "risk", label: "Risk Radar", caption: "Stress, slippage, exposure, gates", icon: Radar },
   { id: "audit", label: "Research & Audit", caption: "Traceability, trades, replayable events", icon: DatabaseZap },
 ] as const;
 
 type DomainId = (typeof DOMAINS)[number]["id"];
+
+const MODE_OPTIONS: Array<{ id: TerminalMode; label: string; caption: string }> = [
+  { id: "auto", label: "Auto", caption: "smart source" },
+  { id: "backtest", label: "Backtest", caption: "historical" },
+  { id: "forward", label: "Forward Test", caption: "paper runtime" },
+  { id: "live", label: "Live", caption: "production runtime" },
+];
 
 const toneClasses: Record<MetricTile["tone"], string> = {
   cyan: "text-cyan border-cyan/20 bg-cyan/10",
@@ -49,6 +57,11 @@ const toneClasses: Record<MetricTile["tone"], string> = {
 };
 
 function normalizeSnapshot(snapshot: TerminalSnapshot): TerminalSnapshot {
+  const normalizedMeta = {
+    ...snapshot.meta,
+    viewModeRequested: snapshot.meta?.viewModeRequested ?? "auto",
+    viewModeEffective: snapshot.meta?.viewModeEffective ?? "auto",
+  };
   const normalizedMarket = snapshot.market
     ? {
         ...snapshot.market,
@@ -71,9 +84,10 @@ function normalizeSnapshot(snapshot: TerminalSnapshot): TerminalSnapshot {
         stats: [],
         activeTrades: snapshot.audit?.trades?.slice(0, 8) ?? [],
       };
-  if (snapshot.performance && snapshot.market) return { ...snapshot, market: normalizedMarket };
+  if (snapshot.performance && snapshot.market) return { ...snapshot, meta: normalizedMeta, market: normalizedMarket };
   return {
     ...snapshot,
+    meta: normalizedMeta,
     performance: {
       summary: snapshot.performance?.summary ?? "Performance payload not provided by backend yet.",
       kpis: [],
@@ -86,10 +100,42 @@ function normalizeSnapshot(snapshot: TerminalSnapshot): TerminalSnapshot {
   };
 }
 
-export function TerminalApp({ initialSnapshot }: { initialSnapshot: TerminalSnapshot }) {
+function getObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function pickNumber(...values: unknown[]): number | null {
+  for (const value of values) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+function pickString(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return null;
+}
+
+export function TerminalApp({
+  initialSnapshot,
+  initialMode = "auto",
+}: {
+  initialSnapshot: TerminalSnapshot;
+  initialMode?: TerminalMode;
+}) {
   const [activeDomain, setActiveDomain] = useState<DomainId>("mission");
   const [hoveredDomain, setHoveredDomain] = useState<DomainId | null>(null);
   const [snapshot, setSnapshot] = useState(normalizeSnapshot(initialSnapshot));
+  const [viewMode, setViewMode] = useState<TerminalMode>(initialMode);
   const [wsConnected, setWsConnected] = useState(false);
   const [selectedSignalId, setSelectedSignalId] = useState<string | null>(initialSnapshot.signals.candidates[0]?.id ?? null);
   const deferredSignals = useDeferredValue(snapshot.signals.candidates).slice(0, 5);
@@ -108,7 +154,7 @@ export function TerminalApp({ initialSnapshot }: { initialSnapshot: TerminalSnap
     let cancelled = false;
     const refreshSnapshot = async () => {
       try {
-        const res = await fetch("/api/terminal", { cache: "no-store" });
+        const res = await fetch(`/api/terminal?mode=${viewMode}`, { cache: "no-store" });
         if (!res.ok || cancelled) return;
         const next = (await res.json()) as TerminalSnapshot;
         if (!cancelled) {
@@ -119,11 +165,11 @@ export function TerminalApp({ initialSnapshot }: { initialSnapshot: TerminalSnap
       }
     };
 
-    if (!wsConnected) {
+    if (!wsConnected || (viewMode !== "auto" && viewMode !== "live")) {
       refreshSnapshot();
     }
     const timer = window.setInterval(() => {
-      if (!wsConnected) {
+      if (!wsConnected || (viewMode !== "auto" && viewMode !== "live")) {
         refreshSnapshot();
       }
     }, 3000);
@@ -131,7 +177,14 @@ export function TerminalApp({ initialSnapshot }: { initialSnapshot: TerminalSnap
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [wsConnected]);
+  }, [viewMode, wsConnected]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const url = new URL(window.location.href);
+    url.searchParams.set("mode", viewMode);
+    window.history.replaceState({}, "", url);
+  }, [viewMode]);
 
   useEffect(() => {
     const nextId = snapshot.signals.candidates[0]?.id ?? null;
@@ -163,6 +216,9 @@ export function TerminalApp({ initialSnapshot }: { initialSnapshot: TerminalSnap
       };
 
       socket.onmessage = (message) => {
+        if (viewMode !== "auto" && viewMode !== "live") {
+          return;
+        }
         try {
           const payload = JSON.parse(message.data) as {
             type?: string;
@@ -222,7 +278,7 @@ export function TerminalApp({ initialSnapshot }: { initialSnapshot: TerminalSnap
       }
       socket?.close();
     };
-  }, [wsUrl]);
+  }, [viewMode, wsUrl]);
 
   const hoverCaption = hoveredDomain
     ? DOMAINS.find((item) => item.id === hoveredDomain)?.caption
@@ -286,6 +342,11 @@ export function TerminalApp({ initialSnapshot }: { initialSnapshot: TerminalSnap
 
         <div className="min-w-0 flex-1">
           <TopBar snapshot={snapshot} wsConnected={wsConnected} />
+          <ModeDock
+            selectedMode={viewMode}
+            effectiveMode={snapshot.meta.viewModeEffective ?? viewMode}
+            onChange={setViewMode}
+          />
           <div className={`mt-5 grid gap-5 ${activeDomain === "market" ? "xl:grid-cols-1" : "xl:grid-cols-[1.5fr_0.95fr]"}`}>
             <AnimatePresence mode="wait">
               <motion.section
@@ -305,6 +366,15 @@ export function TerminalApp({ initialSnapshot }: { initialSnapshot: TerminalSnap
                   <SignalsPanel
                     summary={snapshot.signals.summary}
                     candidates={deferredSignals}
+                    selectedSignalId={selectedSignalId}
+                    onSelectSignal={setSelectedSignalId}
+                    reasoning={selectedReasoning}
+                  />
+                )}
+                {activeDomain === "confluence" && (
+                  <ConfluencePanel
+                    snapshot={snapshot}
+                    candidates={snapshot.signals.candidates}
                     selectedSignalId={selectedSignalId}
                     onSelectSignal={setSelectedSignalId}
                     reasoning={selectedReasoning}
@@ -359,6 +429,51 @@ function TopBar({ snapshot, wsConnected }: { snapshot: TerminalSnapshot; wsConne
           <StatusPill label={`Models ${snapshot.meta.modelVersion}`} tone="cyan" />
           <StatusPill label={snapshot.mission.status} tone={snapshot.mission.status === "Cooling" ? "rose" : "teal"} />
         </div>
+      </div>
+    </div>
+  );
+}
+
+function ModeDock({
+  selectedMode,
+  effectiveMode,
+  onChange,
+}: {
+  selectedMode: TerminalMode;
+  effectiveMode: TerminalMode;
+  onChange: (mode: TerminalMode) => void;
+}) {
+  return (
+    <div className="glass-panel mt-4 overflow-hidden px-5 py-5">
+      <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+        <div>
+          <div className="section-kicker">Environment Mode</div>
+          <div className="mt-2 text-sm leading-6 text-slate-300/75">
+            Switch the entire terminal between historical, forward-test, and live runtime views without changing the shell.
+          </div>
+        </div>
+        <div className="rounded-full border border-amber/20 bg-amber/10 px-4 py-2 text-xs uppercase tracking-[0.2em] text-amber">
+          effective {effectiveMode}
+        </div>
+      </div>
+      <div className="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        {MODE_OPTIONS.map((mode) => {
+          const active = selectedMode === mode.id;
+          return (
+            <button
+              key={mode.id}
+              onClick={() => onChange(mode.id)}
+              className={`rounded-[22px] border px-4 py-4 text-left transition ${
+                active
+                  ? "border-amber/40 bg-amber/12 text-amber shadow-amber"
+                  : "border-white/10 bg-white/[0.03] text-slate-200 hover:border-cyan/30 hover:bg-cyan/5"
+              }`}
+            >
+              <div className="font-medium">{mode.label}</div>
+              <div className="mt-1 text-[0.68rem] uppercase tracking-[0.18em] text-slate-400">{mode.caption}</div>
+            </button>
+          );
+        })}
       </div>
     </div>
   );
@@ -1547,6 +1662,218 @@ function SignalsPanel({
         subtitle="Click any ranked candidate to inspect the exact nested decision vector that generated the alert."
         reasoning={reasoning}
       />
+    </div>
+  );
+}
+
+function ConfluencePanel({
+  snapshot,
+  candidates,
+  selectedSignalId,
+  onSelectSignal,
+  reasoning,
+}: {
+  snapshot: TerminalSnapshot;
+  candidates: SignalCandidate[];
+  selectedSignalId: string | null;
+  onSelectSignal: (signalId: string) => void;
+  reasoning?: ReasoningTree;
+}) {
+  const selectedCandidate = candidates.find((candidate) => candidate.id === selectedSignalId) ?? candidates[0];
+  const envelope = getObject(reasoning);
+  const decision = getObject(envelope?.decision);
+  const reasoningNode = getObject(envelope?.reasoning);
+  const ml = getObject(reasoningNode?.ml);
+  const hazardNode = getObject(reasoningNode?.hazard);
+  const finalDecision = getObject(reasoningNode?.final_decision);
+  const context = getObject(reasoningNode?.context);
+  const specialists = [
+    { label: "Liquidity", value: pickNumber(ml?.p_liq_flow, ml?.prob_liq_flow) ?? 0.0 },
+    { label: "BOS", value: pickNumber(ml?.p_bos_cont, ml?.prob_bos_cont) ?? 0.0 },
+    { label: "Flow 1h", value: pickNumber(ml?.p_flow_1h, ml?.prob_flow_1h, selectedCandidate?.flow1h) ?? 0.0 },
+  ];
+  const ruleConfluence = pickNumber(
+    finalDecision?.confluence,
+    decision?.confluence,
+    selectedCandidate?.confluence,
+    0.0,
+  ) ?? 0.0;
+  const mlConfluence = pickNumber(
+    ml?.prob_confluence,
+    ml?.p_confluence,
+    finalDecision?.prob_confluence,
+    selectedCandidate?.confluence,
+    ruleConfluence,
+  ) ?? ruleConfluence;
+  const hazard = pickNumber(
+    hazardNode?.hazard_score,
+    ml?.hazard_score,
+    selectedCandidate?.hazard,
+    0.0,
+  ) ?? 0.0;
+  const evr = pickNumber(finalDecision?.evr, decision?.evr, selectedCandidate?.evr, 0.0) ?? 0.0;
+  const flow1h = pickNumber(ml?.p_flow_1h, ml?.prob_flow_1h, selectedCandidate?.flow1h, 0.0) ?? 0.0;
+  const routeEffective = pickString(
+    envelope?.routing_mode_effective,
+    envelope?.effective_routing_mode,
+    reasoningNode?.routing_mode_effective,
+    context?.routing_mode_effective,
+    envelope?.inference_source_mode,
+  ) ?? "unreported";
+  const routeRequested = pickString(
+    envelope?.routing_mode_requested,
+    reasoningNode?.routing_mode_requested,
+    context?.routing_mode_requested,
+  ) ?? "tree";
+  const challengerMode = pickString(
+    envelope?.challenger_mode,
+    reasoningNode?.challenger_mode,
+    context?.challenger_mode,
+  ) ?? "tcn";
+  const side = pickString(decision?.side, selectedCandidate?.side) ?? "long";
+  const tier = pickString(finalDecision?.tier, decision?.tier, selectedCandidate?.tier) ?? "-";
+  const regime = pickString(finalDecision?.regime, decision?.regime, context?.regime, selectedCandidate?.regime) ?? "unknown";
+  const confluenceGap = mlConfluence - ruleConfluence;
+  const stackVector = [
+    ruleConfluence * 100,
+    mlConfluence * 100,
+    flow1h * 100,
+    (1 - Math.max(0, Math.min(1, hazard))) * 100,
+    ...specialists.map((item) => item.value * 100),
+  ];
+  const stackLabels = ["Rule", "ML", "Flow 1h", "Hazard Inv.", "Liquidity", "BOS"];
+  const scatterPoints = candidates.map((candidate) => ({
+    x: candidate.confluence * 100,
+    y: candidate.hazard * 100,
+    label: candidate.asset,
+    tone: candidate.side === "long" ? ("teal" as const) : ("rose" as const),
+  }));
+
+  return (
+    <div className="space-y-5">
+      <div className="glass-panel p-5">
+        <div className="section-kicker">Confluence Studio</div>
+        <h2 className="mt-2 text-xl font-semibold text-white">Stack agreement and execution quality in one desk</h2>
+        <p className="mt-3 text-sm leading-6 text-slate-300/75">
+          Confluence is kept separate here so you can read the decision stack cleanly without disturbing the original terminal shell.
+        </p>
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+        <MetricCard metric={{ label: "Rule Confluence", value: ruleConfluence.toFixed(2), tone: ruleConfluence >= 0.75 ? "teal" : ruleConfluence >= 0.6 ? "amber" : "rose", delta: `${tier} tier` }} />
+        <MetricCard metric={{ label: "ML Confluence", value: mlConfluence.toFixed(2), tone: mlConfluence >= 0.75 ? "teal" : mlConfluence >= 0.6 ? "amber" : "rose", delta: `${confluenceGap >= 0 ? "+" : ""}${confluenceGap.toFixed(2)} vs rule` }} />
+        <MetricCard metric={{ label: "EVR", value: evr.toFixed(2), tone: evr >= 2 ? "teal" : evr >= 1.5 ? "amber" : "rose", delta: regime }} />
+        <MetricCard metric={{ label: "Flow 1h", value: flow1h.toFixed(2), tone: flow1h >= 0.7 ? "teal" : flow1h >= 0.58 ? "amber" : "rose", delta: side }} />
+        <MetricCard metric={{ label: "Hazard", value: hazard.toFixed(2), tone: hazard <= 0.2 ? "teal" : hazard <= 0.32 ? "amber" : "rose", delta: "lower is better" }} />
+        <MetricCard metric={{ label: "Route", value: routeEffective, tone: routeEffective === "tcn" ? "teal" : routeEffective === "hybrid_explicit" ? "cyan" : "amber", delta: `req ${routeRequested} • chall ${challengerMode}` }} />
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-[1.2fr_1fr]">
+        <ChartCard
+          title="Confluence Stack Vector"
+          subtitle="Rule, ML, flow, and specialist support aligned on the same scale"
+        >
+          <InteractiveBarSurface
+            values={stackVector}
+            labels={stackLabels}
+            positiveColor="#52d7ff"
+            negativeColor="#ff6b88"
+            valueFormatter={(value) => `${value.toFixed(1)}%`}
+          />
+        </ChartCard>
+        <ChartCard
+          title="Candidate Quality Map"
+          subtitle="Upper-left remains best: high confluence, low hazard"
+        >
+          <ScatterSurface points={scatterPoints} />
+        </ChartCard>
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-[1.15fr_0.95fr]">
+        <div className="glass-panel overflow-hidden">
+          <div className="border-b border-white/10 px-5 py-4">
+            <div className="section-kicker">Signal Ladder</div>
+            <div className="mt-2 text-sm text-slate-300">Select the candidate whose confluence stack you want to inspect.</div>
+          </div>
+          <div className="divide-y divide-white/6">
+            {candidates.map((candidate) => {
+              const active = candidate.id === selectedCandidate?.id;
+              return (
+                <button
+                  key={candidate.id}
+                  onClick={() => onSelectSignal(candidate.id)}
+                  className={`w-full px-5 py-4 text-left transition hover:bg-cyan/5 ${active ? "bg-cyan/10" : ""}`}
+                >
+                  <div className="flex items-start justify-between gap-4">
+                    <div>
+                      <div className="font-medium text-white">{candidate.asset}</div>
+                      <div className="mt-1 text-xs uppercase tracking-[0.18em] text-slate-400">
+                        {candidate.side} • {candidate.tier} • {candidate.regime}
+                      </div>
+                      <div className="mt-2 text-sm text-slate-300/75">{candidate.reason}</div>
+                    </div>
+                    <div className="min-w-[132px]">
+                      <div className="flex items-center justify-between text-xs uppercase tracking-[0.16em] text-slate-400">
+                        <span>Conf</span>
+                        <span className="text-cyan">{candidate.confluence.toFixed(2)}</span>
+                      </div>
+                      <div className="mt-2 h-2 rounded-full bg-white/8">
+                        <div className="h-full rounded-full bg-gradient-to-r from-cyan to-teal" style={{ width: `${candidate.confluence * 100}%` }} />
+                      </div>
+                      <div className="mt-3 flex items-center justify-between text-xs uppercase tracking-[0.16em] text-slate-400">
+                        <span>Haz</span>
+                        <span className="text-rose">{candidate.hazard.toFixed(2)}</span>
+                      </div>
+                      <div className="mt-2 h-2 rounded-full bg-white/8">
+                        <div className="h-full rounded-full bg-gradient-to-r from-amber to-rose" style={{ width: `${candidate.hazard * 100}%` }} />
+                      </div>
+                    </div>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="space-y-4">
+          <div className="glass-panel p-5">
+            <div className="section-kicker">Execution Read</div>
+            <h3 className="mt-2 text-lg font-semibold text-white">{selectedCandidate?.asset ?? "No candidate selected"}</h3>
+            <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-1">
+              <NarrativePanel title="Requested Route" text={`Requested ${routeRequested}, effective ${routeEffective}, challenger ${challengerMode}.`} />
+              <NarrativePanel title="Decision Surface" text={`Rule confluence ${ruleConfluence.toFixed(2)}, ML confluence ${mlConfluence.toFixed(2)}, EVR ${evr.toFixed(2)}, hazard ${hazard.toFixed(2)}.`} />
+              <NarrativePanel title="Specialist Support" text={`Liquidity ${specialists[0].value.toFixed(2)}, BOS ${specialists[1].value.toFixed(2)}, Flow 1h ${flow1h.toFixed(2)}.`} />
+            </div>
+          </div>
+          <ChartCard
+            title="Selected Specialist Balance"
+            subtitle="Current candidate only"
+          >
+            <InteractiveBarSurface
+              values={[...specialists.map((item) => item.value * 100), mlConfluence * 100, hazard * 100]}
+              labels={["Liquidity", "BOS", "Flow 1h", "ML Conf", "Hazard"]}
+              positiveColor="#2ae6b8"
+              negativeColor="#ff6b88"
+              valueFormatter={(value) => `${value.toFixed(1)}%`}
+            />
+          </ChartCard>
+        </div>
+      </div>
+
+      <ReasoningTreePanel
+        title="Selected Confluence Payload"
+        subtitle="Exact structured payload attached to the selected candidate."
+        reasoning={reasoning}
+      />
+
+      <div className="glass-panel p-5">
+        <div className="section-kicker">System Link</div>
+        <div className="grid gap-4 md:grid-cols-3">
+          <TelemetryRow icon={<Gauge className="h-4 w-4" />} label="Model Version" value={snapshot.meta.modelVersion} />
+          <TelemetryRow icon={<ShieldCheck className="h-4 w-4" />} label="Transport" value={snapshot.meta.transport} />
+          <TelemetryRow icon={<BrainCircuit className="h-4 w-4" />} label="Active Regime" value={snapshot.regime.current} />
+        </div>
+      </div>
     </div>
   );
 }

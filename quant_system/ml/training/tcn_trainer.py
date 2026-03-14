@@ -429,7 +429,15 @@ class TCNSpecialistTrainer:
         self.progress_dir.mkdir(parents=True, exist_ok=True)
         self.progress_snapshot_path = self.progress_dir / str(self.cfg.get("progress_snapshot_filename", "hpo_progress.json"))
         self.progress_events_path = self.progress_dir / str(self.cfg.get("progress_events_filename", "hpo_progress.ndjson"))
+        self._configure_external_logging()
         self._set_runtime_knobs()
+
+    @staticmethod
+    def _configure_external_logging() -> None:
+        try:
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+        except Exception:
+            pass
 
     @staticmethod
     def _utc_now_iso() -> str:

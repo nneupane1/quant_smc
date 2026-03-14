@@ -27,8 +27,39 @@ class ConfigLoader:
     def __init__(self, conf_dir: str, env: str = None):
         self.conf_dir = conf_dir
         self.env = env or os.getenv("QS_ENV", "DEV").upper()
+        self.verbose_file_logs = os.getenv("QS_VERBOSE_CONFIG_LOGS", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._reset_load_trace()
         self._load_env_files()
-        log(f"ConfigLoader initialized. env={self.env}")
+        if self.verbose_file_logs:
+            log(f"ConfigLoader initialized. env={self.env}")
+
+    def _reset_load_trace(self):
+        self._load_trace = {
+            "base_loaded": False,
+            "module_files": 0,
+            "env_override": False,
+            "regime_overrides": 0,
+            "session_overrides": 0,
+            "env_injected": False,
+        }
+
+    def _record_load(self, message: str, trace_key: str = None):
+        if trace_key == "base_loaded":
+            self._load_trace["base_loaded"] = True
+        elif trace_key == "env_override":
+            self._load_trace["env_override"] = True
+        elif trace_key == "env_injected":
+            self._load_trace["env_injected"] = True
+        elif trace_key in {"module_files", "regime_overrides", "session_overrides"}:
+            self._load_trace[trace_key] += 1
+
+        if self.verbose_file_logs:
+            log(message)
 
     def _load_env_files(self):
         """
@@ -72,7 +103,7 @@ class ConfigLoader:
     def _load_base(self) -> Dict[str, Any]:
         path = os.path.join(self.conf_dir, "base.yaml")
         cfg = self._load_yaml(path)
-        log("Loaded base.yaml")
+        self._record_load("Loaded base.yaml", "base_loaded")
         return cfg
 
     # Public helper for modules that need a single YAML file
@@ -101,7 +132,7 @@ class ConfigLoader:
         for path in sorted(yaml_paths):
             mod = self._load_yaml(path)
             merged = self._merge(merged, mod)
-            log(f"Loaded {os.path.relpath(path, self.conf_dir)}")
+            self._record_load(f"Loaded {os.path.relpath(path, self.conf_dir)}", "module_files")
         return merged
 
     def _load_env_override(self) -> Dict[str, Any]:
@@ -111,7 +142,7 @@ class ConfigLoader:
         fname = f"{self.env}.yaml"
         path = self._find_file(fname)
         if os.path.exists(path):
-            log(f"Loaded env override {fname}")
+            self._record_load(f"Loaded env override {fname}", "env_override")
             return self._load_yaml(path)
         return {}
 
@@ -128,7 +159,7 @@ class ConfigLoader:
                 path = os.path.join(d, f)
                 cfg = self._load_yaml(path)
                 merged = self._merge(merged, cfg)
-                log(f"Loaded regime override {f}")
+                self._record_load(f"Loaded regime override {f}", "regime_overrides")
         return merged
 
     def _load_session_overrides(self) -> Dict[str, Any]:
@@ -144,7 +175,7 @@ class ConfigLoader:
                 path = os.path.join(d, f)
                 cfg = self._load_yaml(path)
                 merged = self._merge(merged, cfg)
-                log(f"Loaded session override {f}")
+                self._record_load(f"Loaded session override {f}", "session_overrides")
         return merged
 
     def _inject_env_vars(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -168,7 +199,7 @@ class ConfigLoader:
             return updated
 
         cfg2 = recurse(cfg)
-        log("Injected .env variables into configuration.")
+        self._record_load("Injected .env variables into configuration.", "env_injected")
         return cfg2
 
     def _normalize_assets(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -407,7 +438,7 @@ class ConfigLoader:
             session overrides
             .env injection
         """
-
+        self._reset_load_trace()
         cfg = self._load_base()
         cfg = self._merge(cfg, self._load_modules())
         cfg = self._merge(cfg, self._load_env_override())
@@ -415,6 +446,17 @@ class ConfigLoader:
         cfg = self._merge(cfg, self._load_session_overrides())
         cfg = self._inject_env_vars(cfg)
         cfg = self._normalize(cfg)
-
-        log("Final unified config loaded.")
+        if self.verbose_file_logs:
+            log("Final unified config loaded.")
+        else:
+            log(
+                "Config ready "
+                f"env={self.env} "
+                f"base={'yes' if self._load_trace['base_loaded'] else 'no'} "
+                f"modules={self._load_trace['module_files']} "
+                f"env_override={'yes' if self._load_trace['env_override'] else 'no'} "
+                f"regime_overrides={self._load_trace['regime_overrides']} "
+                f"session_overrides={self._load_trace['session_overrides']} "
+                f"env_injected={'yes' if self._load_trace['env_injected'] else 'no'}"
+            )
         return cfg

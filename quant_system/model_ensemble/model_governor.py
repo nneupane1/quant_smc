@@ -37,6 +37,15 @@ class ModelGovernor:
             },
         }
 
+    @staticmethod
+    def _requested_model_name(model_id: str) -> str:
+        name = str(model_id or "").strip()
+        if "_" in name:
+            prefix, rest = name.split("_", 1)
+            if prefix.isupper():
+                return rest
+        return name
+
     # ------------------------------------------------------------------
     def submit(self, model_id: str, metrics: dict, risk: dict, calib: dict):
         """
@@ -132,6 +141,9 @@ class ModelGovernor:
         active = None
         if hasattr(self.registry, "set_active_model"):
             active = self.registry.set_active_model(model_id, slot=self.slot)
+        if hasattr(self.registry, "set_active_route"):
+            requested = self._requested_model_name(model_id)
+            self.registry.set_active_route(requested, model_id, slot=self.slot)
         self._append_log("promotion", {"timestamp": time.time(), "model_id": model_id, "slot": self.slot, "active": active})
         return active
 
@@ -142,6 +154,9 @@ class ModelGovernor:
         active = None
         if hasattr(self.registry, "set_active_model"):
             active = self.registry.set_active_model(to_model_id, slot=self.slot)
+        if hasattr(self.registry, "set_active_route"):
+            requested = self._requested_model_name(to_model_id)
+            self.registry.set_active_route(requested, to_model_id, slot=self.slot)
         self._append_log("rollback", {"timestamp": time.time(), "model_id": to_model_id, "slot": self.slot, "active": active})
         return active
 

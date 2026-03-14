@@ -1,4 +1,5 @@
 export type DataSource = "artifacts" | "demo" | "telemetry";
+export type TerminalMode = "auto" | "backtest" | "forward" | "live";
 
 export type ReasoningValue =
   | string
@@ -191,6 +192,8 @@ export type TerminalSnapshot = {
     repoRoot: string;
     modelVersion: string;
     transport: string;
+    viewModeRequested: TerminalMode;
+    viewModeEffective: TerminalMode;
   };
   mission: {
     headline: string;

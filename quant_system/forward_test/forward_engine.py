@@ -17,6 +17,7 @@ This engine is the live mirror of the backtester.
 
 import pandas as pd
 import numpy as np
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 
@@ -37,7 +38,7 @@ from quant_system.execution.risk.compound_cooling import CompoundCoolingPolicy
 
 from quant_system.forward_test.forward_executor import ForwardExecutor
 from quant_system.forward_test.forward_reasoning_attach import ReasoningAttach
-from quant_system.ml.predict.model_predictor import ModelPredictor
+from quant_system.ml.predict.model_predictor import ModelPredictor, resolve_inference_preference
 from quant_system.utils.logger import get_logger
 
 
@@ -63,7 +64,10 @@ class ForwardEngine:
         self.assets_cfg = self.cfg.load_yaml("assets.yaml")
         self.exec_cfg = merged_cfg.get("execution", {})
         pref_cfg = merged_cfg.get("inference_preference", {}) if isinstance(merged_cfg.get("inference_preference", {}), dict) else {}
-        self.prefer_tcn_specialists = bool(pref_cfg.get("prefer_tcn_specialists", True))
+        pref = resolve_inference_preference(pref_cfg)
+        self.routing_mode = str(pref["routing_mode"])
+        self.challenger_mode = str(pref["challenger_mode"])
+        self.allow_hybrid_explicit = bool(pref["allow_hybrid_explicit"])
         self.manual_alert_only = bool(self.exec_cfg.get("manual_alert_only", False))
 
         self.models = None
@@ -82,7 +86,9 @@ class ForwardEngine:
         self.exposure = ExposureTracker(merged_cfg)
         self.predictor = ModelPredictor(
             model_registry,
-            prefer_tcn_specialists=self.prefer_tcn_specialists,
+            routing_mode=self.routing_mode,
+            challenger_mode=self.challenger_mode,
+            allow_hybrid_explicit=self.allow_hybrid_explicit,
         )
 
         self.executor = ForwardExecutor(config_loader)
@@ -117,48 +123,43 @@ class ForwardEngine:
         """
         Load latest generic model artifacts for forward execution.
         """
-        specialist_names = {"liq_flow", "bos_cont", "flow_1h", "momo", "eop", "edp"}
-        names = [
-            "liq_flow",
-            "bos_cont",
-            "flow_1h",
-            "momo",
-            "eop",
-            "edp",
-            "meta_model",
-            "confluence_model",
-            "hazard",
-            "quantile",
-        ]
         self.models = {}
-        for name in names:
-            candidates = [name]
-            if name in specialist_names:
-                candidates = [f"{name}_tcn", name] if self.prefer_tcn_specialists else [name, f"{name}_tcn"]
-            loaded = False
-            last_exc = None
-            for candidate in candidates:
-                try:
-                    self.models[name], _ = self.registry.load_latest(candidate)
-                    LOG.info(f"[ForwardEngine] Loaded model {name} via {candidate}")
-                    loaded = True
-                    break
-                except Exception as e:
-                    last_exc = e
-                    continue
-            if not loaded:
-                LOG.warning(f"[ForwardEngine] Missing model {name}: {last_exc}")
         self.predictor = ModelPredictor(
             self.registry,
-            prefer_tcn_specialists=self.prefer_tcn_specialists,
+            routing_mode=self.routing_mode,
+            challenger_mode=self.challenger_mode,
+            allow_hybrid_explicit=self.allow_hybrid_explicit,
         )
         resolved_specialists = self.predictor.warmup_specialists(
             ["liq_flow", "bos_cont", "flow_1h", "momo", "eop", "edp"]
         )
+        resolved_stacks = self.predictor.warmup_stacks(["meta_model", "confluence_model"])
+        specialist_bundle = self.predictor.specialist_bundle_map()
+        stack_bundle = self.predictor.stack_bundle_map()
+        registry_root = Path(self.registry.base_dir)
+        runtime_models = {
+            **resolved_specialists,
+            **resolved_stacks,
+            "hazard": "hazard",
+            "quantile": "quantile",
+        }
+        for canonical_name, resolved_name in runtime_models.items():
+            model_root = registry_root / str(resolved_name)
+            if not resolved_name or not model_root.exists() or not any(child.is_dir() for child in model_root.iterdir()):
+                continue
+            self.models[canonical_name] = True
+            LOG.info("[ForwardEngine] Runtime artifact ready %s -> %s", canonical_name, resolved_name)
+        route_status = self.predictor.routing_status()
         LOG.info(
-            "[ForwardEngine] Inference source mode=%s specialist_routes=%s",
-            self.predictor.source_mode(),
+            "[ForwardEngine] Inference routing requested=%s effective=%s challenger=%s "
+            "allow_hybrid=%s note=%s specialists=%s stacks=%s",
+            route_status["requested_mode"],
+            route_status["effective_mode"],
+            route_status["challenger_mode"],
+            route_status["allow_hybrid_explicit"],
+            route_status["note"] or "ready",
             resolved_specialists,
+            resolved_stacks,
         )
         if self.dashboard:
             self.dashboard.log_event(
@@ -166,9 +167,15 @@ class ForwardEngine:
                 None,
                 {
                     "version": version,
-                    "prefer_tcn_specialists": self.prefer_tcn_specialists,
+                    "routing_mode_requested": route_status["requested_mode"],
+                    "challenger_mode": route_status["challenger_mode"],
+                    "allow_hybrid_explicit": route_status["allow_hybrid_explicit"],
+                    "routing_note": route_status["note"],
                     "inference_source_mode": self.predictor.source_mode(),
                     "specialist_model_source": resolved_specialists,
+                    "stack_model_source": resolved_stacks,
+                    "specialist_model_bundle": specialist_bundle,
+                    "stack_model_bundle": stack_bundle,
                 },
             )
 
@@ -595,6 +602,10 @@ class ForwardEngine:
     def state_snapshot(self) -> Dict[str, Any]:
         source_mode = self.predictor.source_mode() if self.predictor is not None else "unknown"
         specialist_source = self.predictor.specialist_source_map() if self.predictor is not None else {}
+        stack_source = self.predictor.stack_source_map() if self.predictor is not None else {}
+        specialist_bundle = self.predictor.specialist_bundle_map() if self.predictor is not None else {}
+        stack_bundle = self.predictor.stack_bundle_map() if self.predictor is not None else {}
+        route_status = self.predictor.routing_status() if self.predictor is not None else {}
         return {
             "timestamp": self.last_timestamp,
             "starting_capital": self.exec_cfg.get("starting_equity", 0.0),
@@ -609,9 +620,17 @@ class ForwardEngine:
             "closed_trades": self.closed_trades,
             "exposures": self.exposure.current_exposures(self.equity),
             "manual_alert_only": self.manual_alert_only,
-            "prefer_tcn_specialists": self.prefer_tcn_specialists,
+            "prefer_tcn_specialists": source_mode == "tcn",
+            "routing_mode_requested": route_status.get("requested_mode", self.routing_mode),
+            "challenger_mode": route_status.get("challenger_mode", self.challenger_mode),
+            "active_slot": route_status.get("active_slot", "production"),
+            "allow_hybrid_explicit": route_status.get("allow_hybrid_explicit", self.allow_hybrid_explicit),
+            "routing_note": route_status.get("note", ""),
             "inference_source_mode": source_mode,
             "specialist_model_source": specialist_source,
+            "stack_model_source": stack_source,
+            "specialist_model_bundle": specialist_bundle,
+            "stack_model_bundle": stack_bundle,
         }
 
     def _register_exposure(self, pos) -> None:

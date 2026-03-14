@@ -755,6 +755,11 @@ def load_model_registry_summary(base_dir: Optional[Path]) -> pd.DataFrame:
                 "pr_auc": metrics.get("pr_auc"),
                 "brier": metrics.get("brier"),
                 "logloss": metrics.get("logloss"),
+                "decision_threshold": (
+                    cfg.get("decision_threshold")
+                    if isinstance(cfg.get("decision_threshold"), (int, float))
+                    else (metrics.get("threshold_tuning") or {}).get("threshold")
+                ),
             }
         )
     return pd.DataFrame(rows).sort_values(["model"]).reset_index(drop=True) if rows else pd.DataFrame()

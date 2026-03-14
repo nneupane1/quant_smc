@@ -82,6 +82,21 @@ def fmt_seconds(value) -> str:
     return f"{minutes}m {seconds:02d}s"
 
 
+def fmt_progress(completed, total, *, width: int = 24) -> str:
+    try:
+        done = max(int(completed), 0)
+        whole = max(int(total), 1)
+    except Exception:
+        return "-"
+    ratio = min(max(done / whole, 0.0), 1.0)
+    width = max(int(width), 8)
+    filled = int(round(ratio * width))
+    if filled > width:
+        filled = width
+    bar = "#" * filled + "-" * (width - filled)
+    return f"[{bar}] {ratio * 100:5.1f}%"
+
+
 def console_rule(title: str, *, style: str = "cyan"):
     if _CONSOLE is not None:
         _CONSOLE.rule(f"[bold {style}]{title}[/bold {style}]")

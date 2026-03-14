@@ -14,6 +14,7 @@ import type {
   MetricTile,
   ReasoningTree,
   SignalCandidate,
+  TerminalMode,
   TerminalSnapshot,
 } from "@/lib/terminal-types";
 
@@ -21,6 +22,64 @@ const REPO_ROOT = process.env.QUANT_SMC_ROOT
   ? path.resolve(process.env.QUANT_SMC_ROOT)
   : path.resolve(process.cwd(), "..");
 const BACKEND_API_URL = process.env.QUANT_TERMINAL_API_URL ?? "http://127.0.0.1:8100/snapshot";
+const BACKTEST_DIR_OVERRIDE = process.env.QUANT_TERMINAL_BACKTEST_DIR ?? "";
+const FORWARD_DIR_OVERRIDE = process.env.QUANT_TERMINAL_FORWARD_DIR ?? "";
+const LIVE_DIR_OVERRIDE = process.env.QUANT_TERMINAL_LIVE_DIR ?? "";
+
+const BACKTEST_DIR_CANDIDATES = ["backtest_outputs", "backtest_output", "artifacts/backtest/latest"] as const;
+const FORWARD_DIR_CANDIDATES = ["forward_outputs", "artifacts/forward/latest"] as const;
+const LIVE_DIR_CANDIDATES = ["live_outputs", "artifacts/live/latest"] as const;
+
+const BACKTEST_FILE_MARKERS = [
+  "summary.json",
+  "ledger.csv",
+  "trades.csv",
+  "execution_log.csv",
+  "candles_15m.csv",
+  "candles.csv",
+  "reasoning.json",
+] as const;
+
+const RUNTIME_FILE_MARKERS = [
+  "snapshot.json",
+  "state.json",
+  "events.json",
+  "events.csv",
+  "closed_trades.csv",
+  "candles.csv",
+  "bars.csv",
+] as const;
+
+type BacktestBundle = {
+  root: string | null;
+  summary: Record<string, unknown> | null;
+  ledger: Record<string, string>[];
+  candles: Record<string, string>[];
+  reasoning: Record<string, unknown> | null;
+  mtimeMs: number;
+};
+
+type RuntimeBundle = {
+  root: string | null;
+  snapshot: Record<string, unknown> | null;
+  state: Record<string, unknown> | null;
+  events: Record<string, string>[];
+  ledger: Record<string, string>[];
+  candles: Record<string, string>[];
+  mtimeMs: number;
+};
+
+function asReasoningTree(value: unknown): ReasoningTree | undefined {
+  return value && typeof value === "object" ? (value as ReasoningTree) : undefined;
+}
+
+function normalizeMode(value: unknown, fallback: TerminalMode = "auto"): TerminalMode {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (normalized === "backtest" || normalized === "forward" || normalized === "live" || normalized === "auto") {
+    return normalized;
+  }
+  return fallback;
+}
 
 async function exists(filePath: string) {
   try {
@@ -29,6 +88,129 @@ async function exists(filePath: string) {
   } catch {
     return false;
   }
+}
+
+async function statMtimeMs(filePath: string): Promise<number> {
+  try {
+    const stat = await fs.stat(filePath);
+    return stat.mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+function resolveRoot(candidate: string): string {
+  return path.isAbsolute(candidate) ? candidate : path.join(REPO_ROOT, candidate);
+}
+
+function uniqueRoots(roots: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const root of roots) {
+    const normalized = resolveRoot(root.trim());
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
+async function chooseBundleRoot(candidates: string[], markers: readonly string[]): Promise<string | null> {
+  let fallbackRoot: string | null = null;
+  let bestRoot: string | null = null;
+  let bestScore = -1;
+  let bestMtime = -1;
+
+  for (const candidate of candidates) {
+    const root = resolveRoot(candidate);
+    if (!(await exists(root))) continue;
+    fallbackRoot ??= root;
+
+    let score = 0;
+    let latest = 0;
+    for (const marker of markers) {
+      const full = path.join(root, marker);
+      if (await exists(full)) {
+        score += 1;
+        latest = Math.max(latest, await statMtimeMs(full));
+      }
+    }
+    if (score > bestScore || (score === bestScore && latest > bestMtime)) {
+      bestScore = score;
+      bestMtime = latest;
+      bestRoot = root;
+    }
+  }
+
+  if (bestRoot && bestScore > 0) return bestRoot;
+  return fallbackRoot;
+}
+
+async function readFirstJson<T>(root: string | null, candidates: readonly string[]): Promise<T | null> {
+  if (!root) return null;
+  for (const candidate of candidates) {
+    const payload = await readJson<T>(path.join(root, candidate));
+    if (payload) return payload;
+  }
+  return null;
+}
+
+async function readFirstCsv(root: string | null, candidates: readonly string[]): Promise<Record<string, string>[]> {
+  if (!root) return [];
+  for (const candidate of candidates) {
+    const rows = await readCsv(path.join(root, candidate));
+    if (rows.length) return rows;
+  }
+  return [];
+}
+
+function flattenPayloadRow(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object") return {};
+  const row = value as Record<string, unknown>;
+  const payload = row.payload && typeof row.payload === "object"
+    ? (row.payload as Record<string, unknown>)
+    : {};
+  const merged = { ...payload, ...row };
+  const flattened: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(merged)) {
+    if (entry === undefined || entry === null) continue;
+    if (typeof entry === "object") {
+      flattened[key] = JSON.stringify(entry);
+    } else {
+      flattened[key] = String(entry);
+    }
+  }
+  return flattened;
+}
+
+function stateClosedTrades(state: Record<string, unknown> | null): Record<string, string>[] {
+  if (!state || typeof state.closed_trades !== "object" || state.closed_trades === null) return [];
+  return Object.values(state.closed_trades as Record<string, unknown>)
+    .filter((trade): trade is Record<string, unknown> => Boolean(trade) && typeof trade === "object")
+    .map((trade) => flattenPayloadRow(trade));
+}
+
+function runtimeHasActivity(bundle: RuntimeBundle): boolean {
+  if (bundle.events.length || bundle.ledger.length || bundle.candles.length) return true;
+  if (bundle.snapshot && Object.keys(bundle.snapshot).length) return true;
+  if (bundle.state && Object.keys(bundle.state).length) return true;
+  return false;
+}
+
+function resolveEffectiveMode(
+  requestedMode: TerminalMode,
+  forwardBundle: RuntimeBundle,
+  liveBundle: RuntimeBundle,
+): TerminalMode {
+  if (requestedMode !== "auto") return requestedMode;
+  const forwardActive = runtimeHasActivity(forwardBundle);
+  const liveActive = runtimeHasActivity(liveBundle);
+  if (liveActive && !forwardActive) return "live";
+  if (forwardActive && !liveActive) return "forward";
+  if (liveActive && forwardActive) {
+    return liveBundle.mtimeMs >= forwardBundle.mtimeMs ? "live" : "forward";
+  }
+  return "backtest";
 }
 
 async function readJson<T>(filePath: string): Promise<T | null> {
@@ -586,6 +768,8 @@ function makeDemoSnapshot(): TerminalSnapshot {
       repoRoot: REPO_ROOT,
       modelVersion: "demo-v1",
       transport: "fastapi + websocket preferred, artifact fallback available",
+      viewModeRequested: "auto",
+      viewModeEffective: "auto",
     },
     mission: {
       headline: "Terminal primed for deterministic execution parity",
@@ -1162,40 +1346,134 @@ function withMarket(snapshot: TerminalSnapshot): TerminalSnapshot {
   };
 }
 
-export async function loadTerminalSnapshot(): Promise<TerminalSnapshot> {
-  if (BACKEND_API_URL) {
+export async function loadTerminalSnapshot(mode: TerminalMode = "auto"): Promise<TerminalSnapshot> {
+  const requestedMode = normalizeMode(mode, "auto");
+
+  if (BACKEND_API_URL && (requestedMode === "auto" || requestedMode === "live")) {
     try {
-      const response = await fetch(BACKEND_API_URL, { cache: "no-store" });
+      const url = new URL(BACKEND_API_URL);
+      url.searchParams.set("mode", requestedMode);
+      const response = await fetch(url, { cache: "no-store" });
       if (response.ok) {
-        return withMarket(withPerformance((await response.json()) as TerminalSnapshot));
+        const snapshot = withMarket(withPerformance((await response.json()) as TerminalSnapshot));
+        return {
+          ...snapshot,
+          meta: {
+            ...snapshot.meta,
+            source: "telemetry",
+            viewModeRequested: requestedMode,
+            viewModeEffective: requestedMode === "auto" ? "live" : requestedMode,
+          },
+        };
       }
     } catch {
       // fall back to local artifact loader
     }
   }
 
-  const backtestRoot = path.join(REPO_ROOT, "backtest_outputs");
-  const forwardRoot = path.join(REPO_ROOT, "forward_outputs");
-  const liveRoot = path.join(REPO_ROOT, "live_outputs");
+  const backtestRoot = await chooseBundleRoot(
+    uniqueRoots([BACKTEST_DIR_OVERRIDE, ...BACKTEST_DIR_CANDIDATES]),
+    BACKTEST_FILE_MARKERS,
+  );
+  const forwardRoot = await chooseBundleRoot(
+    uniqueRoots([FORWARD_DIR_OVERRIDE, ...FORWARD_DIR_CANDIDATES]),
+    RUNTIME_FILE_MARKERS,
+  );
+  const liveRoot = await chooseBundleRoot(
+    uniqueRoots([LIVE_DIR_OVERRIDE, ...LIVE_DIR_CANDIDATES]),
+    RUNTIME_FILE_MARKERS,
+  );
   const modelRoot = path.join(REPO_ROOT, "models");
 
-  const snapshot = await readJson<Record<string, unknown>>(path.join(forwardRoot, "snapshot.json"))
-    ?? await readJson<Record<string, unknown>>(path.join(liveRoot, "snapshot.json"));
-  const state = (snapshot?.state as Record<string, unknown> | undefined)
-    ?? await readJson<Record<string, unknown>>(path.join(forwardRoot, "state.json"))
-    ?? await readJson<Record<string, unknown>>(path.join(liveRoot, "state.json"))
-    ?? {};
-  const summary = await readJson<Record<string, unknown>>(path.join(backtestRoot, "summary.json"));
-  const events = ((snapshot?.events as Record<string, string>[] | undefined) ?? [])
-    .concat(await readCsv(path.join(forwardRoot, "events.csv")))
-    .concat(await readCsv(path.join(liveRoot, "events.csv")));
-  const ledger = (await readCsv(path.join(backtestRoot, "ledger.csv")))
-    .concat(await readCsv(path.join(forwardRoot, "closed_trades.csv")))
-    .concat(await readCsv(path.join(liveRoot, "closed_trades.csv")));
+  const backtestSummary = await readFirstJson<Record<string, unknown>>(backtestRoot, ["summary.json"]);
+  const backtestLedger = await readFirstCsv(backtestRoot, ["ledger.csv", "trades.csv"]);
+  const backtestCandles = await readFirstCsv(backtestRoot, ["candles_15m.csv", "candles.csv"]);
+  const backtestReasoning = await readFirstJson<Record<string, unknown>>(backtestRoot, ["reasoning.json"]);
+  const backtestBundle: BacktestBundle = {
+    root: backtestRoot,
+    summary: backtestSummary,
+    ledger: backtestLedger,
+    candles: backtestCandles,
+    reasoning: backtestReasoning,
+    mtimeMs: Math.max(
+      await statMtimeMs(backtestRoot ? path.join(backtestRoot, "summary.json") : ""),
+      await statMtimeMs(backtestRoot ? path.join(backtestRoot, "ledger.csv") : ""),
+      await statMtimeMs(backtestRoot ? path.join(backtestRoot, "trades.csv") : ""),
+    ),
+  };
+
+  const loadRuntimeBundle = async (root: string | null): Promise<RuntimeBundle> => {
+    const snapshot = await readFirstJson<Record<string, unknown>>(root, ["snapshot.json"]);
+    const fallbackState = await readFirstJson<Record<string, unknown>>(root, ["state.json"]);
+    const fallbackEventsJson = await readFirstJson<unknown[]>(root, ["events.json"]);
+    const fallbackEventsCsv = await readFirstCsv(root, ["events.csv"]);
+    const fallbackLedger = await readFirstCsv(root, ["closed_trades.csv"]);
+    const fallbackCandles = await readFirstCsv(root, ["candles.csv", "bars.csv"]);
+    const snapshotState = snapshot?.state && typeof snapshot.state === "object"
+      ? (snapshot.state as Record<string, unknown>)
+      : null;
+    const snapshotEvents = Array.isArray(snapshot?.events)
+      ? (snapshot.events as unknown[]).map((row) => flattenPayloadRow(row))
+      : [];
+    const jsonEvents = Array.isArray(fallbackEventsJson)
+      ? fallbackEventsJson.map((row) => flattenPayloadRow(row))
+      : [];
+    const state = snapshotState ?? fallbackState ?? {};
+    const ledger = fallbackLedger.length ? fallbackLedger : stateClosedTrades(state);
+    const candles = fallbackCandles.length
+      ? fallbackCandles
+      : Array.isArray(snapshot?.candles)
+        ? (snapshot.candles as unknown[]).map((row) => flattenPayloadRow(row))
+        : [];
+    const mtimeMs = Math.max(
+      await statMtimeMs(root ? path.join(root, "snapshot.json") : ""),
+      await statMtimeMs(root ? path.join(root, "state.json") : ""),
+      await statMtimeMs(root ? path.join(root, "events.json") : ""),
+      await statMtimeMs(root ? path.join(root, "events.csv") : ""),
+      await statMtimeMs(root ? path.join(root, "closed_trades.csv") : ""),
+      await statMtimeMs(root ? path.join(root, "candles.csv") : ""),
+      await statMtimeMs(root ? path.join(root, "bars.csv") : ""),
+    );
+    return {
+      root,
+      snapshot,
+      state,
+      events: snapshotEvents.length ? snapshotEvents : jsonEvents.length ? jsonEvents : fallbackEventsCsv,
+      ledger,
+      candles,
+      mtimeMs,
+    };
+  };
+
+  const forwardBundle = await loadRuntimeBundle(forwardRoot);
+  const liveBundle = await loadRuntimeBundle(liveRoot);
+  const effectiveMode = resolveEffectiveMode(requestedMode, forwardBundle, liveBundle);
+
+  const runtimeBundle = effectiveMode === "forward"
+    ? forwardBundle
+    : effectiveMode === "live"
+      ? liveBundle
+      : null;
+  const snapshot = runtimeBundle?.snapshot ?? null;
+  const state = runtimeBundle?.state ?? {};
+  const summary = effectiveMode === "backtest" ? backtestBundle.summary : null;
+  const events = effectiveMode === "backtest" ? [] : runtimeBundle?.events ?? [];
+  const ledger = effectiveMode === "backtest" ? backtestBundle.ledger : runtimeBundle?.ledger ?? [];
+  const marketPayload = effectiveMode === "backtest"
+    ? backtestBundle.candles
+    : snapshot?.market ?? snapshot?.candles ?? runtimeBundle?.candles ?? null;
 
   const version = await listLatestModelVersion(modelRoot);
   if (!summary && !snapshot && !ledger.length && !events.length) {
-    return makeDemoSnapshot();
+    const demo = makeDemoSnapshot();
+    return {
+      ...demo,
+      meta: {
+        ...demo.meta,
+        viewModeRequested: requestedMode,
+        viewModeEffective: requestedMode === "auto" ? "backtest" : requestedMode,
+      },
+    };
   }
 
   const guardrails = deriveGuardrails(state);
@@ -1203,17 +1481,26 @@ export async function loadTerminalSnapshot(): Promise<TerminalSnapshot> {
   const freeCapital = num(state.free_capital, equity);
   const lockedProfit = num(state.locked_profit, 0);
   const openPositions = num(state.open_positions, 0);
-  const winRate = num(summary?.win_rate, 0.57) * (num(summary?.win_rate) <= 1 ? 100 : 1);
+  const trades = buildTrades(ledger);
+  const closedTrades = trades.filter((trade) => trade.status !== "open");
+  const signalSourceTrades = closedTrades.length ? closedTrades : trades;
+  const wins = signalSourceTrades.filter((trade) => num(trade.pnl) > 0).length;
+  const fallbackWinRate = signalSourceTrades.length ? (wins / signalSourceTrades.length) * 100 : 0;
+  const summaryWinRate = num(summary?.win_rate, NaN);
+  const winRate = Number.isFinite(summaryWinRate)
+    ? summaryWinRate * (summaryWinRate <= 1 ? 100 : 1)
+    : fallbackWinRate;
   const maxDrawdown = Math.abs(num(summary?.max_drawdown, num(state.max_drawdown, 0)));
   const signals = buildSignalsFromEvents(events);
-  const trades = buildTrades(ledger);
   const performance = buildPerformance(trades);
   const market = buildMarket(
     trades,
     signals,
-    (snapshot as Record<string, unknown> | undefined)?.market
-      ?? (snapshot as Record<string, unknown> | undefined)?.candles,
+    marketPayload,
   );
+  const latestReasoning = effectiveMode === "backtest"
+    ? asReasoningTree(backtestBundle.reasoning)
+    : signals[0]?.reasoning;
 
   return withMarket(withPerformance({
     meta: {
@@ -1222,19 +1509,21 @@ export async function loadTerminalSnapshot(): Promise<TerminalSnapshot> {
       repoRoot: REPO_ROOT,
       modelVersion: version,
       transport: "fastapi + websocket preferred, artifact fallback available",
+      viewModeRequested: requestedMode,
+      viewModeEffective: effectiveMode,
     },
     mission: {
       headline: "Artifact-backed terminal state loaded from repaired repo outputs",
       status: state.cooling_to ? "Cooling" : openPositions ? "Active" : "Monitoring",
       substatus: state.cooling_to
         ? `Cooling active until ${String(state.cooling_to)}`
-        : `${openPositions} live positions visible through current artifacts.`,
+        : `${openPositions} positions visible through ${effectiveMode} artifacts.`,
       metrics: [
         { label: "Equity", value: fmtMoney(equity), tone: "cyan", delta: version },
         { label: "Free Capital", value: fmtMoney(freeCapital), tone: "teal", delta: "deployable" },
         { label: "Locked Profit", value: fmtMoney(lockedProfit), tone: "amber", delta: "vaulted" },
-        { label: "Open Positions", value: String(openPositions), tone: openPositions ? "amber" : "slate", delta: "live state" },
-        { label: "Win Rate", value: fmtPct(winRate), tone: winRate >= 55 ? "teal" : "rose", delta: "backtest summary" },
+        { label: "Open Positions", value: String(openPositions), tone: openPositions ? "amber" : "slate", delta: `${effectiveMode} state` },
+        { label: "Win Rate", value: fmtPct(winRate), tone: winRate >= 55 ? "teal" : "rose", delta: effectiveMode === "backtest" ? "backtest summary" : `${effectiveMode} ledger` },
       ],
     },
     insights: {
@@ -1244,8 +1533,17 @@ export async function loadTerminalSnapshot(): Promise<TerminalSnapshot> {
         { label: "Execution Posture", value: state.cooling_to ? "Guarded" : "Eligible", detail: state.cooling_to ? "Cooling timer is active under current state." : "No cooling blocker is present in state artifacts.", tone: state.cooling_to ? "rose" : "teal" },
         { label: "Model Surface", value: version, detail: "Latest discovered model registry version across repaired artifact directories.", tone: "cyan" },
         { label: "Decision Trace", value: `${events.length} events`, detail: "The frontend is reading the same persisted event stream the repaired runtime emits today.", tone: "teal" },
+        {
+          label: "Artifact Route",
+          value: effectiveMode,
+          detail:
+            effectiveMode === "backtest"
+              ? (backtestBundle.root ?? "no backtest artifacts discovered")
+              : (runtimeBundle?.root ?? `no ${effectiveMode} artifacts discovered`),
+          tone: effectiveMode === "live" ? "teal" : effectiveMode === "forward" ? "cyan" : "amber",
+        },
       ],
-      latestReasoning: signals[0]?.reasoning,
+      latestReasoning,
     },
     regime: {
       current: String((ledger[0]?.regime || events[0]?.regime || "unknown")).replaceAll("_", " "),

@@ -5,7 +5,7 @@ import time
 from typing import List
 
 from launcher_common import inspect_training_artifacts, train_model
-from quant_system.utils.logger import console_kv, console_rule, console_stage, fmt_seconds
+from quant_system.utils.logger import console_kv, console_rule, console_stage, fmt_progress, fmt_seconds
 
 
 DEFAULT_TARGETS = ["liq_flow", "bos_cont", "flow_1h", "momo", "eop", "edp"]
@@ -105,6 +105,7 @@ def main() -> None:
         console_stage(
             "Tree batch progress",
             (
+                f"progress={fmt_progress(done_before, len(targets))} "
                 f"completed={done_before}/{len(targets)} remaining={len(targets) - done_before} "
                 f"elapsed={fmt_seconds(elapsed_before)} "
                 f"eta={fmt_seconds(eta_before) if eta_before is not None else '-'}"
@@ -183,6 +184,7 @@ def main() -> None:
                 "version": latest.get("version"),
                 "cv_score": _fmt_score(latest.get("cv_score")),
                 "target_elapsed": latest.get("elapsed"),
+                "progress": fmt_progress(done_now, len(targets)),
                 "batch_completed": f"{done_now}/{len(targets)}",
                 "batch_remaining": max(len(targets) - done_now, 0),
                 "batch_elapsed": fmt_seconds(elapsed_now),
@@ -194,6 +196,7 @@ def main() -> None:
         console_stage(
             "Tree batch heartbeat",
             (
+                f"progress={fmt_progress(done_now, len(targets))} "
                 f"completed={done_now}/{len(targets)} remaining={max(len(targets)-done_now, 0)} "
                 f"elapsed={fmt_seconds(elapsed_now)} eta={fmt_seconds(eta_now)} "
                 f"remaining_targets={_remaining_targets(targets, done_now)}"

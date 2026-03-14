@@ -19,7 +19,14 @@ import warnings
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.metrics import (
+    average_precision_score,
+    brier_score_loss,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
@@ -60,6 +67,7 @@ from quant_system.utils.logger import (
     console_kv,
     console_stage,
     fmt_num,
+    fmt_progress,
     fmt_seconds,
     get_logger,
 )
@@ -159,8 +167,17 @@ class ModelTrainer:
         self.registry = registry
         version_index = Path(getattr(registry, "base_dir", ".")) / ".model_versions.json"
         self.versioner = ModelVersionManager(str(version_index))
+        self._configure_external_logging()
 
         LOG.info("[ModelTrainer] Initialized (walk-forward + HPO)")
+
+    @staticmethod
+    def _configure_external_logging() -> None:
+        if optuna is not None:
+            try:
+                optuna.logging.set_verbosity(optuna.logging.WARNING)
+            except Exception:
+                pass
 
     @staticmethod
     @contextmanager
@@ -216,6 +233,7 @@ class ModelTrainer:
         console_stage(
             "Training Progress",
             (
+                f"progress={fmt_progress(completed, total)} "
                 f"{asset} {completed}/{total} ({pct:.1f}%) "
                 f"phase={phase} elapsed={fmt_seconds(elapsed)} eta={fmt_seconds(eta)}"
             ),
@@ -507,6 +525,327 @@ class ModelTrainer:
             return arr[:, classes.index(1)]
         return arr[:, min(1, arr.shape[1] - 1)]
 
+    def _threshold_tuning_cfg(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        global_cfg = deepcopy((self.preproc_cfg or {}).get("threshold_tuning", {}))
+        local_cfg = deepcopy(cfg.get("threshold_tuning", {}))
+        merged = global_cfg if isinstance(global_cfg, dict) else {}
+        if isinstance(local_cfg, dict):
+            merged.update(local_cfg)
+        return merged
+
+    @staticmethod
+    def _evaluate_binary_predictions(y_true: np.ndarray, p: np.ndarray, threshold: float) -> Dict[str, float]:
+        y = np.asarray(y_true, dtype=int)
+        prob = np.clip(np.asarray(p, dtype=float), 1e-6, 1.0 - 1e-6)
+        try:
+            ap = float(average_precision_score(y, prob))
+        except Exception:
+            ap = 0.0
+        try:
+            auc = float(roc_auc_score(y, prob))
+        except Exception:
+            auc = 0.5
+        try:
+            brier = float(brier_score_loss(y, prob))
+        except Exception:
+            brier = float("nan")
+
+        y_hat = (prob >= float(threshold)).astype(int)
+        precision = float(precision_score(y, y_hat, zero_division=0))
+        recall = float(recall_score(y, y_hat, zero_division=0))
+        f1 = float(f1_score(y, y_hat, zero_division=0))
+        return {
+            "ap": ap,
+            "auc": auc,
+            "brier": brier,
+            "precision_at_threshold": precision,
+            "recall_at_threshold": recall,
+            "f1_at_threshold": f1,
+            "positive_rate_at_threshold": float(np.mean(y_hat) if len(y_hat) else 0.0),
+            "threshold": float(threshold),
+        }
+
+    def _tune_threshold(self, y_true: np.ndarray, p: np.ndarray, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        tune_cfg = self._threshold_tuning_cfg(cfg)
+        metric = str(tune_cfg.get("metric", "f1")).lower()
+        min_precision = float(tune_cfg.get("min_precision", 0.10))
+        min_recall = float(tune_cfg.get("min_recall", 0.01))
+        default_thr = float(tune_cfg.get("default_threshold", 0.50))
+        max_candidates = max(int(tune_cfg.get("max_candidates", 256)), 16)
+
+        y = np.asarray(y_true, dtype=int)
+        prob = np.clip(np.asarray(p, dtype=float), 1e-6, 1.0 - 1e-6)
+        if len(y) == 0 or not bool(tune_cfg.get("enabled", True)):
+            metrics = self._evaluate_binary_predictions(y, prob, default_thr)
+            return {
+                "enabled": bool(tune_cfg.get("enabled", True)),
+                "metric": metric,
+                "threshold": float(default_thr),
+                "best_value": float(metrics.get("f1_at_threshold", 0.0)),
+                "constraints": {
+                    "min_precision": min_precision,
+                    "min_recall": min_recall,
+                },
+                "metrics": metrics,
+            }
+
+        candidates = np.unique(prob)
+        if candidates.size > max_candidates:
+            qs = np.linspace(0.01, 0.99, max_candidates)
+            candidates = np.unique(np.quantile(prob, qs))
+        candidates = np.clip(candidates, 1e-4, 1.0 - 1e-4)
+        candidates = np.unique(np.r_[candidates, default_thr])
+
+        best_thr = float(default_thr)
+        best_value = -np.inf
+        best_metrics = self._evaluate_binary_predictions(y, prob, default_thr)
+
+        for thr in candidates:
+            metrics = self._evaluate_binary_predictions(y, prob, float(thr))
+            precision = float(metrics["precision_at_threshold"])
+            recall = float(metrics["recall_at_threshold"])
+            if precision < min_precision or recall < min_recall:
+                continue
+            if metric == "precision":
+                value = precision
+            elif metric == "recall":
+                value = recall
+            else:
+                value = float(metrics["f1_at_threshold"])
+            if value > best_value:
+                best_value = value
+                best_thr = float(thr)
+                best_metrics = metrics
+
+        if not np.isfinite(best_value):
+            if metric == "precision":
+                best_value = float(best_metrics["precision_at_threshold"])
+            elif metric == "recall":
+                best_value = float(best_metrics["recall_at_threshold"])
+            else:
+                best_value = float(best_metrics["f1_at_threshold"])
+
+        return {
+            "enabled": bool(tune_cfg.get("enabled", True)),
+            "metric": metric,
+            "threshold": float(best_thr),
+            "best_value": float(best_value),
+            "constraints": {
+                "min_precision": min_precision,
+                "min_recall": min_recall,
+            },
+            "metrics": best_metrics,
+        }
+
+    def _calibration_holdout_split(self, y: np.ndarray, cfg: Dict[str, Any]) -> Optional[int]:
+        tune_cfg = self._threshold_tuning_cfg(cfg)
+        if not bool(tune_cfg.get("enabled", True)):
+            return None
+        n_rows = int(len(y))
+        min_rows = max(int(tune_cfg.get("min_rows", 4096)), 256)
+        if n_rows < min_rows:
+            return None
+
+        holdout_frac = float(tune_cfg.get("holdout_frac", 0.15))
+        min_holdout_rows = max(int(tune_cfg.get("min_holdout_rows", 512)), 64)
+        candidate_sizes = [
+            max(min_holdout_rows, int(round(n_rows * holdout_frac))),
+            max(min_holdout_rows, int(round(n_rows * 0.10))),
+            max(min_holdout_rows, int(round(n_rows * 0.20))),
+        ]
+
+        tried: set[int] = set()
+        for holdout_n in candidate_sizes:
+            holdout_n = min(max(holdout_n, min_holdout_rows), n_rows - min_holdout_rows)
+            if holdout_n in tried or holdout_n <= 0:
+                continue
+            tried.add(holdout_n)
+            split_idx = n_rows - holdout_n
+            if split_idx <= 0 or split_idx >= n_rows:
+                continue
+            y_train = y[:split_idx]
+            y_holdout = y[split_idx:]
+            if pd.Series(y_train).nunique() < 2 or pd.Series(y_holdout).nunique() < 2:
+                continue
+            return split_idx
+        return None
+
+    @staticmethod
+    def _calibrator_label(calibrator: Any) -> str:
+        if calibrator is None:
+            return "none"
+        cls_name = calibrator.__class__.__name__.lower()
+        if "logisticregression" in cls_name:
+            return "platt"
+        if "isotonic" in cls_name:
+            return "isotonic"
+        if "histogram" in cls_name:
+            return "histogram"
+        return calibrator.__class__.__name__
+
+    def _build_classifier_estimator(
+        self,
+        algo: str,
+        params: Dict[str, Any],
+        *,
+        class_weight: Optional[Any],
+        scale_pos_weight: Optional[float],
+    ):
+        if algo == "lightgbm":
+            return lgb.LGBMClassifier(
+                n_estimators=int(params["n_estimators"]),
+                num_leaves=int(params["num_leaves"]),
+                max_depth=int(params["max_depth"]),
+                learning_rate=float(params["learning_rate"]),
+                subsample=float(params.get("subsample", 1.0)),
+                colsample_bytree=float(params.get("colsample_bytree", 1.0)),
+                reg_alpha=float(params.get("reg_alpha", 0.0)),
+                reg_lambda=float(params.get("reg_lambda", 0.0)),
+                objective="binary",
+                class_weight=class_weight,
+                verbosity=-1,
+            )
+        if algo == "xgboost":
+            return xgb.XGBClassifier(
+                n_estimators=int(params["n_estimators"]),
+                max_depth=int(params["max_depth"]),
+                learning_rate=float(params["learning_rate"]),
+                subsample=float(params.get("subsample", 1.0)),
+                colsample_bytree=float(params.get("colsample_bytree", 1.0)),
+                reg_alpha=float(params.get("reg_alpha", 0.0)),
+                reg_lambda=float(params.get("reg_lambda", 0.0)),
+                eval_metric="logloss",
+                tree_method="hist",
+                objective="binary:logistic",
+                scale_pos_weight=scale_pos_weight,
+                verbosity=0,
+            )
+        return LogisticRegression(
+            C=float(params.get("C", 1.0)),
+            max_iter=500,
+            penalty="l2",
+            solver="lbfgs",
+            class_weight=class_weight,
+        )
+
+    def _finalize_binary_model(
+        self,
+        *,
+        X_df: pd.DataFrame,
+        y: np.ndarray,
+        cfg: Dict[str, Any],
+        name: str,
+        algo: str,
+        params: Dict[str, Any],
+        num_cols: List[str],
+        cat_cols: List[str],
+        class_weight: Optional[Any],
+        scale_pos_weight: Optional[float],
+    ) -> Tuple[Any, Dict[str, Any]]:
+        tune_cfg = self._threshold_tuning_cfg(cfg)
+        cal_method = str(cfg.get("calibrator", "auto")).lower()
+        default_threshold = float(tune_cfg.get("default_threshold", 0.50))
+
+        calibration_report: Dict[str, Any] = {
+            "method": "none",
+            "holdout_rows": 0,
+            "brier_raw": None,
+            "brier_calibrated": None,
+            "split_mode": "full_fit",
+            "holdout_eval": None,
+        }
+        threshold_report: Dict[str, Any] = {
+            "enabled": bool(tune_cfg.get("enabled", True)),
+            "metric": str(tune_cfg.get("metric", "f1")).lower(),
+            "threshold": float(default_threshold),
+            "best_value": None,
+            "constraints": {
+                "min_precision": float(tune_cfg.get("min_precision", 0.10)),
+                "min_recall": float(tune_cfg.get("min_recall", 0.01)),
+            },
+            "metrics": None,
+        }
+
+        split_idx = self._calibration_holdout_split(np.asarray(y, dtype=int), cfg)
+        train_X = X_df
+        train_y = y
+        holdout_X = None
+        holdout_y = None
+        split_mode = "full_fit"
+        if split_idx is not None:
+            train_X = X_df.iloc[:split_idx].copy()
+            train_y = y[:split_idx]
+            holdout_X = X_df.iloc[split_idx:].copy()
+            holdout_y = y[split_idx:]
+            split_mode = "tail_holdout"
+
+        estimator = self._build_classifier_estimator(
+            algo,
+            params,
+            class_weight=class_weight,
+            scale_pos_weight=scale_pos_weight,
+        )
+        pre = self._build_preprocessor(num_cols, cat_cols, algo=algo)
+        base_model = Pipeline([("pre", pre), ("clf", estimator)])
+        with self._suppress_low_signal_warnings():
+            base_model.fit(train_X, train_y)
+
+        calibrator = None
+        wrapped_model: Any = base_model
+
+        if holdout_X is not None and holdout_y is not None and len(holdout_y) >= 64:
+            p_raw = self._positive_class_proba(base_model, holdout_X)
+            p_for_decision = p_raw
+            calibration_report["split_mode"] = split_mode
+            calibration_report["holdout_rows"] = int(len(holdout_y))
+
+            if cal_method != "none" and np.unique(holdout_y).size > 1 and np.unique(p_raw).size > 1:
+                method_for_emp = "auto" if cal_method in {"auto", "empirical"} else cal_method
+                calibrator = EmpiricalCalibrator(method=method_for_emp).calibrate(p_raw, holdout_y)
+                if hasattr(calibrator, "predict_proba"):
+                    p_for_decision = calibrator.predict_proba(p_raw.reshape(-1, 1))[:, 1]
+                elif hasattr(calibrator, "predict"):
+                    p_for_decision = calibrator.predict(p_raw)
+                else:
+                    p_for_decision = np.asarray([float(calibrator(pi)) for pi in p_raw], dtype=float)
+                calibration_report["method"] = self._calibrator_label(calibrator)
+                calibration_report["brier_raw"] = float(brier_score_loss(holdout_y, p_raw))
+                calibration_report["brier_calibrated"] = float(brier_score_loss(holdout_y, p_for_decision))
+
+            threshold_report = self._tune_threshold(holdout_y, p_for_decision, cfg)
+            calibration_report["holdout_eval"] = self._evaluate_binary_predictions(
+                holdout_y,
+                p_for_decision,
+                float(threshold_report["threshold"]),
+            )
+            wrapped_model = CalibratedProbabilityModel(base_model, calibrator)
+            console_stage(
+                "Decision model ready",
+                (
+                    f"{self._display_name(name)} calibrator={calibration_report['method']} "
+                    f"threshold={float(threshold_report['threshold']):.3f} "
+                    f"precision={float((threshold_report.get('metrics') or {}).get('precision_at_threshold', 0.0)):.3f} "
+                    f"recall={float((threshold_report.get('metrics') or {}).get('recall_at_threshold', 0.0)):.3f} "
+                    f"holdout_rows={len(holdout_y)}"
+                ),
+                status="ok",
+            )
+        else:
+            if cal_method != "none":
+                wrapped_model = self._calibrate(base_model, X_df, y, cal_method)
+                calibration_report["method"] = "full_fit_fallback"
+            console_stage(
+                "Decision tuning skipped",
+                f"{self._display_name(name)} holdout unavailable -> threshold={default_threshold:.3f}",
+                status="warn",
+            )
+
+        return wrapped_model, {
+            "calibration": calibration_report,
+            "threshold_tuning": threshold_report,
+            "decision_threshold": float(threshold_report["threshold"]),
+        }
+
     # ------------------------------------------------------------------
     # Utility: class weights and single-class safety
     # ------------------------------------------------------------------
@@ -728,7 +1067,6 @@ class ModelTrainer:
             model, metrics = self._train_classifier(
                 X_sel, targets[key], cfg, name=f"{asset}_{key}", num_cols=num_cols, cat_cols=cat_cols
             )
-            model = self._calibrate(model, X_sel, targets[key], cfg.get("calibrator"))
             selected_cols = metrics.get("selected_feature_cols", cols_sel) if isinstance(metrics, dict) else cols_sel
             specialists[key] = {"model": model, "feature_cols": selected_cols}
             specialist_metrics[key] = metrics
@@ -808,7 +1146,11 @@ class ModelTrainer:
                 version=version,
                 clf=bundle["model"],
                 cal=None,
-                config={"features": bundle["feature_cols"]},
+                config={
+                    "features": bundle["feature_cols"],
+                    "decision_threshold": ((specialist_metrics.get(key, {}) or {}).get("decision_threshold")),
+                    "calibration": ((specialist_metrics.get(key, {}) or {}).get("calibration")),
+                },
             )
             # generic alias for single-asset deployments
             self.registry.save_model(
@@ -816,7 +1158,11 @@ class ModelTrainer:
                 version=version,
                 clf=bundle["model"],
                 cal=None,
-                config={"features": bundle["feature_cols"]},
+                config={
+                    "features": bundle["feature_cols"],
+                    "decision_threshold": ((specialist_metrics.get(key, {}) or {}).get("decision_threshold")),
+                    "calibration": ((specialist_metrics.get(key, {}) or {}).get("calibration")),
+                },
             )
             # metrics (cv and params)
             metrics = specialist_metrics.get(key, {})
@@ -1132,6 +1478,8 @@ class ModelTrainer:
         X_df: pd.DataFrame,
         y: np.ndarray,
         model_name: str,
+        *,
+        emit_log: bool = True,
     ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         cfg = self.feature_sel_cfg if isinstance(self.feature_sel_cfg, dict) else {}
         report: Dict[str, Any] = {"enabled": False}
@@ -1187,21 +1535,31 @@ class ModelTrainer:
             "method": "mutual_info",
             "selected": int(len(keep_cols)),
             "dropped": int(len(X_df.columns) - len(keep_cols)),
+            "cv_scope": "train_fold_only",
+            "leak_safe": True,
             "top_features": {k: float(v) for k, v in top_features.items()},
         }
-        LOG.info(
-            "[ModelTrainer] MI filter %s selected=%s/%s",
-            model_name,
-            len(keep_cols),
-            len(X_df.columns),
-        )
+        if emit_log:
+            LOG.info(
+                "[ModelTrainer] MI filter %s selected=%s/%s",
+                model_name,
+                len(keep_cols),
+                len(X_df.columns),
+            )
         return X_df[keep_cols].copy(), report
+
+    @staticmethod
+    def _split_feature_types(X_df: pd.DataFrame) -> Tuple[List[str], List[str]]:
+        num_cols = [c for c in X_df.columns if pd.api.types.is_numeric_dtype(X_df[c])]
+        cat_cols = [c for c in X_df.columns if c not in num_cols]
+        return num_cols, cat_cols
 
     @staticmethod
     def _extract_model_importance(model: Any) -> Dict[str, Any]:
         try:
-            clf = model.named_steps.get("clf") if hasattr(model, "named_steps") else model
-            pre = model.named_steps.get("pre") if hasattr(model, "named_steps") else None
+            base_model = model.base if hasattr(model, "base") else model
+            clf = base_model.named_steps.get("clf") if hasattr(base_model, "named_steps") else base_model
+            pre = base_model.named_steps.get("pre") if hasattr(base_model, "named_steps") else None
             if clf is None:
                 return {}
             if pre is not None and hasattr(pre, "get_feature_names_out"):
@@ -1517,10 +1875,6 @@ class ModelTrainer:
         cv_splits = int(cfg.get("cv_splits", 4))
         hpo_space = cfg.get("hpo_space", {})
 
-        X_df, mi_report = self._apply_mutual_info_filter(X_df, y, name)
-        num_cols = [c for c in X_df.columns if pd.api.types.is_numeric_dtype(X_df[c])]
-        cat_cols = [c for c in X_df.columns if c not in num_cols]
-
         # handle imbalance & single-class upfront
         cw, scale_pos = self._make_class_weight(y, cfg)
         class_counts = pd.Series(y).value_counts().to_dict()
@@ -1545,6 +1899,17 @@ class ModelTrainer:
             class_counts=class_counts,
             trials=n_trials,
         )
+        if bool(self.feature_sel_cfg.get("enabled", True)) and bool(self.feature_sel_cfg.get("use_mutual_info", True)):
+            console_stage(
+                "Feature selection plan",
+                (
+                    f"{self._display_name(name)} mode=mutual_info(train-fold-only) "
+                    f"top_k={int(self.feature_sel_cfg.get('mutual_info_top_k', 180))} "
+                    f"min_features={int(self.feature_sel_cfg.get('min_features', 24))} "
+                    f"input_features={len(X_df.columns)}"
+                ),
+                status="info",
+            )
         # single-class guard: fall back to a constant predictor so pipeline doesn't explode
         if pd.Series(y).nunique() < 2:
             LOG.warning(f"[ModelTrainer] {name} target has single class; training DummyClassifier.")
@@ -1553,6 +1918,7 @@ class ModelTrainer:
                 f"class={next(iter(class_counts.keys())) if class_counts else 'n/a'} -> DummyClassifier",
                 status="warn",
             )
+            num_cols, cat_cols = self._split_feature_types(X_df)
             pre = self._build_preprocessor(num_cols, cat_cols, algo=algo)
             dummy = DummyClassifier(strategy="most_frequent")
             model = Pipeline([("pre", pre), ("clf", dummy)])
@@ -1560,48 +1926,48 @@ class ModelTrainer:
                 model.fit(X_df, y)
             metrics = {"cv_score": None, "best_params": {}, "hpo_trials": 0, "class_counts": class_counts}
             metrics["selected_feature_cols"] = list(X_df.columns)
-            metrics["feature_selection"] = mi_report
+            metrics["feature_selection"] = {"enabled": False, "reason": "single_class_target"}
             metrics["model_importance"] = self._extract_model_importance(model)
             metrics["feature_dominance_audit"] = {}
             return model, metrics
 
         LOG.info(f"[ModelTrainer] HPO for {name} algo={algo} trials={n_trials} splits={cv_splits}")
         hpo_t0 = time.perf_counter()
+        tscv = self._make_tscv(len(X_df), cv_splits)
+        split_contexts = []
+        if tscv is not None:
+            for tr_idx, va_idx in tscv.split(X_df):
+                Xt_fold, _ = self._apply_mutual_info_filter(X_df.iloc[tr_idx], y[tr_idx], name, emit_log=False)
+                fold_cols = list(Xt_fold.columns)
+                fold_num_cols, fold_cat_cols = self._split_feature_types(Xt_fold)
+                split_contexts.append(
+                    {
+                        "tr_idx": tr_idx,
+                        "va_idx": va_idx,
+                        "cols": fold_cols,
+                        "num_cols": fold_num_cols,
+                        "cat_cols": fold_cat_cols,
+                    }
+                )
+        else:
+            X_eval, _ = self._apply_mutual_info_filter(X_df, y, name, emit_log=False)
+            eval_num_cols, eval_cat_cols = self._split_feature_types(X_eval)
+            split_contexts.append(
+                {
+                    "tr_idx": None,
+                    "va_idx": None,
+                    "cols": list(X_eval.columns),
+                    "num_cols": eval_num_cols,
+                    "cat_cols": eval_cat_cols,
+                }
+            )
 
         def build_model(params: Dict[str, Any]):
-            if algo == "lightgbm":
-                return lgb.LGBMClassifier(
-                    n_estimators=int(params["n_estimators"]),
-                    num_leaves=int(params["num_leaves"]),
-                    max_depth=int(params["max_depth"]),
-                    learning_rate=float(params["learning_rate"]),
-                    subsample=float(params.get("subsample", 1.0)),
-                    colsample_bytree=float(params.get("colsample_bytree", 1.0)),
-                    reg_alpha=float(params.get("reg_alpha", 0.0)),
-                    reg_lambda=float(params.get("reg_lambda", 0.0)),
-                    objective="binary",
-                    class_weight=cw,
-                )
-            if algo == "xgboost":
-                return xgb.XGBClassifier(
-                    n_estimators=int(params["n_estimators"]),
-                    max_depth=int(params["max_depth"]),
-                    learning_rate=float(params["learning_rate"]),
-                    subsample=float(params.get("subsample", 1.0)),
-                    colsample_bytree=float(params.get("colsample_bytree", 1.0)),
-                    reg_alpha=float(params.get("reg_alpha", 0.0)),
-                    reg_lambda=float(params.get("reg_lambda", 0.0)),
-                    eval_metric="logloss",
-                    tree_method="hist",
-                    objective="binary:logistic",
-                    scale_pos_weight=scale_pos,
-                )
-            return LogisticRegression(
-                C=float(params.get("C", 1.0)),
-                max_iter=500,
-                penalty="l2",
-                solver="lbfgs",
+            return self._build_classifier_estimator(
+                algo,
+                params,
                 class_weight=cw,
+                scale_pos_weight=scale_pos,
             )
 
         default_params = self._default_params_for_algo(algo, hpo_space)
@@ -1657,24 +2023,30 @@ class ModelTrainer:
             trial_label: Optional[str] = None,
             trial_started_at: Optional[float] = None,
         ) -> float:
-            base_model = build_model(params)
-            pre = self._build_preprocessor(num_cols, cat_cols, algo=algo)
-            model = Pipeline([("pre", pre), ("clf", base_model)])
-            tscv = self._make_tscv(len(X_df), cv_splits)
-            if tscv is None:
+            if len(split_contexts) == 1 and split_contexts[0]["tr_idx"] is None:
+                ctx = split_contexts[0]
+                X_eval = X_df.loc[:, ctx["cols"]]
+                base_model = build_model(params)
+                pre = self._build_preprocessor(ctx["num_cols"], ctx["cat_cols"], algo=algo)
+                model = Pipeline([("pre", pre), ("clf", base_model)])
                 with self._suppress_low_signal_warnings():
-                    model.fit(X_df, y)
-                    prob = self._positive_class_proba(model, X_df)
+                    model.fit(X_eval, y)
+                    prob = self._positive_class_proba(model, X_eval)
                     try:
                         return float(average_precision_score(y, prob))
                     except Exception:
                         return 0.5
             scores = []
-            splits = list(tscv.split(X_df))
             last_beat = trial_started_at or time.perf_counter()
-            for fold_idx, (tr_idx, va_idx) in enumerate(splits, start=1):
-                Xt, Xv = X_df.iloc[tr_idx], X_df.iloc[va_idx]
+            for fold_idx, ctx in enumerate(split_contexts, start=1):
+                tr_idx = ctx["tr_idx"]
+                va_idx = ctx["va_idx"]
+                Xt = X_df.iloc[tr_idx].loc[:, ctx["cols"]]
+                Xv = X_df.iloc[va_idx].loc[:, ctx["cols"]]
                 yt, yv = y[tr_idx], y[va_idx]
+                base_model = build_model(params)
+                pre = self._build_preprocessor(ctx["num_cols"], ctx["cat_cols"], algo=algo)
+                model = Pipeline([("pre", pre), ("clf", base_model)])
                 with self._suppress_low_signal_warnings():
                     model.fit(Xt, yt)
                     prob = self._positive_class_proba(model, Xv)
@@ -1688,7 +2060,7 @@ class ModelTrainer:
                 if trial_label and (now - last_beat) >= self.heartbeat_seconds:
                     elapsed = now - (trial_started_at or now)
                     fold_done = fold_idx
-                    fold_total = max(len(splits), 1)
+                    fold_total = max(len(split_contexts), 1)
                     rate = fold_done / max(elapsed, 1e-6)
                     eta = (fold_total - fold_done) / max(rate, 1e-6)
                     partial = float(np.mean(scores)) if scores else 0.0
@@ -1741,21 +2113,37 @@ class ModelTrainer:
             if study is None:
                 best_params = {k: v for k, v in default_params.items() if v is not None}
                 best_cv = ts_score(best_params, trial_label="default", trial_started_at=time.perf_counter())
-                pre = self._build_preprocessor(num_cols, cat_cols, algo=algo)
-                final_model = Pipeline([("pre", pre), ("clf", build_model(best_params))])
-                with self._suppress_low_signal_warnings():
-                    final_model.fit(X_df, y)
+                X_fit, mi_report = self._apply_mutual_info_filter(X_df, y, name, emit_log=True)
+                fit_num_cols, fit_cat_cols = self._split_feature_types(X_fit)
+                final_model, finalize_report = self._finalize_binary_model(
+                    X_df=X_fit,
+                    y=y,
+                    cfg=cfg,
+                    name=name,
+                    algo=algo,
+                    params=best_params,
+                    num_cols=fit_num_cols,
+                    cat_cols=fit_cat_cols,
+                    class_weight=cw,
+                    scale_pos_weight=scale_pos,
+                )
+                console_stage(
+                    "Feature selection ready",
+                    f"{self._display_name(name)} selected={len(X_fit.columns)}/{len(X_df.columns)} leak_safe=cv-fold",
+                    status="ok",
+                )
                 metrics = {
                     "cv_score": best_cv,
                     "best_params": best_params,
                     "hpo_trials": 0,
                     "class_counts": class_counts,
-                    "selected_feature_cols": list(X_df.columns),
+                    "selected_feature_cols": list(X_fit.columns),
                     "feature_selection": mi_report,
                     "model_importance": self._extract_model_importance(final_model),
-                    "permutation_importance": self._permutation_importance_audit(final_model, X_df, y),
-                    "feature_dominance_audit": self._feature_dominance_audit(final_model, X_df, y, name),
+                    "permutation_importance": self._permutation_importance_audit(final_model, X_fit, y),
+                    "feature_dominance_audit": self._feature_dominance_audit(final_model, X_fit, y, name),
                 }
+                metrics.update(finalize_report)
                 return final_model, metrics
             with self._suppress_low_signal_warnings():
                 study.optimize(objective, n_trials=n_trials, show_progress_bar=False, callbacks=[_cb])
@@ -1777,24 +2165,40 @@ class ModelTrainer:
             cfg=cfg,
         )
 
-        pre = self._build_preprocessor(num_cols, cat_cols, algo=algo)
-        final_model = Pipeline([("pre", pre), ("clf", build_model(best_params))])
-        with self._suppress_low_signal_warnings():
-            final_model.fit(X_df, y)
+        X_fit, mi_report = self._apply_mutual_info_filter(X_df, y, name, emit_log=True)
+        fit_num_cols, fit_cat_cols = self._split_feature_types(X_fit)
+        final_model, finalize_report = self._finalize_binary_model(
+            X_df=X_fit,
+            y=y,
+            cfg=cfg,
+            name=name,
+            algo=algo,
+            params=best_params,
+            num_cols=fit_num_cols,
+            cat_cols=fit_cat_cols,
+            class_weight=cw,
+            scale_pos_weight=scale_pos,
+        )
+        console_stage(
+            "Feature selection ready",
+            f"{self._display_name(name)} selected={len(X_fit.columns)}/{len(X_df.columns)} leak_safe=cv-fold",
+            status="ok",
+        )
         importance_report = self._extract_model_importance(final_model)
-        perm_report = self._permutation_importance_audit(final_model, X_df, y)
+        perm_report = self._permutation_importance_audit(final_model, X_fit, y)
         metrics = {
             "cv_score": best_cv,
             "best_params": best_params,
             "hpo_trials": n_trials,
             # record label balance for downstream monitoring
             "class_counts": class_counts,
-            "selected_feature_cols": list(X_df.columns),
+            "selected_feature_cols": list(X_fit.columns),
             "feature_selection": mi_report,
             "model_importance": importance_report,
             "permutation_importance": perm_report,
-            "feature_dominance_audit": self._feature_dominance_audit(final_model, X_df, y, name),
+            "feature_dominance_audit": self._feature_dominance_audit(final_model, X_fit, y, name),
         }
+        metrics.update(finalize_report)
         return final_model, metrics
 
     # ------------------------------------------------------------------
@@ -1903,6 +2307,9 @@ class ModelTrainer:
             "stack_inputs": inputs,
             "meta_feature_cols": meta_columns,
             "selected_algorithm": stack_metrics.get("selected_algorithm"),
+            "decision_threshold": stack_metrics.get("decision_threshold"),
+            "calibration": stack_metrics.get("calibration"),
+            "threshold_tuning": stack_metrics.get("threshold_tuning"),
             "challenger_scores": stack_metrics.get("challenger_scores", {}),
             "training_metrics": {k: v for k, v in stack_metrics.items() if k not in {"challenger_scores"}},
         }
@@ -1943,7 +2350,10 @@ class ModelTrainer:
                 eligible_total += 1
         console_stage(
             "Hazard schedule",
-            f"eligible_bins={eligible_total}/{horizon} min_event_fraction={min_event_fraction:.4f}",
+            (
+                f"progress={fmt_progress(0, max(eligible_total, 1))} "
+                f"eligible_bins={eligible_total}/{horizon} min_event_fraction={min_event_fraction:.4f}"
+            ),
             status="info",
         )
         hazard_started = time.perf_counter()
@@ -2058,6 +2468,7 @@ class ModelTrainer:
                         reg_lambda=float(params.get("reg_lambda", 0.0)),
                         objective="binary",
                         class_weight=cw_bin,
+                        verbosity=-1,
                     )
                 if selected_algo == "xgboost":
                     return xgb.XGBClassifier(
@@ -2072,6 +2483,7 @@ class ModelTrainer:
                         tree_method="hist",
                         objective="binary:logistic",
                         scale_pos_weight=scale_pos_bin,
+                        verbosity=0,
                     )
                 return LogisticRegression(
                     C=float(params["C"]),
@@ -2145,6 +2557,7 @@ class ModelTrainer:
             console_stage(
                 "Hazard bin done",
                 (
+                    f"progress={fmt_progress(processed_bins, max(eligible_total, 1))} "
                     f"bar={b} progress={processed_bins}/{max(eligible_total, 1)} "
                     f"elapsed={fmt_seconds(total_elapsed)} eta={fmt_seconds(eta)} "
                     f"bin_elapsed={fmt_seconds(time.perf_counter() - bin_started)}"
@@ -2247,6 +2660,7 @@ class ModelTrainer:
                         learning_rate=float(params["learning_rate"]),
                         subsample=float(params["subsample"]),
                         colsample_bytree=float(params["colsample_bytree"]),
+                        verbosity=-1,
                     )
                 if algo == "xgboost":
                     return xgb.XGBRegressor(
@@ -2258,6 +2672,7 @@ class ModelTrainer:
                         subsample=float(params["subsample"]),
                         colsample_bytree=float(params["colsample_bytree"]),
                         tree_method="hist",
+                        verbosity=0,
                     )
                 return GradientBoostingRegressor(
                     loss="quantile",
@@ -2365,6 +2780,7 @@ class ModelTrainer:
             console_stage(
                 "Quantile progress",
                 (
+                    f"progress={fmt_progress(q_idx, total_q)} "
                     f"{q_idx}/{total_q} done "
                     f"elapsed={fmt_seconds(total_elapsed)} eta={fmt_seconds(eta)}"
                 ),

@@ -128,6 +128,28 @@ class FeatureSelectionConfig(BaseModel):
     mutual_info_random_state: int = 42
 
 
+class ThresholdTuningConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    enabled: bool = True
+    holdout_frac: float = Field(default=0.15, gt=0.0, lt=0.5)
+    min_rows: int = Field(default=4096, ge=64)
+    min_holdout_rows: int = Field(default=512, ge=32)
+    metric: str = "f1"
+    min_precision: float = Field(default=0.10, ge=0.0, le=1.0)
+    min_recall: float = Field(default=0.01, ge=0.0, le=1.0)
+    default_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
+    max_candidates: int = Field(default=256, ge=8)
+
+    @field_validator("metric")
+    @classmethod
+    def _validate_metric(cls, v: str) -> str:
+        vv = str(v).lower().strip()
+        if vv not in {"f1", "precision", "recall"}:
+            raise ValueError("threshold metric must be one of: f1, precision, recall")
+        return vv
+
+
 class TrainingPreprocessingConfig(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -138,6 +160,7 @@ class TrainingPreprocessingConfig(BaseModel):
     outlier_clip: bool = True
     clip_quantiles: list[float] = Field(default_factory=lambda: [0.005, 0.995], min_length=2, max_length=2)
     feature_selection: Optional[FeatureSelectionConfig] = None
+    threshold_tuning: Optional[ThresholdTuningConfig] = None
 
     @field_validator("scaler")
     @classmethod
@@ -173,12 +196,29 @@ class TcnTrainingConfig(BaseModel):
     overrides: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
 
 
+class InferencePreferenceConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    routing_mode: str = "tree"
+    challenger_mode: str = "tcn"
+    allow_hybrid_explicit: bool = False
+
+    @field_validator("routing_mode", "challenger_mode")
+    @classmethod
+    def _validate_route_mode(cls, v: str) -> str:
+        vv = str(v).lower().strip()
+        if vv not in {"tree", "tcn", "hybrid_explicit"}:
+            raise ValueError("routing mode must be one of: tree, tcn, hybrid_explicit")
+        return vv
+
+
 class ModelsFileConfig(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     models: Dict[str, ModelEntryConfig]
     training_preprocessing: Optional[TrainingPreprocessingConfig] = None
     tcn_training: Optional[TcnTrainingConfig] = None
+    inference_preference: Optional[InferencePreferenceConfig] = None
 
     @model_validator(mode="after")
     def _validate_required_specialists(self) -> "ModelsFileConfig":

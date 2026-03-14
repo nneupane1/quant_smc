@@ -27,7 +27,7 @@ from quant_system.live.live_executor import LiveExecutor
 from quant_system.live_data.live_feature_enricher import LiveFeatureEnricher
 from quant_system.live_data.quote_state import QuoteState
 from quant_system.live_data.tf_builder import TFBuilder
-from quant_system.ml.predict.model_predictor import ModelPredictor
+from quant_system.ml.predict.model_predictor import ModelPredictor, resolve_inference_preference
 from quant_system.ml.registry.model_registry import ModelRegistry
 from quant_system.utils.logger import get_logger
 
@@ -40,7 +40,10 @@ class LiveOrchestrator:
         self.cfg = config_loader.load()
         self.exec_cfg = self.cfg.get("execution", {})
         pref_cfg = self.cfg.get("inference_preference", {}) if isinstance(self.cfg.get("inference_preference", {}), dict) else {}
-        self.prefer_tcn_specialists = bool(pref_cfg.get("prefer_tcn_specialists", True))
+        pref = resolve_inference_preference(pref_cfg)
+        self.routing_mode = str(pref["routing_mode"])
+        self.challenger_mode = str(pref["challenger_mode"])
+        self.allow_hybrid_explicit = bool(pref["allow_hybrid_explicit"])
         self.manual_alert_only = bool(self.exec_cfg.get("manual_alert_only", False))
         self.registry = registry
         self.dashboard = dashboard_adapter
@@ -60,7 +63,9 @@ class LiveOrchestrator:
 
         self.predictor = ModelPredictor(
             registry,
-            prefer_tcn_specialists=self.prefer_tcn_specialists,
+            routing_mode=self.routing_mode,
+            challenger_mode=self.challenger_mode,
+            allow_hybrid_explicit=self.allow_hybrid_explicit,
         )
         self.models_loaded = False
 
@@ -97,10 +102,20 @@ class LiveOrchestrator:
         resolved_specialists = self.predictor.warmup_specialists(
             ["liq_flow", "bos_cont", "flow_1h", "momo", "eop", "edp"]
         )
+        resolved_stacks = self.predictor.warmup_stacks(["meta_model", "confluence_model"])
+        specialist_bundle = self.predictor.specialist_bundle_map()
+        stack_bundle = self.predictor.stack_bundle_map()
+        route_status = self.predictor.routing_status()
         LOG.info(
-            "[LiveOrchestrator] Inference source mode=%s specialist_routes=%s",
-            self.predictor.source_mode(),
+            "[LiveOrchestrator] Inference routing requested=%s effective=%s challenger=%s "
+            "allow_hybrid=%s note=%s specialists=%s stacks=%s",
+            route_status["requested_mode"],
+            route_status["effective_mode"],
+            route_status["challenger_mode"],
+            route_status["allow_hybrid_explicit"],
+            route_status["note"] or "ready",
             resolved_specialists,
+            resolved_stacks,
         )
         if self.dashboard:
             self.dashboard.log_event(
@@ -108,9 +123,15 @@ class LiveOrchestrator:
                 None,
                 {
                     "version": "latest",
-                    "prefer_tcn_specialists": self.prefer_tcn_specialists,
+                    "routing_mode_requested": route_status["requested_mode"],
+                    "challenger_mode": route_status["challenger_mode"],
+                    "allow_hybrid_explicit": route_status["allow_hybrid_explicit"],
+                    "routing_note": route_status["note"],
                     "inference_source_mode": self.predictor.source_mode(),
                     "specialist_model_source": resolved_specialists,
+                    "stack_model_source": resolved_stacks,
+                    "specialist_model_bundle": specialist_bundle,
+                    "stack_model_bundle": stack_bundle,
                 },
             )
 
@@ -654,6 +675,10 @@ class LiveOrchestrator:
     def state_snapshot(self) -> Dict[str, Any]:
         source_mode = self.predictor.source_mode() if self.predictor is not None else "unknown"
         specialist_source = self.predictor.specialist_source_map() if self.predictor is not None else {}
+        stack_source = self.predictor.stack_source_map() if self.predictor is not None else {}
+        specialist_bundle = self.predictor.specialist_bundle_map() if self.predictor is not None else {}
+        stack_bundle = self.predictor.stack_bundle_map() if self.predictor is not None else {}
+        route_status = self.predictor.routing_status() if self.predictor is not None else {}
         return {
             "timestamp": self.last_timestamp,
             "starting_capital": self.exec_cfg.get("starting_equity", 0.0),
@@ -668,7 +693,15 @@ class LiveOrchestrator:
             "closed_trades": self.closed_trades,
             "exposures": self.exposure.current_exposures(self.executor.equity),
             "manual_alert_only": self.manual_alert_only,
-            "prefer_tcn_specialists": self.prefer_tcn_specialists,
+            "prefer_tcn_specialists": source_mode == "tcn",
+            "routing_mode_requested": route_status.get("requested_mode", self.routing_mode),
+            "challenger_mode": route_status.get("challenger_mode", self.challenger_mode),
+            "active_slot": route_status.get("active_slot", "production"),
+            "allow_hybrid_explicit": route_status.get("allow_hybrid_explicit", self.allow_hybrid_explicit),
+            "routing_note": route_status.get("note", ""),
             "inference_source_mode": source_mode,
             "specialist_model_source": specialist_source,
+            "stack_model_source": stack_source,
+            "specialist_model_bundle": specialist_bundle,
+            "stack_model_bundle": stack_bundle,
         }

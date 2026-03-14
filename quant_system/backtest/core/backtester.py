@@ -26,7 +26,7 @@ from quant_system.execution.gating.gates import GateEvaluator
 from quant_system.execution.gating.profit_ladder import ProfitLadderManager
 
 from quant_system.ml.registry.model_registry import ModelRegistry
-from quant_system.ml.predict.model_predictor import ModelPredictor
+from quant_system.ml.predict.model_predictor import ModelPredictor, resolve_inference_preference
 from quant_system.config.config_loader import ConfigLoader
 from quant_system.config.config_manager import ConfigManager
 
@@ -67,7 +67,10 @@ class Backtester:
         self.assets_cfg = self.cfg.get("assets", {})
         self.exec_cfg = self.cfg.get("execution", {})
         pref_cfg = self.cfg.get("inference_preference", {}) if isinstance(self.cfg.get("inference_preference", {}), dict) else {}
-        self.prefer_tcn_specialists = bool(pref_cfg.get("prefer_tcn_specialists", True))
+        pref = resolve_inference_preference(pref_cfg)
+        self.routing_mode = str(pref["routing_mode"])
+        self.challenger_mode = str(pref["challenger_mode"])
+        self.allow_hybrid_explicit = bool(pref["allow_hybrid_explicit"])
 
         self.simulator = ExecutionSimulator(self.cfg)
         self.tiering = TieringEngine(self.cfg)
@@ -79,7 +82,9 @@ class Backtester:
         self.profit_ladder = ProfitLadderManager(self.cfg)
         self.predictor = ModelPredictor(
             model_registry,
-            prefer_tcn_specialists=self.prefer_tcn_specialists,
+            routing_mode=self.routing_mode,
+            challenger_mode=self.challenger_mode,
+            allow_hybrid_explicit=self.allow_hybrid_explicit,
         )
         self.mpc = MPCRiskManager(self.cfg)
         self.capital = CapitalAllocator(self.cfg)
@@ -89,7 +94,16 @@ class Backtester:
 
         self.trade_log = TradeLog()
 
-        LOG.info("[Backtester] Initialized with multi-asset support")
+        route_status = self.predictor.routing_status()
+        LOG.info(
+            "[Backtester] Initialized with multi-asset support | requested_route=%s "
+            "effective_route=%s challenger=%s allow_hybrid=%s note=%s",
+            route_status["requested_mode"],
+            route_status["effective_mode"],
+            route_status["challenger_mode"],
+            route_status["allow_hybrid_explicit"],
+            route_status["note"] or "ready",
+        )
 
     # ----------------------------------------------------------------------
     # RUN BACKTEST

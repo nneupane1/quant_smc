@@ -59,6 +59,7 @@ def render_metrics(theme_choice: str, model_version: str, *, context: DashboardC
             {"label": "Latest Version", "value": model_version},
             {"label": "Avg Feature Count", "value": f"{summary['feature_count'].dropna().mean():.1f}"},
             {"label": "Best AUC", "value": f"{summary['auc'].dropna().max():.3f}" if summary['auc'].notna().any() else "--"},
+            {"label": "Thresholded Models", "value": f"{int(summary['decision_threshold'].notna().sum())}" if 'decision_threshold' in summary.columns else "0"},
         ]
     )
 
@@ -73,6 +74,11 @@ def render_metrics(theme_choice: str, model_version: str, *, context: DashboardC
         section_title("AUC by Model", "Specialists, meta, confluence, and auxiliaries")
         auc_df = summary.dropna(subset=["auc"]).sort_values("auc", ascending=False)
         _bar(auc_df, "auc:Q", "model:N", color="#6ea8fe")
+
+    if "decision_threshold" in summary.columns and summary["decision_threshold"].notna().any():
+        section_title("Decision Threshold by Model", "Saved calibrated cutoff used for post-fit classification review")
+        thr_df = summary.dropna(subset=["decision_threshold"]).sort_values("decision_threshold", ascending=False)
+        _bar(thr_df, "decision_threshold:Q", "model:N", color="#3ddc97")
 
     analysis = _optional_analysis(context)
     col1, col2 = st.columns(2)
