@@ -374,8 +374,31 @@ class ModelPredictor:
         stack_inputs = cfg.get("stack_inputs", list(specialist_probs.keys()))
         if not stack_inputs:
             return None
-        vec = np.array([float(specialist_probs.get(name, 0.0)) for name in stack_inputs], dtype=float).reshape(1, -1)
-        return self._positive_class_proba(clf, vec)
+        # Stack models may expect either raw specialist names (`liq_flow`) or
+        # prefixed feature names (`p_liq_flow`) depending on how the training
+        # frame was materialized. Build a named DataFrame and satisfy both.
+        base_model = getattr(clf, "base", clf)
+        feature_cols = cfg.get("features")
+        if not feature_cols:
+            feature_names_in = getattr(base_model, "feature_names_in_", None)
+            feature_cols = list(feature_names_in) if feature_names_in is not None else []
+        if not feature_cols:
+            feature_cols = list(stack_inputs)
+
+        row = {}
+        for col in feature_cols:
+            col = str(col)
+            if col in specialist_probs:
+                row[col] = float(specialist_probs.get(col, 0.0))
+            elif col.startswith("p_") and col[2:] in specialist_probs:
+                row[col] = float(specialist_probs.get(col[2:], 0.0))
+            elif col.startswith("prob_") and col[5:] in specialist_probs:
+                row[col] = float(specialist_probs.get(col[5:], 0.0))
+            else:
+                row[col] = 0.0
+
+        X_in = pd.DataFrame([row], columns=feature_cols)
+        return self._positive_class_proba(clf, X_in)
 
     def _predict_hazard_curve(self, row_like, model_name: str) -> Dict[int, float]:
         """
