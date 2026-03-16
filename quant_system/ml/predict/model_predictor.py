@@ -33,11 +33,13 @@ def resolve_inference_preference(pref_cfg: Optional[Dict[str, Any]]) -> Dict[str
     routing_mode = _normalize_routing_mode(requested, default="tree")
     challenger_mode = _normalize_routing_mode(pref.get("challenger_mode", "tcn"), default="tcn")
     allow_hybrid_explicit = bool(pref.get("allow_hybrid_explicit", False))
+    active_slot = str(pref.get("active_slot", "production") or "production").strip() or "production"
 
     return {
         "routing_mode": routing_mode,
         "challenger_mode": challenger_mode,
         "allow_hybrid_explicit": allow_hybrid_explicit,
+        "active_slot": active_slot,
     }
 
 
@@ -75,6 +77,10 @@ class ModelPredictor:
         self._resolved_stack_names: Dict[str, str] = {}
         self._resolved_specialist_meta: Dict[str, Dict[str, Any]] = {}
         self._resolved_stack_meta: Dict[str, Dict[str, Any]] = {}
+        self._specialist_bundle_cache: Dict[str, Tuple[Any, Any, Dict[str, Any], str]] = {}
+        self._stack_bundle_cache: Dict[str, Tuple[Any, Any, Dict[str, Any], str]] = {}
+        self._hazard_bundle_cache: Dict[str, Tuple[Dict[int, Any], Dict[str, Any]]] = {}
+        self._quantile_bundle_cache: Dict[str, Tuple[Any, Any, Dict[str, Any]]] = {}
         self._routing_note = ""
         self._effective_routing_mode = self._resolve_effective_routing_mode()
         log(
@@ -165,6 +171,9 @@ class ModelPredictor:
 
     def _load_specialist_bundle(self, model_name: str) -> Tuple[Any, Any, Dict[str, Any], str]:
         requested = str(model_name)
+        cached_bundle = self._specialist_bundle_cache.get(requested)
+        if cached_bundle is not None:
+            return cached_bundle
         cached = self._resolved_specialist_names.get(requested)
         if cached is not None:
             try:
@@ -182,11 +191,14 @@ class ModelPredictor:
                         **meta,
                         "decision_threshold": cfg.get("decision_threshold"),
                     }
-                return clf, cal, cfg, cached
+                bundle = (clf, cal, cfg, cached)
+                self._specialist_bundle_cache[requested] = bundle
+                return bundle
             except Exception:
                 # stale cache entry (artifact rotation/deletion) -> re-resolve
                 self._resolved_specialist_names.pop(requested, None)
                 self._resolved_specialist_meta.pop(requested, None)
+                self._specialist_bundle_cache.pop(requested, None)
 
         last_exc: Optional[Exception] = None
         for candidate in self._candidate_specialist_names(requested):
@@ -209,7 +221,9 @@ class ModelPredictor:
                         f"version={meta.get('version')} "
                         f"source={meta.get('selection_source', 'best')}"
                     )
-                return clf, cal, cfg, resolved_name
+                bundle = (clf, cal, cfg, resolved_name)
+                self._specialist_bundle_cache[requested] = bundle
+                return bundle
             except Exception as exc:
                 last_exc = exc
                 continue
@@ -232,6 +246,9 @@ class ModelPredictor:
 
     def _load_stack_bundle(self, model_name: str) -> Tuple[Any, Any, Dict[str, Any], str]:
         requested = str(model_name)
+        cached_bundle = self._stack_bundle_cache.get(requested)
+        if cached_bundle is not None:
+            return cached_bundle
         cached = self._resolved_stack_names.get(requested)
         if cached is not None:
             try:
@@ -249,10 +266,13 @@ class ModelPredictor:
                         **meta,
                         "decision_threshold": cfg.get("decision_threshold"),
                     }
-                return clf, cal, cfg, cached
+                bundle = (clf, cal, cfg, cached)
+                self._stack_bundle_cache[requested] = bundle
+                return bundle
             except Exception:
                 self._resolved_stack_names.pop(requested, None)
                 self._resolved_stack_meta.pop(requested, None)
+                self._stack_bundle_cache.pop(requested, None)
 
         last_exc: Optional[Exception] = None
         for candidate in self._candidate_stack_names(requested):
@@ -275,7 +295,9 @@ class ModelPredictor:
                         f"version={meta.get('version')} "
                         f"source={meta.get('selection_source', 'best')}"
                     )
-                return clf, cal, cfg, resolved_name
+                bundle = (clf, cal, cfg, resolved_name)
+                self._stack_bundle_cache[requested] = bundle
+                return bundle
             except Exception as exc:
                 last_exc = exc
                 continue
@@ -359,7 +381,11 @@ class ModelPredictor:
         """
         Returns per-bin event probability.
         """
-        models, cfg = self.registry.load_hazard_model(model_name)
+        cached_bundle = self._hazard_bundle_cache.get(str(model_name))
+        if cached_bundle is None:
+            cached_bundle = self.registry.load_hazard_model(model_name)
+            self._hazard_bundle_cache[str(model_name)] = cached_bundle
+        models, cfg = cached_bundle
         H = cfg.get("horizon_bars", 48)
         event_probs = {}
         feature_cols = cfg.get("feature_cols", [])
@@ -376,7 +402,11 @@ class ModelPredictor:
         return event_probs
 
     def _predict_quantiles(self, row_like, model_name: str = "quantile") -> Dict[str, float]:
-        models, _cal, cfg = self.registry.load_latest_bundle(model_name)
+        cached_bundle = self._quantile_bundle_cache.get(str(model_name))
+        if cached_bundle is None:
+            cached_bundle = self.registry.load_latest_bundle(model_name)
+            self._quantile_bundle_cache[str(model_name)] = cached_bundle
+        models, _cal, cfg = cached_bundle
         feature_cols = cfg.get("features", [])
         X_in = self._row_frame(row_like, feature_cols) if feature_cols else self._row_frame(row_like, [])
         quantiles = {}
