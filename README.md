@@ -44,6 +44,7 @@ The central design promise of the project is research-to-execution parity. The s
 - [9B. Temporal Convolutional Network (TCN) Design Rationale And Learning Mechanics](#9b-temporal-convolutional-network-tcn-design-rationale-and-learning-mechanics)
 - [10. Execution, Risk, And Capital Logic](#10-execution-risk-and-capital-logic)
 - [10A. Operator Guide: Reading Confluence, EVR, And Hazard Together](#10a-operator-guide-reading-confluence-evr-and-hazard-together)
+- [10B. Post-Backtest Trade-Policy Overlay](#10b-post-backtest-trade-policy-overlay)
 - [11. Runtime Modes](#11-runtime-modes)
 - [12. Dashboards, Terminal, And Telemetry](#12-dashboards-terminal-and-telemetry)
 - [13. Installation](#13-installation)
@@ -327,6 +328,694 @@ On top of the specialist layer, the repo trains:
 ### Inference Contract
 
 At inference time, the predictor is expected to return a structured output rather than a single scalar. The downstream execution layer expects specialist probabilities, meta probability, confluence probability, hazard shape, and quantile outputs in a schema-stable form. That is why model registry artifacts persist their feature lists and why the predictor reads those persisted feature contracts instead of guessing from column names at runtime.
+
+### Current Persisted Selected Feature Contracts
+
+The following lists are the current BTCUSD specialist feature contracts persisted by the trained tree winners. These are post-hygiene, post-filtering, post-selection input lists, not the raw pre-filter feature universe. When TCN training is configured to align to the tree manifest, it inherits these same selected columns for fair comparison.
+
+#### `liq_flow`
+
+```python
+[
+    "swing_equal_high",
+    "swing_equal_low",
+    "bos_up",
+    "bos_down",
+    "choch_up",
+    "choch_down",
+    "bos_flag",
+    "choch_flag",
+    "bias",
+    "fvg_up",
+    "fvg_down",
+    "fvg_touch_flag",
+    "fvg_ctx_dir",
+    "fvg_ctx_age",
+    "fvg_ctx_weight",
+    "fvg_ctx_fresh",
+    "fvg_ctx_stale",
+    "fvg_ctx_dist_top",
+    "fvg_ctx_dist_bot",
+    "sweep_high",
+    "sweep_low",
+    "sweep_flag",
+    "sweep_dir",
+    "demand_quality",
+    "demand_touched",
+    "supply_quality",
+    "supply_age",
+    "supply_touched",
+    "zone_id",
+    "zone_recency",
+    "zone_displacement",
+    "zone_mitigation",
+    "displacement_15m",
+    "fresh_retest_15m",
+    "compression_6h",
+    "bos_flag_1h",
+    "choch_flag_1h",
+    "bias_1h",
+    "sweep_flag_1h",
+    "demand_quality_1h",
+    "supply_quality_1h",
+    "demand_age_1h",
+    "supply_age_1h",
+    "zone_recency_1h",
+    "zone_displacement_1h",
+    "zone_mitigation_1h",
+    "bos_flag_6h",
+    "choch_flag_6h",
+    "sweep_flag_6h",
+    "demand_quality_6h",
+    "supply_quality_6h",
+    "supply_age_6h",
+    "zone_recency_6h",
+    "zone_displacement_6h",
+    "zone_mitigation_6h",
+    "bos_flag_12h",
+    "choch_flag_12h",
+    "sweep_flag_12h",
+    "demand_quality_12h",
+    "supply_quality_12h",
+    "demand_age_12h",
+    "supply_age_12h",
+    "zone_recency_12h",
+    "zone_displacement_12h",
+    "ema_slope_21_15m",
+    "band_regime_21_15m",
+    "ema_slope_55_15m",
+    "band_regime_55_15m",
+    "dist_to_ema_15m",
+    "ema_alignment_15m",
+    "band_regime_50_1h",
+    "band_regime_200_1h",
+    "ema_alignment_1h",
+    "band_regime_100_6h",
+    "band_regime_200_12h",
+    "liq_eq_high_density",
+    "liq_eq_low_density",
+    "liq_sweep_strength",
+    "liq_displacement_ratio",
+    "liq_wick_pressure",
+    "liq_volume_pressure",
+    "liq_near_pool_dist",
+    "liq_sweep_lag1",
+    "liq_sweep_lag2",
+    "liq_sweep_lag3",
+    "liq_sweep_strength_lag1",
+    "liq_sweep_strength_lag2",
+    "liq_wick_pressure_lag3",
+    "liq_near_pool_dist_lag1",
+    "liq_near_pool_dist_lag2",
+    "liq_near_pool_dist_lag3",
+    "atr",
+    "realized_vol",
+    "atr_slope",
+    "vol_zscore",
+    "dollar_volume",
+    "absorption_score",
+    "absorption_near_entry",
+    "absorption_near_stop",
+    "vol_pct",
+    "trend_persist",
+    "session_london",
+    "session_ny",
+    "session_overlap",
+    "session_offhours",
+    "session_name",
+    "session_bucket",
+    "session_bucket_id",
+    "session_pre_expansion",
+    "session_expansion",
+    "wick_asymmetry_15m",
+    "session_volume_pct",
+    "session_range_pct",
+    "session_wick_asym_pct",
+    "session_atr_pct",
+    "bos_flag_lag1",
+    "choch_flag_lag1",
+    "fvg_touch_flag_lag1",
+    "atr_rstd4",
+    "atr_rstd16",
+]
+```
+
+#### `bos_cont`
+
+```python
+[
+    "swing_equal_high",
+    "swing_equal_low",
+    "bos_up",
+    "bos_down",
+    "choch_up",
+    "choch_down",
+    "bos_flag",
+    "choch_flag",
+    "bias",
+    "fvg_up",
+    "fvg_down",
+    "fvg_touch_flag",
+    "fvg_ctx_dir",
+    "fvg_ctx_age",
+    "fvg_ctx_weight",
+    "fvg_ctx_fresh",
+    "fvg_ctx_dist_top",
+    "fvg_ctx_dist_bot",
+    "sweep_high",
+    "sweep_low",
+    "sweep_flag",
+    "sweep_dir",
+    "demand_top",
+    "demand_quality",
+    "demand_touched",
+    "supply_quality",
+    "supply_age",
+    "supply_touched",
+    "zone_recency",
+    "zone_displacement",
+    "zone_mitigation",
+    "displacement_15m",
+    "fresh_retest_15m",
+    "structural_bias_6h",
+    "zone_score_6h",
+    "bos_flag_1h",
+    "choch_flag_1h",
+    "bias_1h",
+    "sweep_flag_1h",
+    "demand_quality_1h",
+    "supply_quality_1h",
+    "demand_age_1h",
+    "supply_age_1h",
+    "zone_recency_1h",
+    "zone_displacement_1h",
+    "zone_mitigation_1h",
+    "displacement_body_pct_1h",
+    "ret_1h_1h",
+    "range_pct_1h",
+    "range_z_1h",
+    "bos_flag_6h",
+    "choch_flag_6h",
+    "bias_6h_y",
+    "sweep_flag_6h",
+    "demand_quality_6h",
+    "supply_quality_6h",
+    "demand_age_6h",
+    "supply_age_6h",
+    "zone_recency_6h",
+    "zone_displacement_6h",
+    "bos_flag_12h",
+    "choch_flag_12h",
+    "bias_12h",
+    "sweep_flag_12h",
+    "demand_quality_12h",
+    "supply_quality_12h",
+    "demand_age_12h",
+    "supply_age_12h",
+    "zone_recency_12h",
+    "zone_displacement_12h",
+    "ema_slope_21_15m",
+    "band_regime_21_15m",
+    "ema_slope_55_15m",
+    "band_regime_55_15m",
+    "dist_to_ema_15m",
+    "ema_alignment_15m",
+    "ema_slope_50_1h",
+    "band_regime_50_1h",
+    "ema_slope_200_1h",
+    "band_regime_200_1h",
+    "dist_to_ema_1h",
+    "ema_alignment_1h",
+    "ema_slope_100_6h",
+    "band_regime_100_6h",
+    "ema_slope_200_12h",
+    "band_regime_200_12h",
+    "dist_to_ema_12h",
+    "atr",
+    "realized_vol",
+    "atr_slope",
+    "vol_zscore",
+    "vol_pct",
+    "trend_persist",
+    "compression_12h",
+    "toxicity_12h",
+    "compression_12h_lag1",
+    "compression_12h_lag2",
+    "p_regime_trend",
+    "p_regime_expansion",
+    "p_regime_collapse",
+    "p_regime_range",
+    "session_london",
+    "session_ny",
+    "session_overlap",
+    "session_offhours",
+    "session_name",
+    "session_bucket",
+    "session_bucket_id",
+    "session_pre_expansion",
+    "session_expansion",
+    "session_volume_pct",
+    "session_range_pct",
+    "session_wick_asym_pct",
+    "session_atr_pct",
+    "bos_flag_lag1",
+    "choch_flag_lag1",
+    "sweep_flag_lag1",
+    "fvg_touch_flag_lag1",
+    "atr_rstd4",
+    "atr_rstd8",
+]
+```
+
+#### `flow_1h`
+
+```python
+[
+    "structural_bias_6h",
+    "zone_score_6h",
+    "bos_flag_1h",
+    "choch_flag_1h",
+    "bias_1h",
+    "sweep_flag_1h",
+    "zone_id_1h",
+    "zone_hi_1h",
+    "demand_quality_1h",
+    "supply_quality_1h",
+    "demand_age_1h",
+    "supply_age_1h",
+    "zone_recency_1h",
+    "zone_displacement_1h",
+    "zone_mitigation_1h",
+    "displacement_body_pct_1h",
+    "body_dir_1h",
+    "ret_1h_1h",
+    "close_loc_1h",
+    "range_pct_1h",
+    "range_z_1h",
+    "volume_z_1h",
+    "flow_signal_1h",
+    "flow_age_bars_1h",
+    "flow_ok_1h",
+    "flow_strength_1h",
+    "ema_slope_50_1h",
+    "dist_ema_50_1h",
+    "z_dist_ema_50_1h",
+    "band_regime_50_1h",
+    "ema_slope_200_1h",
+    "dist_ema_200_1h",
+    "z_dist_ema_200_1h",
+    "band_regime_200_1h",
+    "ema_alignment_1h",
+    "atr",
+    "realized_vol",
+    "vol_zscore",
+    "vol_pct",
+    "trend_persist",
+    "p_regime_trend",
+    "p_regime_expansion",
+    "p_regime_collapse",
+    "p_regime_range",
+    "regime_state",
+    "session_weight",
+    "session",
+]
+```
+
+#### `momo`
+
+```python
+[
+    "bos_up",
+    "bos_down",
+    "choch_up",
+    "bos_flag",
+    "choch_flag",
+    "fvg_down",
+    "fvg_touch_flag",
+    "fvg_ctx_dir",
+    "fvg_ctx_age",
+    "fvg_ctx_fresh",
+    "fvg_ctx_dist_top",
+    "fvg_ctx_dist_bot",
+    "sweep_flag",
+    "sweep_dir",
+    "demand_top",
+    "demand_quality",
+    "demand_touched",
+    "supply_quality",
+    "supply_touched",
+    "zone_displacement",
+    "displacement_15m",
+    "fresh_retest_15m",
+    "structural_bias_6h",
+    "pd_context_6h",
+    "zone_score_6h",
+    "bos_flag_1h",
+    "choch_flag_1h",
+    "bias_1h",
+    "sweep_flag_1h",
+    "demand_quality_1h",
+    "supply_quality_1h",
+    "demand_age_1h",
+    "zone_displacement_1h",
+    "displacement_body_pct_1h",
+    "ret_1h_1h",
+    "range_pct_1h",
+    "range_z_1h",
+    "bos_flag_6h",
+    "choch_flag_6h",
+    "bias_6h_y",
+    "sweep_flag_6h",
+    "demand_quality_6h",
+    "supply_quality_6h",
+    "demand_age_6h",
+    "supply_age_6h",
+    "zone_recency_6h",
+    "zone_displacement_6h",
+    "zone_mitigation_6h",
+    "bos_flag_12h",
+    "choch_flag_12h",
+    "bias_12h",
+    "sweep_flag_12h",
+    "demand_quality_12h",
+    "supply_quality_12h",
+    "demand_age_12h",
+    "supply_age_12h",
+    "zone_recency_12h",
+    "zone_displacement_12h",
+    "ema_slope_21_15m",
+    "band_regime_21_15m",
+    "ema_slope_55_15m",
+    "band_regime_55_15m",
+    "dist_to_ema_15m",
+    "ema_alignment_15m",
+    "ema_slope_50_1h",
+    "band_regime_50_1h",
+    "ema_slope_200_1h",
+    "band_regime_200_1h",
+    "dist_to_ema_1h",
+    "ema_alignment_1h",
+    "ema_slope_100_6h",
+    "band_regime_100_6h",
+    "ema_slope_200_12h",
+    "band_regime_200_12h",
+    "dist_to_ema_12h",
+    "liq_eq_high_density",
+    "liq_eq_low_density",
+    "liq_wick_pressure",
+    "liq_near_pool_dist",
+    "liq_sweep_lag1",
+    "liq_sweep_lag2",
+    "liq_sweep_lag3",
+    "liq_wick_pressure_lag1",
+    "liq_wick_pressure_lag2",
+    "liq_near_pool_dist_lag1",
+    "liq_near_pool_dist_lag3",
+    "realized_vol",
+    "atr_slope",
+    "vol_zscore",
+    "dollar_volume",
+    "absorption_near_entry",
+    "absorption_near_stop",
+    "vol_pct",
+    "trend_persist",
+    "compression_12h",
+    "toxicity_12h",
+    "compression_12h_lag1",
+    "compression_12h_lag2",
+    "p_regime_trend",
+    "p_regime_expansion",
+    "p_regime_collapse",
+    "p_regime_range",
+    "session_london",
+    "session_ny",
+    "session_overlap",
+    "session_offhours",
+    "session_name",
+    "session_bucket",
+    "session_bucket_id",
+    "session_pre_expansion",
+    "session_expansion",
+    "session_volume_pct",
+    "session_range_pct",
+    "session_wick_asym_pct",
+    "session_atr_pct",
+    "bos_flag_lag1",
+    "choch_flag_lag1",
+    "fvg_touch_flag_lag1",
+    "atr_rstd8",
+    "atr_rstd16",
+]
+```
+
+#### `eop`
+
+```python
+[
+    "bos_up",
+    "bos_down",
+    "choch_up",
+    "choch_down",
+    "bos_flag",
+    "choch_flag",
+    "bias",
+    "fvg_up",
+    "fvg_down",
+    "fvg_touch_flag",
+    "fvg_ctx_dir",
+    "fvg_ctx_age",
+    "fvg_ctx_weight",
+    "fvg_ctx_fresh",
+    "fvg_ctx_stale",
+    "fvg_ctx_dist_top",
+    "fvg_ctx_dist_bot",
+    "sweep_flag",
+    "sweep_dir",
+    "demand_top",
+    "demand_quality",
+    "demand_age",
+    "demand_touched",
+    "supply_quality",
+    "supply_touched",
+    "zone_id",
+    "zone_recency",
+    "zone_displacement",
+    "displacement_15m",
+    "fresh_retest_15m",
+    "structural_bias_6h",
+    "pd_context_6h",
+    "zone_score_6h",
+    "bos_flag_1h",
+    "choch_flag_1h",
+    "bias_1h",
+    "sweep_flag_1h",
+    "zone_id_1h",
+    "demand_quality_1h",
+    "supply_quality_1h",
+    "demand_age_1h",
+    "supply_age_1h",
+    "zone_recency_1h",
+    "zone_displacement_1h",
+    "zone_mitigation_1h",
+    "displacement_body_pct_1h",
+    "ret_1h_1h",
+    "range_pct_1h",
+    "range_z_1h",
+    "bos_flag_6h",
+    "choch_flag_6h",
+    "bias_6h_y",
+    "zone_id_6h",
+    "demand_quality_6h",
+    "supply_quality_6h",
+    "demand_age_6h",
+    "supply_age_6h",
+    "zone_recency_6h",
+    "zone_displacement_6h",
+    "zone_mitigation_6h",
+    "bos_flag_12h",
+    "choch_flag_12h",
+    "bias_12h",
+    "sweep_flag_12h",
+    "zone_id_12h",
+    "demand_quality_12h",
+    "supply_quality_12h",
+    "demand_age_12h",
+    "supply_age_12h",
+    "zone_recency_12h",
+    "zone_displacement_12h",
+    "band_regime_21_15m",
+    "ema_slope_55_15m",
+    "band_regime_55_15m",
+    "dist_to_ema_15m",
+    "ema_alignment_15m",
+    "ema_slope_50_1h",
+    "band_regime_50_1h",
+    "ema_slope_200_1h",
+    "band_regime_200_1h",
+    "dist_to_ema_1h",
+    "ema_alignment_1h",
+    "ema_slope_100_6h",
+    "band_regime_100_6h",
+    "ema_slope_200_12h",
+    "band_regime_200_12h",
+    "dist_to_ema_12h",
+    "atr",
+    "realized_vol",
+    "atr_slope",
+    "vol_zscore",
+    "vol_pct",
+    "trend_persist",
+    "compression_12h",
+    "toxicity_12h",
+    "compression_12h_lag1",
+    "compression_12h_lag2",
+    "p_regime_trend",
+    "p_regime_expansion",
+    "p_regime_collapse",
+    "p_regime_range",
+    "session_london",
+    "session_ny",
+    "session_offhours",
+    "session_name",
+    "session_bucket",
+    "session_bucket_id",
+    "session_pre_expansion",
+    "session_expansion",
+    "session_volume_pct",
+    "session_range_pct",
+    "session_wick_asym_pct",
+    "session_atr_pct",
+    "bos_flag_lag1",
+    "choch_flag_lag1",
+    "sweep_flag_lag1",
+    "fvg_touch_flag_lag1",
+    "atr_rstd4",
+    "atr_rstd8",
+    "atr_rstd16",
+]
+```
+
+#### `edp`
+
+```python
+[
+    "swing_equal_high",
+    "swing_equal_low",
+    "bos_up",
+    "bos_down",
+    "choch_up",
+    "choch_down",
+    "bos_flag",
+    "choch_flag",
+    "bias",
+    "fvg_up",
+    "fvg_down",
+    "fvg_touch_flag",
+    "fvg_ctx_dir",
+    "fvg_ctx_age",
+    "fvg_ctx_weight",
+    "fvg_ctx_fresh",
+    "fvg_ctx_stale",
+    "fvg_ctx_dist_top",
+    "fvg_ctx_dist_bot",
+    "sweep_high",
+    "sweep_low",
+    "sweep_flag",
+    "sweep_dir",
+    "demand_top",
+    "demand_quality",
+    "demand_age",
+    "demand_touched",
+    "supply_quality",
+    "supply_age",
+    "supply_touched",
+    "zone_id",
+    "zone_recency",
+    "zone_displacement",
+    "zone_mitigation",
+    "displacement_15m",
+    "fresh_retest_15m",
+    "structural_bias_6h",
+    "pd_context_6h",
+    "compression_6h",
+    "zone_score_6h",
+    "bos_flag_1h",
+    "choch_flag_1h",
+    "bias_1h",
+    "sweep_flag_1h",
+    "zone_id_1h",
+    "demand_quality_1h",
+    "supply_quality_1h",
+    "demand_age_1h",
+    "supply_age_1h",
+    "zone_recency_1h",
+    "zone_displacement_1h",
+    "zone_mitigation_1h",
+    "displacement_body_pct_1h",
+    "ret_1h_1h",
+    "range_pct_1h",
+    "range_z_1h",
+    "bos_flag_6h",
+    "choch_flag_6h",
+    "bias_6h_y",
+    "sweep_flag_6h",
+    "zone_id_6h",
+    "demand_quality_6h",
+    "supply_quality_6h",
+    "demand_age_6h",
+    "supply_age_6h",
+    "zone_recency_6h",
+    "zone_displacement_6h",
+    "zone_mitigation_6h",
+    "bos_flag_12h",
+    "choch_flag_12h",
+    "bias_12h",
+    "sweep_flag_12h",
+    "zone_id_12h",
+    "demand_quality_12h",
+    "supply_quality_12h",
+    "demand_age_12h",
+    "supply_age_12h",
+    "zone_recency_12h",
+    "zone_displacement_12h",
+    "zone_mitigation_12h",
+    "atr",
+    "realized_vol",
+    "atr_slope",
+    "vol_zscore",
+    "vol_pct",
+    "trend_persist",
+    "compression_12h",
+    "toxicity_12h",
+    "compression_12h_lag1",
+    "compression_12h_lag2",
+    "p_regime_trend",
+    "p_regime_expansion",
+    "p_regime_collapse",
+    "p_regime_range",
+    "regime_state",
+    "session_london",
+    "session_ny",
+    "session_overlap",
+    "session_offhours",
+    "session_name",
+    "session_bucket",
+    "session_bucket_id",
+    "session_pre_expansion",
+    "session_expansion",
+    "session_volume_pct",
+    "session_range_pct",
+    "session_wick_asym_pct",
+    "session_atr_pct",
+    "bos_flag_lag1",
+    "choch_flag_lag1",
+    "sweep_flag_lag1",
+    "fvg_touch_flag_lag1",
+    "atr_rstd4",
+    "atr_rstd8",
+    "atr_rstd16",
+]
+```
 
 ## 9A. Temporal Convolutional Network (TCN) Specialist Benchmark Stack
 
@@ -869,6 +1558,95 @@ When they disagree, believe the disagreement. The disagreement is information, n
 
 That is the point of building a layered trading system instead of a single glowing button.
 
+## 10B. Post-Backtest Trade-Policy Overlay
+
+Once a backtest has been run, the repo can now build a second-stage dataset from `ledger.csv` and optional `reasoning.json` and train a trade-policy overlay on those executed-trade rows. This is not a replacement for the primary model stack. It is a post-backtest layer intended to answer:
+
+- should this kind of trade be trusted more or less at entry?
+- what realized `R` distribution should be expected for this setup family?
+- should a future deployment use this information for veto, ranking, or size adjustment?
+
+### Why The Default Model Family Is Tabular, Not Sequence-Based
+
+The backtest policy dataset is not raw candle history. Each row is already a compressed entry-state observation containing:
+
+- `confluence`, `EVR`, `hazard_entry`
+- tier, regime, session, leg, side
+- gate checks and gate reasons
+- sizing and stop context
+- optional reasoning-derived probabilities and decomposition fields
+
+That is a tabular decision-state problem. For this data shape, the right default is:
+
+- linear baseline for calibration and interpretability
+- tree challengers for nonlinear interaction capture
+- quantile regression for realized-`R` distribution
+
+This is why the trade-policy trainer uses:
+
+- `logistic` as the baseline quality model
+- `lightgbm` and `xgboost` as challengers
+- LightGBM quantile regression for realized-`R`
+
+Sequence architectures such as `TCN`, `LSTM`, or `NARX` are not the first choice here because the temporal structure has already been summarized upstream into a single entry row. Those models are appropriate earlier in the stack when learning directly from ordered feature windows. They are not the best first instrument for a ledger-driven policy overlay.
+
+### What Gets Built
+
+After a backtest, the CLI now writes:
+
+- `trade_policy_dataset.csv`
+- `trade_policy_dataset_meta.json`
+
+The dataset builder keeps only entry-safe features as model inputs and leaves realized outcomes as targets:
+
+- `label_trade_positive`
+- `label_trade_nonnegative`
+- `label_trade_ge_1r`
+- `target_realized_r`
+- `target_realized_pnl`
+- `target_duration_min`
+
+### Training Path
+
+The top-level launcher is:
+
+```bash
+python train_BTCUSD_trade_policy_models.py --backtest-dir artifacts/backtest/latest
+```
+
+This produces a separate training manifest under:
+
+- `artifacts/train/BTCUSD/trade_policy/train_manifest.json`
+
+and saves versioned models to the normal registry:
+
+- `trade_policy_quality`
+- `trade_policy_return`
+
+### What The Two Models Are For
+
+`trade_policy_quality`
+- binary classifier over trade quality
+- calibrated and threshold-tuned
+- intended for veto, acceptance tightening, or rank ordering
+
+`trade_policy_return`
+- realized-`R` quantile forecaster
+- intended for sizing and payoff-shape estimation
+- best used as a distributional overlay, not as a single magic target
+
+### Validation Standard
+
+This overlay must be held to a higher standard than a normal backtest summary. It should be trained only on past trade rows and validated on later trade rows by `entry_ts`. The correct deployment order is:
+
+1. base models generate trades
+2. backtest artifacts create the trade-policy dataset
+3. trade-policy models are trained on historical trade rows
+4. trade-policy overlay is shadowed in forward or paper runtime
+5. only then should it influence production sizing or veto logic
+
+That order matters because post-backtest overlays are otherwise an easy place to create elegant but non-transferable overfit.
+
 ## 11. Runtime Modes
 
 ### Backtest
@@ -1120,6 +1898,13 @@ These are the human-friendly top-level scripts that make the pipeline explicit:
 - `train_BTCUSD_momo_tcn_model.py`
 - `train_BTCUSD_eop_tcn_model.py`
 - `train_BTCUSD_edp_tcn_model.py`
+- `train_BTCUSD_tcn_stack_model.py`
+- `train_BTCUSD_meta_tcn_model.py`
+- `train_BTCUSD_confluence_tcn_model.py`
+- `configure_BTCUSD_hybrid_routes.py`
+- `train_BTCUSD_hybrid_stack_model.py`
+- `train_BTCUSD_meta_hybrid_model.py`
+- `train_BTCUSD_confluence_hybrid_model.py`
 - `tune_BTCUSD_label_horizons.py`
 
 Temporal Convolutional Network (TCN) launchers require PyTorch in the active interpreter:
@@ -1275,6 +2060,99 @@ and inspect latest compact snapshot:
 ```bash
 cat artifacts/train/BTCUSD/<target>_tcn/hpo_progress.json
 ```
+
+## 16B. BTCUSD Hybrid-Explicit Stack Runbook
+
+Hybrid-explicit means:
+
+- specialists can be mixed per target, e.g. `flow_1h_tcn` with the rest still on tree
+- `meta_model_hybrid` and `confluence_model_hybrid` are then trained on that exact mixed specialist route set
+- backtest / forward / live use the mixed specialist slot only when `routing_mode: hybrid_explicit` is enabled
+
+This is the correct way to mix families without silently feeding a tree-trained stack with a different specialist-output distribution.
+
+### Hybrid Prerequisites
+
+Before training hybrid stacks, you should already have:
+
+- the tree specialist family trained
+- any TCN specialists you want to compete already trained
+- a deliberate winner chosen per specialist target
+
+### Step 1: Pin Hybrid Specialist Winners Into A Slot
+
+Use the route configurator to define the exact mixed specialist set. Example:
+
+```bash
+python configure_BTCUSD_hybrid_routes.py --slot hybrid_candidate \
+  --route liq_flow=liq_flow \
+  --route bos_cont=bos_cont \
+  --route flow_1h=flow_1h_tcn \
+  --route momo=momo \
+  --route eop=eop \
+  --route edp=edp
+```
+
+Notes:
+
+- left side is the requested specialist used by the runtime stack
+- right side is the saved model family to use for that specialist
+- omit `@version` to use the registry-selected best saved version
+- add `@v000X` if you want to pin an exact version
+
+This writes routes into `models/active_models.json` under the chosen slot and also saves a readable copy in:
+
+- `artifacts/train/BTCUSD/hybrid_routes/<slot>.json`
+
+### Step 2: Train The Hybrid Stackers
+
+Default wrappers use slot `hybrid_candidate`:
+
+```bash
+python train_BTCUSD_meta_hybrid_model.py
+python train_BTCUSD_confluence_hybrid_model.py
+```
+
+If you want a different slot or strict/fallback control:
+
+```bash
+python train_BTCUSD_hybrid_stack_model.py --target meta_model --slot hybrid_candidate
+python train_BTCUSD_hybrid_stack_model.py --target confluence_model --slot hybrid_candidate
+```
+
+The trainer is strict by default: every specialist used by the hybrid stack must be explicitly routed in the chosen slot.
+
+Hybrid stack outputs are written to:
+
+- `artifacts/train/BTCUSD/meta_model_hybrid/`
+- `artifacts/train/BTCUSD/confluence_model_hybrid/`
+
+Registry aliases created by the trainer:
+
+- `meta_model_hybrid`
+- `confluence_model_hybrid`
+- `BTCUSD_meta_model_hybrid`
+- `BTCUSD_confluence_model_hybrid`
+
+### Step 3: Enable Hybrid Inference Later
+
+When you are ready to backtest or run the hybrid route, set this in `quant_system/config/models/models.yaml`:
+
+```yaml
+inference_preference:
+  routing_mode: hybrid_explicit
+  challenger_mode: tcn
+  allow_hybrid_explicit: true
+  active_slot: hybrid_candidate
+```
+
+Then the predictor will:
+
+- resolve specialists from the chosen active slot
+- require `meta_model_hybrid` and `confluence_model_hybrid`
+- use the mixed-family route in backtest / forward / live
+
+Until you flip those settings, the default runtime route remains the regular tree family.
 
 ### Recommended Interpretation Of The Sequence
 
