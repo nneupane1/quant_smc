@@ -22,7 +22,7 @@ The central design promise of the project is research-to-execution parity. The s
 | Regime layer | `12h` HMM + HDBSCAN |
 | Main supervised layer | tabular specialists + stackers |
 | Forecast layer | quantile forecaster active, `NARX` deferred |
-| Runtime modes | backtest, forward, live |
+| Runtime modes | backtest, forward replay, paper live, live |
 | UI surfaces | Streamlit research shell + Next terminal |
 | Telemetry transport | FastAPI + WebSocket |
 | Capital baseline | `20,000 USD` ticket policy with compounding and cooling |
@@ -1811,6 +1811,17 @@ That order matters because post-backtest overlays are otherwise an easy place to
 
 ## 11. Runtime Modes
 
+This section is important because the repo has both runtime names and dashboard view names. They are related, but they are not the same thing.
+
+### Runtime Meaning Matrix
+
+| Term | What it actually means in this repo | Data source | Order behavior |
+|---|---|---|---|
+| `backtest` | full historical simulation over the prepared BTCUSD feature frame | historical `15m` engineered rows with joined `1h/6h/12h` context | simulated |
+| `forward` | historical sequential replay through the forward engine | historical prepared rows replayed one bar at a time | simulated |
+| `paper live` | real-time paper trading | live `1m` stream -> live `15m/1h/6h/12h` rebuild -> inference | simulated |
+| `live` | real-time live trading | live `1m` stream -> live `15m/1h/6h/12h` rebuild -> inference | real if `live_trading.enabled=true` |
+
 ### Backtest
 
 Historical execution and analytics are under `quant_system/backtest/`. The core backtester is the authoritative historical runtime path.
@@ -1821,24 +1832,72 @@ Primary use:
 - equity curve and drawdown analysis
 - replay exports and post-trade audit
 
+Operator mental model:
+- replay from `2017-01-01` through the last available feature row
+- simulate trades with the current model stack and execution logic
+- inspect final daily/monthly outputs after the run completes
+
 ### Forward Test
 
-The forward runtime in `quant_system/forward_test/` mirrors live-style decisioning on new bars without placing real exchange orders.
+The forward runtime in `quant_system/forward_test/` is a historical runtime rehearsal. It replays already-prepared bars one by one through the forward engine. It is not the live market feed path.
 
 Primary use:
 - pre-production runtime validation
 - model and execution parity checks
-- dashboard and reasoning inspection under fresh incoming data
+- dashboard and reasoning inspection under bar-by-bar sequential replay
+
+Operator mental model:
+- historical bars arrive one at a time
+- the runtime behaves like a live engine
+- execution is still simulated
+
+### Paper Live
+
+Paper live is the operator concept most people mean when they say “forward test” informally.
+
+Primary use:
+- real-time paper trading
+- live signal verification
+- real-time PnL and alert observation without real order placement
+
+Operator mental model:
+- fetch live `1m` data
+- wait for completed `15m` bars
+- rebuild higher timeframes
+- run inference and execution logic
+- simulate positions and PnL with no real-money orders
 
 ### Live
 
-The live runtime in `quant_system/live/` mirrors the repaired forward logic and publishes structured telemetry. The transport architecture is moving toward a stricter shared event plane rather than independent console/UI logic.
+The live runtime in `quant_system/live/` mirrors the repaired paper-live logic and publishes structured telemetry. It is the same real-time decision path, but with live order routing if enabled.
 
 Primary use:
 - real-time alerting
 - execution intent generation
 - operator monitoring
-- telemetry publishing to the terminal and research surfaces
+- real-money trading when explicitly enabled
+
+Operator mental model:
+- same market-data and feature path as paper live
+- same inference and decision logic
+- real exchange execution if `live_trading.enabled=true`
+
+### Dashboard View Modes
+
+The terminal view selector is not a trading engine selector. It is a UI source selector.
+
+| View mode | Meaning |
+|---|---|
+| `auto` | follow the currently active runtime stream; this is the default operator choice while something is running |
+| `backtest` | read finished backtest artifacts from disk |
+| `forward` | read finished forward artifacts from disk |
+| `live` | follow live or paper-live runtime state |
+
+Operator rule:
+- during an active backtest, keep the terminal on `auto`
+- after a backtest finishes, switch to `backtest`
+- during an active forward replay, keep the terminal on `auto`
+- during paper live or real live, use `auto` or `live`
 
 ## 12. Dashboards, Terminal, And Telemetry
 
@@ -2291,7 +2350,7 @@ python run_BTCUSD_backtest_live_room.py
 http://127.0.0.1:3000
 ```
 
-3. Leave the view mode on `auto` while the run is active. This shows the telemetry-fed live replay state.
+3. Leave the view mode on `auto` while the run is active. `auto` is a dashboard source-selection mode, not a trading mode. During a running backtest it follows the telemetry-fed live replay state.
 
 4. Watch these panels during the run:
 
@@ -2306,7 +2365,10 @@ http://127.0.0.1:3000
 http://127.0.0.1:3000/?mode=backtest
 ```
 
-That mode reads the saved artifact bundle rather than the transient telemetry stream.
+That mode reads the saved artifact bundle rather than the transient telemetry stream. In other words:
+
+- `auto` during the run
+- `backtest` after the run
 
 ### Final Backtest Outputs
 
