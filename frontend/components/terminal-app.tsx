@@ -214,7 +214,11 @@ export function TerminalApp({
   const [snapshot, setSnapshot] = useState(normalizeSnapshot(initialSnapshot));
   const [viewMode, setViewMode] = useState<TerminalMode>(initialMode);
   const [wsConnected, setWsConnected] = useState(false);
-  const [selectedSignalId, setSelectedSignalId] = useState<string | null>(initialSnapshot.signals.candidates[0]?.id ?? null);
+  const [selectedSignalId, setSelectedSignalId] = useState<string | null>(
+    initialSnapshot.signals.candidates.find((candidate) => candidate.status !== "rejected")?.id
+      ?? initialSnapshot.signals.candidates[0]?.id
+      ?? null,
+  );
   const deferredSignals = useDeferredValue(snapshot.signals.candidates).slice(0, 5);
   const wsUrl = useMemo(() => {
     if (typeof window === "undefined") {
@@ -264,7 +268,9 @@ export function TerminalApp({
   }, [viewMode]);
 
   useEffect(() => {
-    const nextId = snapshot.signals.candidates[0]?.id ?? null;
+    const nextId = snapshot.signals.candidates.find((candidate) => candidate.status !== "rejected")?.id
+      ?? snapshot.signals.candidates[0]?.id
+      ?? null;
     if (!nextId) {
       if (selectedSignalId !== null) {
         setSelectedSignalId(null);
@@ -1738,11 +1744,17 @@ function SignalsPanel({
   onSelectSignal: (signalId: string) => void;
   reasoning?: ReasoningTree;
 }) {
+  const executableCandidates = candidates.filter((candidate) => candidate.status !== "rejected");
+  const rejectedCandidates = candidates.filter((candidate) => candidate.status === "rejected");
   const scatterPoints = candidates.map((candidate) => ({
     x: candidate.confluence * 100,
     y: candidate.hazard * 100,
     label: candidate.asset,
-    tone: candidate.side === "long" ? ("teal" as const) : ("rose" as const),
+    tone: candidate.status === "rejected"
+      ? ("amber" as const)
+      : candidate.side === "long"
+        ? ("teal" as const)
+        : ("rose" as const),
   }));
 
   return (
@@ -1758,39 +1770,91 @@ function SignalsPanel({
       >
         <ScatterSurface points={scatterPoints} />
       </ChartCard>
-      <div className="glass-panel overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="min-w-full text-left text-sm">
-            <thead className="border-b border-white/10 bg-white/[0.03] text-xs uppercase tracking-[0.18em] text-slate-400">
-              <tr>
-                {["Asset", "Side", "Tier", "Confluence", "EVR", "Flow 1h", "Hazard", "Reason"].map((header) => (
-                  <th key={header} className="px-4 py-4 font-medium">{header}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {candidates.map((candidate) => (
-                <tr
-                  key={candidate.id}
-                  onClick={() => onSelectSignal(candidate.id)}
-                  className={`cursor-pointer border-b border-white/5 transition hover:bg-cyan/5 ${
-                    selectedSignalId === candidate.id ? "bg-cyan/10" : ""
-                  }`}
-                >
-                  <td className="px-4 py-4 font-medium text-white">{candidate.asset}</td>
-                  <td className={`px-4 py-4 ${candidate.side === "long" ? "text-teal" : "text-rose"}`}>
-                    {candidate.side === "long" ? <ArrowUpRight className="inline h-4 w-4" /> : <ArrowDownRight className="inline h-4 w-4" />} {candidate.side}
-                  </td>
-                  <td className="px-4 py-4 text-amber">{candidate.tier}</td>
-                  <td className="px-4 py-4 text-cyan">{candidate.confluence.toFixed(2)}</td>
-                  <td className="px-4 py-4 text-slate-200">{candidate.evr.toFixed(2)}</td>
-                  <td className="px-4 py-4 text-teal">{candidate.flow1h.toFixed(2)}</td>
-                  <td className="px-4 py-4 text-rose">{candidate.hazard.toFixed(2)}</td>
-                  <td className="px-4 py-4 text-slate-400">{candidate.reason}</td>
+      <div className="grid gap-5 xl:grid-cols-2">
+        <div className="glass-panel overflow-hidden">
+          <div className="border-b border-white/10 bg-white/[0.03] px-4 py-3">
+            <div className="section-kicker">Executable</div>
+            <div className="mt-1 text-sm text-slate-300/75">Qualified alerts that passed the stack and can become trades.</div>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-left text-sm">
+              <thead className="border-b border-white/10 bg-white/[0.03] text-xs uppercase tracking-[0.18em] text-slate-400">
+                <tr>
+                  {["Asset", "Side", "Tier", "Confluence", "EVR", "Flow 1h", "Hazard", "Reason"].map((header) => (
+                    <th key={header} className="px-4 py-4 font-medium">{header}</th>
+                  ))}
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {executableCandidates.length ? executableCandidates.map((candidate) => (
+                  <tr
+                    key={candidate.id}
+                    onClick={() => onSelectSignal(candidate.id)}
+                    className={`cursor-pointer border-b border-white/5 transition hover:bg-cyan/5 ${
+                      selectedSignalId === candidate.id ? "bg-cyan/10" : ""
+                    }`}
+                  >
+                    <td className="px-4 py-4 font-medium text-white">{candidate.asset}</td>
+                    <td className={`px-4 py-4 ${candidate.side === "long" ? "text-teal" : "text-rose"}`}>
+                      {candidate.side === "long" ? <ArrowUpRight className="inline h-4 w-4" /> : <ArrowDownRight className="inline h-4 w-4" />} {candidate.side}
+                    </td>
+                    <td className="px-4 py-4 text-amber">{candidate.tier}</td>
+                    <td className="px-4 py-4 text-cyan">{candidate.confluence.toFixed(2)}</td>
+                    <td className="px-4 py-4 text-slate-200">{candidate.evr.toFixed(2)}</td>
+                    <td className="px-4 py-4 text-teal">{candidate.flow1h.toFixed(2)}</td>
+                    <td className="px-4 py-4 text-rose">{candidate.hazard.toFixed(2)}</td>
+                    <td className="px-4 py-4 text-slate-400">{candidate.reason}</td>
+                  </tr>
+                )) : (
+                  <tr>
+                    <td colSpan={8} className="px-4 py-6 text-slate-400">No executable alerts yet in the current stream.</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div className="glass-panel overflow-hidden">
+          <div className="border-b border-white/10 bg-white/[0.03] px-4 py-3">
+            <div className="section-kicker">Rejected Candidates</div>
+            <div className="mt-1 text-sm text-slate-300/75">Strong setups that were blocked by gating, cooling, or execution policy.</div>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-left text-sm">
+              <thead className="border-b border-white/10 bg-white/[0.03] text-xs uppercase tracking-[0.18em] text-slate-400">
+                <tr>
+                  {["Asset", "Side", "Tier", "Confluence", "EVR", "Hazard", "Reason"].map((header) => (
+                    <th key={header} className="px-4 py-4 font-medium">{header}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rejectedCandidates.length ? rejectedCandidates.map((candidate) => (
+                  <tr
+                    key={candidate.id}
+                    onClick={() => onSelectSignal(candidate.id)}
+                    className={`cursor-pointer border-b border-white/5 transition hover:bg-amber/5 ${
+                      selectedSignalId === candidate.id ? "bg-amber/10" : ""
+                    }`}
+                  >
+                    <td className="px-4 py-4 font-medium text-white">{candidate.asset}</td>
+                    <td className={`px-4 py-4 ${candidate.side === "long" ? "text-teal" : "text-rose"}`}>
+                      {candidate.side === "long" ? <ArrowUpRight className="inline h-4 w-4" /> : <ArrowDownRight className="inline h-4 w-4" />} {candidate.side}
+                    </td>
+                    <td className="px-4 py-4 text-amber">{candidate.tier}</td>
+                    <td className="px-4 py-4 text-cyan">{candidate.confluence.toFixed(2)}</td>
+                    <td className="px-4 py-4 text-slate-200">{candidate.evr.toFixed(2)}</td>
+                    <td className="px-4 py-4 text-rose">{candidate.hazard.toFixed(2)}</td>
+                    <td className="px-4 py-4 text-slate-400">{candidate.reason}</td>
+                  </tr>
+                )) : (
+                  <tr>
+                    <td colSpan={7} className="px-4 py-6 text-slate-400">No strong rejections have been surfaced yet.</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
       <ReasoningTreePanel
@@ -2891,7 +2955,7 @@ function BarSurface({
 function ScatterSurface({
   points,
 }: {
-  points: Array<{ x: number; y: number; label: string; tone: "teal" | "rose" }>;
+  points: Array<{ x: number; y: number; label: string; tone: "teal" | "rose" | "amber" }>;
 }) {
   const width = 640;
   const height = 190;
@@ -2904,7 +2968,7 @@ function ScatterSurface({
       {points.map((point) => {
         const x = 40 + (Math.max(0, Math.min(100, point.x)) / 100) * (width - 56);
         const y = (height - 40) - (Math.max(0, Math.min(100, point.y)) / 100) * (height - 56);
-        const color = point.tone === "teal" ? "#2ae6b8" : "#ff6b88";
+        const color = point.tone === "teal" ? "#2ae6b8" : point.tone === "amber" ? "#f3b63f" : "#ff6b88";
         return (
           <g key={`${point.label}-${point.x}-${point.y}`}>
             <circle cx={x} cy={y} r={5.5} fill={color} opacity={0.9} />

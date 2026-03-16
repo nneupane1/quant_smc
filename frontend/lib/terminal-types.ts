@@ -50,6 +50,8 @@ export type SignalCandidate = {
   hazard: number;
   regime: string;
   reason: string;
+  status?: "executable" | "rejected";
+  eventType?: string;
   reasoning?: ReasoningTree;
 };
 

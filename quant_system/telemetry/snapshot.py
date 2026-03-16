@@ -256,9 +256,10 @@ def _signal_candidates(raw_snapshot: Dict[str, Any], fallback_bundle: Dict[str, 
     out = []
     for row in reversed(events):
         event_type = str(row.get("event_type") or row.get("type") or "").lower()
-        if event_type not in {"entry", "scanner", "signal", "reasoning"}:
+        if event_type not in {"entry", "scanner", "signal", "reasoning", "alert"}:
             continue
         payload = row.get("payload", {}) if isinstance(row, dict) else {}
+        rejected = bool(payload.get("candidate_rejected") or payload.get("scanner")) or event_type == "scanner"
         out.append(
             {
                 "id": str(row.get("trade_id") or payload.get("trade_id") or f"SIG-{len(out)+1}"),
@@ -271,6 +272,8 @@ def _signal_candidates(raw_snapshot: Dict[str, Any], fallback_bundle: Dict[str, 
                 "hazard": _num(payload.get("hazard") or payload.get("hazard_score"), 0.22),
                 "regime": str(payload.get("regime") or payload.get("regime_state") or "unknown"),
                 "reason": str(payload.get("reason") or row.get("event_type") or "signal"),
+                "status": "rejected" if rejected else "executable",
+                "eventType": event_type,
                 "reasoning": _reasoning_tree_from_event(row),
             }
         )

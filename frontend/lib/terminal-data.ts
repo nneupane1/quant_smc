@@ -259,6 +259,11 @@ function num(value: unknown, fallback = 0) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function flag(value: unknown) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes";
+}
+
 function toUnix(value: unknown): number | null {
   if (value === null || value === undefined) return null;
   if (typeof value === "number" && Number.isFinite(value)) {
@@ -858,23 +863,29 @@ function deriveGuardrails(state: Record<string, unknown>): Guardrail[] {
 }
 
 function buildSignalsFromEvents(events: Record<string, string>[]): SignalCandidate[] {
-  const entries = events.filter((row) => ["entry", "signal", "scanner"].includes(String(row.type || row.event || "").toLowerCase()));
+  const entries = events.filter((row) => ["entry", "signal", "scanner", "alert"].includes(String(row.type || row.event || "").toLowerCase()));
   if (!entries.length) {
     return makeDemoSnapshot().signals.candidates;
   }
-  return entries.slice(-5).reverse().map((row, idx) => ({
-    id: String(row.trade_id || row.id || `SIG-${idx + 1}`),
-    asset: String(row.asset || "XBTUSD"),
-    side: String(row.side || "long").toLowerCase() === "short" ? "short" : "long",
-    tier: String(row.tier || "A"),
-    confluence: num(row.confluence || row.conf || row.score, 0.7),
-    evr: num(row.evr, 1.8),
-    flow1h: num(row.flow_1h || row.prob_flow_1h || row.p_flow_1h, 0.62),
-    hazard: num(row.hazard || row.hazard_score, 0.22),
-    regime: String(row.regime || row.regime_state || "unknown"),
-    reason: String(row.reason || row.detail || row.event || "Derived from live event stream."),
-    reasoning: buildReasoningEnvelope(row, row),
-  }));
+  return entries.slice(-5).reverse().map((row, idx) => {
+    const eventType = String(row.type || row.event || "").toLowerCase();
+    const rejected = flag(row.candidate_rejected) || flag(row.scanner) || eventType === "scanner";
+    return {
+      id: String(row.trade_id || row.id || `SIG-${idx + 1}`),
+      asset: String(row.asset || "XBTUSD"),
+      side: String(row.side || "long").toLowerCase() === "short" ? "short" : "long",
+      tier: String(row.tier || "A"),
+      confluence: num(row.confluence || row.conf || row.score, 0.7),
+      evr: num(row.evr, 1.8),
+      flow1h: num(row.flow_1h || row.prob_flow_1h || row.p_flow_1h, 0.62),
+      hazard: num(row.hazard || row.hazard_score, 0.22),
+      regime: String(row.regime || row.regime_state || "unknown"),
+      reason: String(row.reason || row.detail || row.event || "Derived from live event stream."),
+      status: rejected ? "rejected" : "executable",
+      eventType,
+      reasoning: buildReasoningEnvelope(row, row),
+    };
+  });
 }
 
 function buildTrades(rows: Record<string, string>[]): AuditTrade[] {
