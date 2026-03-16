@@ -12,6 +12,8 @@ import {
   BarChart3,
   BrainCircuit,
   CandlestickChart,
+  CheckCircle2,
+  CircleX,
   DatabaseZap,
   Gauge,
   Maximize2,
@@ -123,6 +125,81 @@ function pickString(...values: unknown[]): string | null {
     }
   }
   return null;
+}
+
+function normalizeTierLabel(tier: string): "Aplus" | "A" | "B" | "other" {
+  const raw = tier.trim().toLowerCase();
+  if (raw === "a+" || raw === "aplus" || raw === "a_plus") return "Aplus";
+  if (raw === "a") return "A";
+  if (raw === "b") return "B";
+  return "other";
+}
+
+function buildAlertOperatorGuide({
+  tier,
+  confluence,
+  evr,
+  hazard,
+  flow1h,
+}: {
+  tier: string;
+  confluence: number;
+  evr: number;
+  hazard: number;
+  flow1h: number;
+}): {
+  label: string;
+  tone: MetricTile["tone"];
+  summary: string;
+  action: string;
+  checks: Array<{ label: string; detail: string; tone: MetricTile["tone"]; status: string }>;
+} {
+  const tierKey = normalizeTierLabel(tier);
+  const tierSpec =
+    tierKey === "Aplus"
+      ? { minConfluence: 0.75, minEvr: 1.5, maxHazard: 0.35 }
+      : tierKey === "A"
+        ? { minConfluence: 0.6, minEvr: 1.2, maxHazard: 0.45 }
+        : tierKey === "B"
+          ? { minConfluence: 0.45, minEvr: 0.8, maxHazard: 0.6 }
+          : { minConfluence: 0.6, minEvr: 1.2, maxHazard: 0.45 };
+  const flowFloor = 0.55;
+  const confluenceOk = confluence >= tierSpec.minConfluence;
+  const evrOk = evr >= tierSpec.minEvr;
+  const hazardOk = hazard <= tierSpec.maxHazard;
+  const flowOk = flow1h >= flowFloor;
+
+  let label = "Pass";
+  let tone: MetricTile["tone"] = "rose";
+  let summary = "This alert is outside the normal acceptance posture. Unless there is a separate external reason to keep it visible, stand down.";
+  let action = "Manual mode: pass. Auto mode: do not force an override in favor of the trade.";
+
+  if ((tierKey === "Aplus" || tierKey === "A") && confluenceOk && evrOk && hazardOk && flowOk) {
+    label = "Green Light";
+    tone = "teal";
+    summary = "This alert is already pre-qualified by the system and sits inside the normal acceptance posture for execution.";
+    action = "Manual mode: confirm unless there is an external veto. Auto mode: allow the bot to execute.";
+  } else if (confluenceOk && evrOk && hazardOk) {
+    label = "Caution";
+    tone = "amber";
+    summary = "This alert passed the stack, but the posture is conditional rather than clean. Treat it as a smaller or more supervised process trade.";
+    action = "Manual mode: confirm only if you accept a lower-quality setup. Auto mode: acceptable if policy allows B-tier or conditional entries.";
+  }
+
+  return {
+    label,
+    tone,
+    summary,
+    action,
+    checks: [
+      { label: "Alert Status", detail: "Triggered alerts are already pre-qualified by the modeled decision pipeline.", tone: "cyan", status: "qualified" },
+      { label: "Tier", detail: `${tier} using floors conf ${tierSpec.minConfluence.toFixed(2)}, EVR ${tierSpec.minEvr.toFixed(2)}, hazard ${tierSpec.maxHazard.toFixed(2)}.`, tone: tierKey === "Aplus" || tierKey === "A" ? "teal" : tierKey === "B" ? "amber" : "rose", status: tier },
+      { label: "Confluence", detail: `${confluence.toFixed(2)} vs required ${tierSpec.minConfluence.toFixed(2)}.`, tone: confluenceOk ? "teal" : "rose", status: confluenceOk ? "pass" : "fail" },
+      { label: "EVR", detail: `${evr.toFixed(2)} vs required ${tierSpec.minEvr.toFixed(2)}.`, tone: evrOk ? "teal" : "rose", status: evrOk ? "pass" : "fail" },
+      { label: "Hazard", detail: `${hazard.toFixed(2)} vs ceiling ${tierSpec.maxHazard.toFixed(2)}. Lower is better.`, tone: hazardOk ? "teal" : "rose", status: hazardOk ? "safe" : "high" },
+      { label: "Flow 1h", detail: `${flow1h.toFixed(2)} vs guide floor ${flowFloor.toFixed(2)}.`, tone: flowOk ? "teal" : "amber", status: flowOk ? "fresh" : "thin" },
+    ],
+  };
 }
 
 export function TerminalApp({
@@ -831,6 +908,7 @@ function PerformancePanel({ snapshot }: { snapshot: TerminalSnapshot }) {
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [page, setPage] = useState(0);
   const pageSize = 32;
+  const verdict = snapshot.performance.verdict;
 
   const tierOptions = useMemo(
     () => ["all", ...Array.from(new Set(allRows.map((trade) => trade.tier).filter((value) => Boolean(value)))).sort()],
@@ -1108,6 +1186,64 @@ function PerformancePanel({ snapshot }: { snapshot: TerminalSnapshot }) {
         <h2 className="mt-2 text-xl font-semibold text-white">PnL, attribution, and execution quality at multi-timeframe depth</h2>
         <p className="mt-3 text-sm leading-6 text-slate-300/75">{snapshot.performance.summary}</p>
       </div>
+
+      {verdict ? (
+        <div className="glass-panel p-5">
+          <div className="section-kicker">Backtest Verdict</div>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <span className={`rounded-full border px-3 py-1 text-[0.62rem] uppercase tracking-[0.22em] ${toneClasses[toneFromStatus(verdict.status)]}`}>
+              {verdict.headline}
+            </span>
+            <span className={`rounded-full border px-3 py-1 text-[0.62rem] uppercase tracking-[0.22em] ${toneClasses[toneFromStatus(verdict.status)]}`}>
+              {verdict.recommendation.replace(/_/g, " ")}
+            </span>
+          </div>
+          <p className="mt-3 text-sm leading-6 text-slate-300/75">{verdict.summary}</p>
+
+          <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            <div className="rounded-3xl border border-white/10 bg-white/[0.03] p-4">
+              <div className="text-[0.62rem] uppercase tracking-[0.18em] text-slate-400">Return</div>
+              <div className="mt-2 text-lg font-semibold text-white">{fmtRatioPct(verdict.stats?.returnPct)}</div>
+              <div className="mt-1 text-xs text-slate-500">{fmtSignedUsd(verdict.stats?.totalPnl ?? 0)}</div>
+            </div>
+            <div className="rounded-3xl border border-white/10 bg-white/[0.03] p-4">
+              <div className="text-[0.62rem] uppercase tracking-[0.18em] text-slate-400">Profit Factor</div>
+              <div className="mt-2 text-lg font-semibold text-white">{fmtMaybeNumber(verdict.stats?.profitFactor, 2)}</div>
+              <div className="mt-1 text-xs text-slate-500">gross win / gross loss</div>
+            </div>
+            <div className="rounded-3xl border border-white/10 bg-white/[0.03] p-4">
+              <div className="text-[0.62rem] uppercase tracking-[0.18em] text-slate-400">Max Drawdown</div>
+              <div className="mt-2 text-lg font-semibold text-white">{fmtRatioPct(verdict.stats?.maxDrawdownPct)}</div>
+              <div className="mt-1 text-xs text-slate-500">from starting equity</div>
+            </div>
+            <div className="rounded-3xl border border-white/10 bg-white/[0.03] p-4">
+              <div className="text-[0.62rem] uppercase tracking-[0.18em] text-slate-400">Positive Periods</div>
+              <div className="mt-2 text-lg font-semibold text-white">{fmtRatioPct(verdict.stats?.positivePeriodShare)}</div>
+              <div className="mt-1 text-xs text-slate-500">
+                {verdict.stats?.periodCount ?? 0} {verdict.stats?.positivePeriodBasis ?? "periods"}
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-4 grid gap-3 lg:grid-cols-2">
+            {verdict.checks.map((check) => (
+              <div key={check.label} className="rounded-3xl border border-white/10 bg-white/[0.03] p-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-sm font-semibold text-white">{check.label}</div>
+                  <span className={`rounded-full border px-2 py-1 text-[0.58rem] uppercase tracking-[0.18em] ${toneClasses[toneFromStatus(check.status)]}`}>
+                    {check.status}
+                  </span>
+                </div>
+                <div className="mt-3 text-sm text-slate-200">
+                  <span className="font-mono text-white">{check.value}</span>
+                  <span className="ml-2 text-slate-500">target {check.threshold}</span>
+                </div>
+                <p className="mt-2 text-xs leading-5 text-slate-400">{check.detail}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         {snapshot.performance.kpis.map((metric) => (
@@ -1733,6 +1869,37 @@ function ConfluencePanel({
   const side = pickString(decision?.side, selectedCandidate?.side) ?? "long";
   const tier = pickString(finalDecision?.tier, decision?.tier, selectedCandidate?.tier) ?? "-";
   const regime = pickString(finalDecision?.regime, decision?.regime, context?.regime, selectedCandidate?.regime) ?? "unknown";
+  const operatorConfluence = pickNumber(selectedCandidate?.confluence, finalDecision?.confluence, decision?.confluence, ruleConfluence, mlConfluence, 0.0) ?? 0.0;
+  const operatorGuide = buildAlertOperatorGuide({
+    tier,
+    confluence: operatorConfluence,
+    evr,
+    hazard,
+    flow1h,
+  });
+  const verdictOptions = [
+    {
+      label: "Green Light",
+      emoji: "🟢",
+      icon: CheckCircle2,
+      tone: "teal" as const,
+      blurb: "System-approved process trade.",
+    },
+    {
+      label: "Caution",
+      emoji: "🟠",
+      icon: AlertTriangle,
+      tone: "amber" as const,
+      blurb: "Valid, but more conditional.",
+    },
+    {
+      label: "Pass",
+      emoji: "🔴",
+      icon: CircleX,
+      tone: "rose" as const,
+      blurb: "Stand down unless context changes.",
+    },
+  ];
   const confluenceGap = mlConfluence - ruleConfluence;
   const stackVector = [
     ruleConfluence * 100,
@@ -1836,6 +2003,58 @@ function ConfluencePanel({
         </div>
 
         <div className="space-y-4">
+          <div className="glass-panel p-5">
+            <div className="section-kicker">Alert Decision</div>
+            <div className="mt-2 flex flex-wrap items-center gap-3">
+              <h3 className="text-lg font-semibold text-white">Operator verdict</h3>
+              <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs uppercase tracking-[0.2em] ${toneClasses[operatorGuide.tone]}`}>
+                <span>{operatorGuide.label === "Green Light" ? "🟢" : operatorGuide.label === "Caution" ? "🟠" : "🔴"}</span>
+                <span>{operatorGuide.label}</span>
+              </span>
+            </div>
+            <p className="mt-3 text-sm leading-6 text-slate-300/80">{operatorGuide.summary}</p>
+            <div className="mt-4 grid gap-3 sm:grid-cols-3">
+              {verdictOptions.map((option) => {
+                const active = option.label === operatorGuide.label;
+                const Icon = option.icon;
+                return (
+                  <div
+                    key={option.label}
+                    className={`rounded-2xl border px-4 py-3 transition ${
+                      active
+                        ? `${toneClasses[option.tone]} shadow-[0_0_0_1px_rgba(255,255,255,0.04)]`
+                        : "border-white/10 bg-white/[0.02] text-slate-300"
+                    }`}
+                  >
+                    <div className="flex items-center gap-2">
+                      <Icon className="h-4 w-4" />
+                      <div className="text-sm font-semibold">
+                        {option.emoji} {option.label}
+                      </div>
+                    </div>
+                    <div className="mt-2 text-xs leading-5 text-slate-300/75">{option.blurb}</div>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="mt-4 space-y-2">
+              {operatorGuide.checks.map((check) => (
+                <div key={check.label} className="rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="text-sm font-medium text-white">{check.label}</div>
+                    <div className={`inline-flex rounded-full border px-2 py-1 text-[0.62rem] uppercase tracking-[0.18em] ${toneClasses[check.tone]}`}>
+                      {check.status}
+                    </div>
+                  </div>
+                  <div className="mt-2 text-sm leading-6 text-slate-300/75">{check.detail}</div>
+                </div>
+              ))}
+            </div>
+            <div className="mt-4 rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-3">
+              <div className="text-xs uppercase tracking-[0.18em] text-slate-400">Default action</div>
+              <div className="mt-2 text-sm leading-6 text-slate-200">{operatorGuide.action}</div>
+            </div>
+          </div>
           <div className="glass-panel p-5">
             <div className="section-kicker">Execution Read</div>
             <h3 className="mt-2 text-lg font-semibold text-white">{selectedCandidate?.asset ?? "No candidate selected"}</h3>
@@ -2779,6 +2998,16 @@ function fmtSignedUsd(value: number): string {
   if (value > 0) return `+${abs}`;
   if (value < 0) return `-${abs}`;
   return abs;
+}
+
+function fmtRatioPct(value?: number | null): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "-";
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+function fmtMaybeNumber(value?: number | null, digits = 2): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "-";
+  return value.toFixed(digits);
 }
 
 function fmtTs(value: string): string {

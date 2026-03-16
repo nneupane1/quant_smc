@@ -44,7 +44,8 @@ The central design promise of the project is research-to-execution parity. The s
 - [9B. Temporal Convolutional Network (TCN) Design Rationale And Learning Mechanics](#9b-temporal-convolutional-network-tcn-design-rationale-and-learning-mechanics)
 - [10. Execution, Risk, And Capital Logic](#10-execution-risk-and-capital-logic)
 - [10A. Operator Guide: Reading Confluence, EVR, And Hazard Together](#10a-operator-guide-reading-confluence-evr-and-hazard-together)
-- [10B. Post-Backtest Trade-Policy Overlay](#10b-post-backtest-trade-policy-overlay)
+- [10B. Alert Decision Guide After Trigger](#10b-alert-decision-guide-after-trigger)
+- [10C. Post-Backtest Trade-Policy Overlay](#10c-post-backtest-trade-policy-overlay)
 - [11. Runtime Modes](#11-runtime-modes)
 - [12. Dashboards, Terminal, And Telemetry](#12-dashboards-terminal-and-telemetry)
 - [13. Installation](#13-installation)
@@ -1558,7 +1559,160 @@ When they disagree, believe the disagreement. The disagreement is information, n
 
 That is the point of building a layered trading system instead of a single glowing button.
 
-## 10B. Post-Backtest Trade-Policy Overlay
+## 10B. Alert Decision Guide After Trigger
+
+This section is for the manual or semi-automatic operator who receives a live alert and needs a clean mental model for what to do next.
+
+The most important starting point is this:
+
+- an alert is not a raw idea
+- an alert is a pre-qualified candidate that already passed the modeled decision pipeline
+
+By the time an alert is emitted, the system has already done the following:
+
+- built the `15m` execution bar
+- joined `1h`, `6h`, and `12h` context
+- computed specialist model outputs
+- computed stack outputs
+- computed `hazard` and `quantile` outputs
+- checked gates, session policy, tiering, and cooling logic
+
+So the operator is not supposed to rebuild the thesis from zero every time. The operator is supposed to confirm that there is no obvious non-modeled reason to block or override what the system already approved.
+
+### Tier Thresholds To Remember
+
+These are the main execution thresholds from the current config:
+
+| Tier | Min Confluence | Min EVR | Max Hazard | Plain-English Meaning |
+|---|---|---|---|---|
+| `A+` | `0.75` | `1.50` | `0.35` | strongest process trade |
+| `A` | `0.60` | `1.20` | `0.45` | normal good trade |
+| `B` | `0.45` | `0.80` | `0.60` | weaker / more conditional trade |
+
+Also remember the `1h` flow gate baseline:
+
+- `flow_1h` below about `0.55` is usually a warning that the higher-timeframe push is stale or not convincing enough
+
+### Ten-Point Alert Checklist
+
+When an alert triggers, read it in this order:
+
+1. Assume the alert is already pre-qualified.
+   Do not restart the analysis from scratch unless you have an external reason the system does not know about.
+
+2. Confirm the basic identity of the setup.
+   Check asset, side, session, and regime. Make sure this is actually a trade you are willing to carry in the current market environment.
+
+3. Read the tier first.
+   `A+` means strongest process candidate, `A` means acceptable quality, `B` means conditional and easier to pass on or reduce.
+
+4. Check `confluence`.
+   This is setup coherence, not guaranteed win probability. Compare it to the tier floor.
+
+5. Check `EVR`.
+   This tells you whether the setup is worth taking economically, not just whether it looks clean.
+
+6. Check `hazard`.
+   Low hazard means room to breathe. High hazard means the market is already fragile even if the setup looks attractive.
+
+7. Check `flow_1h`.
+   If higher-timeframe flow is stale, the setup may still look pretty on `15m` while lacking real directional fuel.
+
+8. Check the specialist story.
+   For longs, you generally want strong `liq_flow`, `bos_cont`, `flow_1h`, `momo`, `eop`, and relatively lower `edp`. The point is coherence, not perfection.
+
+9. Check payoff shape if it is shown.
+   `medianR`, `quantiles`, and `CVaR` tell you whether the expected distribution is attractive enough to justify the risk.
+
+10. Make one of three decisions only.
+   `green light`, `caution`, or `pass`. Do not create ten discretionary shades of maybe.
+
+### Green Light, Caution, Pass
+
+Use this compact interpretation:
+
+#### 🟢 Green Light
+
+- `A+` or `A`
+- `confluence` above tier floor
+- `EVR` above tier floor
+- `hazard` below tier ceiling
+- `flow_1h` healthy
+- no external issue such as exchange instability, stale data, or major event risk outside model scope
+
+Read:
+
+- the system already approved this trade
+- there is no strong operator reason to fight it
+- in full-auto mode, this should usually execute automatically
+- in manual mode, the default should be confirm, not debate
+
+#### 🟠 Caution
+
+- `B` tier, or
+- near-threshold `confluence` / `EVR`, or
+- hazard is elevated but not disqualifying
+
+Read:
+
+- the trade is still valid inside the system
+- but it is not the kind of alert you should romanticize
+- smaller size, tighter supervision, or simple pass is reasonable
+
+#### 🔴 Pass
+
+- the setup is below process standards, or
+- a non-modeled external problem exists
+
+Examples of legitimate external pass reasons:
+
+- stale or broken market data
+- exchange/API instability
+- unusual macro headline risk not represented in the feature state
+- borrow, leverage, or execution constraints not reflected in the signal
+
+This is the correct use of human override. The wrong use is manually vetoing clean alerts because the operator suddenly “does not like the chart.”
+
+### The Correct Mental Picture
+
+The operator should not think:
+
+- “The model said buy, should I now invent my own theory?”
+
+The operator should think:
+
+- “The system reconstructed market state, scored setup quality, scored payoff, scored danger, checked policy constraints, and emitted a qualified candidate. Do I see any valid reason outside model scope to block it?”
+
+That is the right relationship between systematic logic and human supervision.
+
+### Manual Mode vs Full Auto
+
+If `execution.manual_alert_only: true`, the system still computes the full decision stack and emits the alert without opening the trade. In that mode:
+
+- the alert is the machine saying “this passed”
+- the human should mainly confirm or veto for exceptional reasons
+
+If you trust the system enough after backtest and forward validation, the natural progression is:
+
+- move from manual confirmation
+- to semi-auto confirmation
+- to full automated execution
+
+That is the entire point of building a system with confluence, EVR, hazard, sizing, and cooling in the first place.
+
+### Final Summary
+
+When an alert appears, the question is not:
+
+- “Should I do fresh discretionary analysis?”
+
+The question is:
+
+- “Did the system qualify this trade cleanly, and do I have any valid external reason to reject it?”
+
+If the answer is no, the alert is your green light.
+
+## 10C. Post-Backtest Trade-Policy Overlay
 
 Once a backtest has been run, the repo can now build a second-stage dataset from `ledger.csv` and optional `reasoning.json` and train a trade-policy overlay on those executed-trade rows. This is not a replacement for the primary model stack. It is a post-backtest layer intended to answer:
 
