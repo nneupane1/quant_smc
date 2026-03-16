@@ -570,6 +570,48 @@ class ModelTrainer:
             return arr[:, classes.index(1)]
         return arr[:, min(1, arr.shape[1] - 1)]
 
+    def _load_saved_specialist_bundle(
+        self,
+        *,
+        asset: str,
+        key: str,
+        df: pd.DataFrame,
+    ) -> Optional[Dict[str, Any]]:
+        last_exc: Optional[Exception] = None
+        for candidate in (f"{asset}_{key}", key):
+            try:
+                version, best_meta = self.registry.best_version(candidate)
+                clf, cal, cfg = self.registry.load_bundle(candidate, version)
+                feature_cols = (
+                    cfg.get("features")
+                    or cfg.get("feature_cols")
+                    or cfg.get("selected_feature_cols")
+                    or ((best_meta.get("metrics") or {}).get("selected_feature_cols"))
+                    or []
+                )
+                feature_cols = [str(col) for col in feature_cols if str(col)]
+                if not feature_cols:
+                    raise ValueError(f"No persisted feature contract found for {candidate} version={version}")
+                missing = [col for col in feature_cols if col not in df.columns]
+                if missing:
+                    raise KeyError(
+                        f"Persisted feature contract for {candidate} version={version} is not compatible; "
+                        f"missing {len(missing)} columns"
+                    )
+                model = clf if cal is None else CalibratedProbabilityModel(clf, cal)
+                return {
+                    "model": model,
+                    "feature_cols": feature_cols,
+                    "metrics": deepcopy((best_meta.get("metrics") or {})),
+                    "resolved_model_name": candidate,
+                    "resolved_version": version,
+                }
+            except Exception as exc:
+                last_exc = exc
+        if last_exc is not None:
+            LOG.info("[ModelTrainer] No saved specialist cache usable for %s: %s", key, last_exc)
+        return None
+
     def _threshold_tuning_cfg(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
         global_cfg = deepcopy((self.preproc_cfg or {}).get("threshold_tuning", {}))
         local_cfg = deepcopy(cfg.get("threshold_tuning", {}))
@@ -1082,6 +1124,9 @@ class ModelTrainer:
         if "confluence_model" in requested_models:
             required_specialists.extend(conf_cfg.get("specialist_inputs", self.SPECIALIST_MODELS))
         required_specialists = list(dict.fromkeys(required_specialists))
+        explicitly_requested_specialists = {
+            name for name in requested_models if name in self.SPECIALIST_MODELS
+        }
 
         planned_steps = list(required_specialists)
         if "meta_model" in requested_models:
@@ -1110,6 +1155,32 @@ class ModelTrainer:
         specialists = {}
         specialist_metrics = {}
         for key in required_specialists:
+            if key not in explicitly_requested_specialists:
+                cached = self._load_saved_specialist_bundle(asset=asset, key=key, df=df)
+                if cached is not None:
+                    specialists[key] = {
+                        "model": cached["model"],
+                        "feature_cols": cached["feature_cols"],
+                    }
+                    specialist_metrics[key] = deepcopy(cached.get("metrics") or {})
+                    console_stage(
+                        "Specialist cache hit",
+                        (
+                            f"{asset}_{key} source={cached['resolved_model_name']} "
+                            f"version={cached['resolved_version']} "
+                            f"features={len(cached['feature_cols'])}"
+                        ),
+                        status="ok",
+                    )
+                    completed_steps += 1
+                    self._log_bundle_progress(
+                        asset=asset,
+                        completed=completed_steps,
+                        total=total_steps,
+                        phase=f"specialist:{key}:cached",
+                        started_at=t0,
+                    )
+                    continue
             cfg = self.model_cfg[key]
             X_sel, cols_sel, num_cols, cat_cols = self._prepare_features(
                 df,

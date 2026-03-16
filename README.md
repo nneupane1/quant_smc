@@ -2552,6 +2552,8 @@ If a later stage fails, the right response is usually to inspect the expected ou
 | `train_BTCUSD_hazard_model.py` | fetch + features + labels must be finished | hazard is a risk/exit layer, not a substitute for specialists |
 | `train_BTCUSD_quantile_model.py` | fetch + features + labels must be finished | quantile is a distribution layer, not the main execution model |
 
+`train_BTCUSD_meta_model.py` and `train_BTCUSD_confluence_model.py` now reuse saved specialist registry artifacts when they already exist. They only fall back to specialist retraining if a required dependency is missing or incompatible with the current training frame.
+
 ### Minimum Safe Sequence
 
 1. `python fetch_BTCUSD_resample.py`
