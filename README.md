@@ -51,8 +51,10 @@ The central design promise of the project is research-to-execution parity. The s
 - [13. Installation](#13-installation)
 - [14. Environment And Secrets](#14-environment-and-secrets)
 - [15. Main Entry Points](#15-main-entry-points)
+- [15A. BTCUSD Backtest Live Room](#15a-btcusd-backtest-live-room)
 - [16. BTCUSD Sequential Runbook](#16-btcusd-sequential-runbook)
 - [16A. BTCUSD Temporal Convolutional Network (TCN)-Only Sequential Runbook](#16a-btcusd-temporal-convolutional-network-tcn-only-sequential-runbook)
+- [16AA. BTCUSD PatchTST-Only Sequential Runbook](#16aa-btcusd-patchtst-only-sequential-runbook)
 - [17. Label Horizon Governance](#17-label-horizon-governance)
 - [18. Expected Artifacts By Stage](#18-expected-artifacts-by-stage)
 - [19. Project Layout](#19-project-layout)
@@ -2051,6 +2053,8 @@ These are the human-friendly top-level scripts that make the pipeline explicit:
 - `train_BTCUSD_quantile_model.py`
 - `train_BTCUSD_tcn_model.py` (Temporal Convolutional Network benchmark runner)
 - `train_BTCUSD_all_tcn_models.py` (sequential Temporal Convolutional Network specialist batch runner)
+- `train_BTCUSD_patchtst_model.py` (PatchTST long-range benchmark runner)
+- `train_BTCUSD_all_patchtst_models.py` (sequential PatchTST specialist batch runner)
 - `train_BTCUSD_all_tree_models.py` (sequential tree-based specialist batch runner)
 - `train_BTCUSD_liq_flow_tcn_model.py`
 - `train_BTCUSD_bos_cont_tcn_model.py`
@@ -2058,6 +2062,12 @@ These are the human-friendly top-level scripts that make the pipeline explicit:
 - `train_BTCUSD_momo_tcn_model.py`
 - `train_BTCUSD_eop_tcn_model.py`
 - `train_BTCUSD_edp_tcn_model.py`
+- `train_BTCUSD_liq_flow_patchtst_model.py`
+- `train_BTCUSD_bos_cont_patchtst_model.py`
+- `train_BTCUSD_flow_1h_patchtst_model.py`
+- `train_BTCUSD_momo_patchtst_model.py`
+- `train_BTCUSD_eop_patchtst_model.py`
+- `train_BTCUSD_edp_patchtst_model.py`
 - `train_BTCUSD_tcn_stack_model.py`
 - `train_BTCUSD_meta_tcn_model.py`
 - `train_BTCUSD_confluence_tcn_model.py`
@@ -2083,6 +2093,18 @@ Single-target Temporal Convolutional Network (TCN) default run (now defaults to 
 
 ```bash
 python train_BTCUSD_tcn_model.py
+```
+
+Batch PatchTST run across all specialist targets:
+
+```bash
+python train_BTCUSD_all_patchtst_models.py
+```
+
+Single-target PatchTST default run (defaults to `flow_1h`):
+
+```bash
+python train_BTCUSD_patchtst_model.py
 ```
 
 Batch tree-model run across core specialists:
@@ -2117,6 +2139,23 @@ This applies to all specialist TCN entrypoints because they share the same gener
 - `train_BTCUSD_eop_tcn_model.py`
 - `train_BTCUSD_edp_tcn_model.py`
 - `train_BTCUSD_all_tcn_models.py`
+
+PatchTST specialist launchers have the same interrupt-checkpoint contract:
+
+- `train_BTCUSD_liq_flow_patchtst_model.py`
+- `train_BTCUSD_bos_cont_patchtst_model.py`
+- `train_BTCUSD_flow_1h_patchtst_model.py`
+- `train_BTCUSD_momo_patchtst_model.py`
+- `train_BTCUSD_eop_patchtst_model.py`
+- `train_BTCUSD_edp_patchtst_model.py`
+- `train_BTCUSD_all_patchtst_models.py`
+
+During long PatchTST runs, progress is persisted to:
+
+- `artifacts/train/BTCUSD/<target>_patchtst/hpo_progress.json`
+- `artifacts/train/BTCUSD/<target>_patchtst/hpo_progress.ndjson`
+
+PatchTST is currently a training benchmark family only. It saves versioned registry artifacts as `<target>_patchtst` and `BTCUSD_<target>_patchtst`, but it is not yet wired as an active runtime routing family like `tree`, `tcn`, or `hybrid_explicit`.
 
 The same interrupt-checkpoint behavior now also applies to the newer stack entrypoints:
 
@@ -2160,6 +2199,130 @@ UI selection can be controlled with:
 - `QUANT_UI_SURFACE=next` (default): React terminal, Streamlit fallback
 - `QUANT_UI_SURFACE=streamlit`: Streamlit only
 - `QUANT_UI_SURFACE=both`: React + Streamlit together
+
+## 15A. BTCUSD Backtest Live Room
+
+Preferred operator command:
+
+```bash
+python run_BTCUSD_backtest_live_room.py
+```
+
+### Runtime Expectation
+
+Backtest runtime is normally much cheaper than model training. It replays the already-built BTCUSD feature frame row by row; it does not run HPO, CV, or model fitting. On the current BTCUSD feature artifact (`artifacts/features/BTCUSD/BTCUSD_features.csv`), the system is working through roughly `321,599` historical `15m` decision rows. In practice, expect minutes to low tens of minutes on a normal CPU workstation, not multi-hour or multi-day training-class runtime.
+
+### What Data The Backtest Uses
+
+The one-command BTCUSD backtest room uses:
+
+- `artifacts/features/BTCUSD/BTCUSD_features.csv`
+
+That file is the engineered `15m` decision spine with joined `1h`, `6h`, and `12h` context already embedded. It is not using labels during execution. Labels are only for training. The backtest replays the historical feature rows as if each completed `15m` bar were arriving in sequence.
+
+If the feature CSV is missing, build it first:
+
+```bash
+python build_BTCUSD_features.py
+```
+
+### Which Models The Default Backtest Uses
+
+The current default runtime route is `tree`, so the backtest uses the tree family unless you deliberately change routing in `quant_system/config/models/models.yaml`.
+
+Default active model family:
+
+- `liq_flow`
+- `bos_cont`
+- `flow_1h`
+- `momo`
+- `eop`
+- `edp`
+- `meta_model`
+- `confluence_model`
+- `hazard`
+- `quantile`
+
+That means:
+
+- specialist models score the setup state
+- `meta_model` and `confluence_model` fuse specialist evidence
+- `hazard` controls danger/tightening/exit logic
+- `quantile` informs payoff-shape and EV-style reasoning
+
+TCN and hybrid families are not used by default in backtest unless routing is explicitly changed and the required stack artifacts exist.
+
+### How The Backtest Actually Works
+
+At a high level, the backtester does this for each historical `15m` row:
+
+1. load the current feature row for BTCUSD
+2. run model inference through the active route
+3. compute confluence, EVR, median-R, tier, and gate checks
+4. apply sizing, capital allocation, and cooling logic
+5. simulate entry, trailing, partials, and exits
+6. update telemetry state, event stream, and equity history
+7. write final artifacts after the replay completes
+
+This is why backtest is a true execution replay, not just a static score report.
+
+### What You Can Watch While It Runs
+
+`run_BTCUSD_backtest_live_room.py` starts:
+
+- terminal API: `http://127.0.0.1:8100`
+- terminal WebSocket: `ws://127.0.0.1:8100/ws/terminal`
+- React operator UI: `http://127.0.0.1:3000`
+- Streamlit fallback: `http://localhost:8501` if React fails
+
+During the run, the UI is fed by live telemetry from the backtest adapter, so you can watch the replay in a live-style mode instead of waiting for the final artifact bundle.
+
+### Recommended Monitoring Steps
+
+1. Start the room:
+
+```bash
+python run_BTCUSD_backtest_live_room.py
+```
+
+2. Open the React operator UI:
+
+```text
+http://127.0.0.1:3000
+```
+
+3. Leave the view mode on `auto` while the run is active. This shows the telemetry-fed live replay state.
+
+4. Watch these panels during the run:
+
+- `Market`: candle progression and overlays
+- `Signals`: candidate setups, confluence, and alert decision state
+- `Risk`: hazard, guardrails, and exposure posture
+- `Audit`: event stream and trade lifecycle
+
+5. After the run completes, switch to explicit backtest artifact view:
+
+```text
+http://127.0.0.1:3000/?mode=backtest
+```
+
+That mode reads the saved artifact bundle rather than the transient telemetry stream.
+
+### Final Backtest Outputs
+
+After completion, the backtest writes the operator artifact bundle to `backtest_outputs/`, including:
+
+- `summary.json`
+- `ledger.csv`
+- `equity_curve.csv`
+- `execution_log.csv`
+- `daily_report.csv`
+- `monthly_report.csv`
+- `reasoning.json`
+- `trade_policy_dataset.csv`
+- `trade_policy_dataset_meta.json`
+
+The UI can then read those outputs directly for post-run review and verdicting.
 
 ### Deterministic Stress Matrix (No Monte Carlo)
 
@@ -2246,6 +2409,31 @@ and inspect latest compact snapshot:
 ```bash
 cat artifacts/train/BTCUSD/<target>_tcn/hpo_progress.json
 ```
+
+## 16AA. BTCUSD PatchTST-Only Sequential Runbook
+
+PatchTST is the first long-lookback benchmark family in this repo. It reuses the same tree-selected feature contracts as the specialist tree and TCN paths, but trains a patch-token transformer over longer sequence windows.
+
+| Step | Run | Output Folder |
+|---|---|---|
+| 1 | `python train_BTCUSD_patchtst_model.py` | `artifacts/train/BTCUSD/flow_1h_patchtst/` |
+| 2 | `python train_BTCUSD_liq_flow_patchtst_model.py` | `artifacts/train/BTCUSD/liq_flow_patchtst/` |
+| 3 | `python train_BTCUSD_bos_cont_patchtst_model.py` | `artifacts/train/BTCUSD/bos_cont_patchtst/` |
+| 4 | `python train_BTCUSD_momo_patchtst_model.py` | `artifacts/train/BTCUSD/momo_patchtst/` |
+| 5 | `python train_BTCUSD_eop_patchtst_model.py` | `artifacts/train/BTCUSD/eop_patchtst/` |
+| 6 | `python train_BTCUSD_edp_patchtst_model.py` | `artifacts/train/BTCUSD/edp_patchtst/` |
+
+Run all PatchTST specialists sequentially:
+
+```bash
+python train_BTCUSD_all_patchtst_models.py
+```
+
+Interrupt behavior matches TCN:
+
+- `Ctrl+C` saves the latest best completed HPO trial as a usable checkpoint artifact
+- the checkpoint includes registry model, `metrics.json`, `model_state.json`, and `train_manifest.json`
+- re-running the same target resumes remaining trials from the saved Optuna SQLite study
 
 ## 16B. BTCUSD Hybrid-Explicit Stack Runbook
 
