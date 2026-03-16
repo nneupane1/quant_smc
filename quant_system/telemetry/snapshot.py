@@ -122,10 +122,23 @@ def _extract_market_candles(raw_snapshot: Dict[str, Any], fallback_bundle: Dict[
     if not direct.empty:
         candidates.append(direct)
 
+    raw_backtest = raw_snapshot.get("backtest", {}) if isinstance(raw_snapshot.get("backtest"), dict) else {}
+    raw_backtest_candles = _to_frame(raw_backtest.get("candles"))
+    if not raw_backtest_candles.empty:
+        candidates.append(raw_backtest_candles)
+
     for key in ("forward", "live", "backtest"):
         frame = _to_frame(fallback_bundle.get(key, {}).get("candles"))
         if not frame.empty:
             candidates.append(frame)
+
+    raw_tf_bars = raw_snapshot.get("tf_bars", {}) if isinstance(raw_snapshot.get("tf_bars"), dict) else {}
+    if isinstance(raw_tf_bars, dict):
+        for tf_key in ("15m", "15min", "M15"):
+            frame = _to_frame(raw_tf_bars.get(tf_key))
+            if not frame.empty:
+                candidates.append(frame)
+                break
 
     tf_bars = fallback_bundle.get("forward", {}).get("tf_bars", {}) or {}
     if isinstance(tf_bars, dict):
@@ -292,6 +305,9 @@ def _guardrails(state: Dict[str, Any]) -> list[Dict[str, Any]]:
 def _trade_rows(raw_snapshot: Dict[str, Any], fallback_bundle: Dict[str, Any]) -> list[Dict[str, Any]]:
     closed = _to_frame(raw_snapshot.get("state", {}).get("closed_trades"))
     if closed.empty:
+        raw_backtest = raw_snapshot.get("backtest", {}) if isinstance(raw_snapshot.get("backtest"), dict) else {}
+        closed = _to_frame(raw_backtest.get("trades"))
+    if closed.empty:
         closed = fallback_bundle.get("backtest", {}).get("trades", pd.DataFrame())
     if closed.empty:
         return []
@@ -338,7 +354,7 @@ def _trade_rows(raw_snapshot: Dict[str, Any], fallback_bundle: Dict[str, Any]) -
     return out
 
 
-def _build_performance(trades: list[Dict[str, Any]]) -> Dict[str, Any]:
+def _build_performance(trades: list[Dict[str, Any]], *, reference_ts: Any = None) -> Dict[str, Any]:
     closed = [t for t in trades if str(t.get("status", "closed")) != "open"]
     scope = closed if closed else trades
 
@@ -415,7 +431,11 @@ def _build_performance(trades: list[Dict[str, Any]]) -> Dict[str, Any]:
         )
     max_drawdown = abs(min((float(row.get("drawdown", 0.0)) for row in equity_curve), default=0.0))
 
-    now = pd.Timestamp.utcnow()
+    now = pd.to_datetime(reference_ts, utc=True, errors="coerce")
+    if pd.isna(now):
+        trade_ts = [_trade_ts(trade) for trade in ordered]
+        trade_ts = [ts for ts in trade_ts if pd.notna(ts)]
+        now = max(trade_ts) if trade_ts else pd.Timestamp.utcnow()
     period_defs = [
         ("Daily", pd.Timedelta(days=1)),
         ("Weekly", pd.Timedelta(days=7)),
@@ -1018,6 +1038,14 @@ def build_terminal_snapshot(
     raw_snapshot = dict(raw_snapshot or {})
     fallback = _load_fallback_bundle(repo_root_path)
     state = dict(raw_snapshot.get("state", {}) or fallback["forward"].get("state", {}) or fallback["live"].get("state", {}) or {})
+    replay_ts = pd.to_datetime(
+        state.get("current_dt") or state.get("timestamp"),
+        utc=True,
+        errors="coerce",
+    )
+    replay_progress = _num(state.get("progress"), 0.0)
+    replay_bar_index = int(_num(state.get("bar_index"), 0.0))
+    replay_bars_total = int(_num(state.get("bars_total"), 0.0))
 
     equity = _num(state.get("equity"), 20_000.0)
     free_capital = _num(state.get("free_capital"), equity)
@@ -1057,7 +1085,7 @@ def build_terminal_snapshot(
     events = _recent_events(raw_snapshot, fallback)
     guardrails = _guardrails(state)
     trades = _trade_rows(raw_snapshot, fallback)
-    performance = _build_performance(trades)
+    performance = _build_performance(trades, reference_ts=replay_ts)
     market = _build_market(raw_snapshot, fallback, trades, signals)
     latest_reasoning = signals[0].get("reasoning", {}) if signals else _fallback_reasoning_tree(fallback)
     backtest_summary = fallback["backtest"].get("summary", {})
@@ -1073,6 +1101,31 @@ def build_terminal_snapshot(
         win_rate *= 100.0
 
     source = "telemetry" if raw_snapshot else "artifacts"
+    mission_metrics = [
+        {"label": "Equity", "value": _fmt_money(equity), "tone": "cyan", "delta": str(model_version)},
+        {"label": "Free Capital", "value": _fmt_money(free_capital), "tone": "teal", "delta": "deployable"},
+        {"label": "Locked Profit", "value": _fmt_money(locked_profit), "tone": "amber", "delta": "vaulted"},
+        {"label": "Open Positions", "value": str(open_positions), "tone": "slate" if open_positions == 0 else "amber", "delta": "live state"},
+        {"label": "Win Rate", "value": _fmt_pct(win_rate), "tone": "teal" if win_rate >= 55 else "rose", "delta": "backtest summary"},
+    ]
+    if pd.notna(replay_ts):
+        mission_metrics.append(
+            {
+                "label": "Replay Date",
+                "value": replay_ts.strftime("%Y-%m-%d"),
+                "tone": "slate",
+                "delta": replay_ts.strftime("%H:%M UTC"),
+            }
+        )
+    if replay_bars_total > 0:
+        mission_metrics.append(
+            {
+                "label": "Replay Progress",
+                "value": f"{replay_progress * 100.0:.1f}%",
+                "tone": "teal" if replay_progress >= 1.0 else "cyan",
+                "delta": f"{replay_bar_index:,}/{replay_bars_total:,} bars",
+            }
+        )
     return {
         "meta": {
             "source": source,
@@ -1090,13 +1143,7 @@ def build_terminal_snapshot(
             "headline": "Live terminal wired to the shared telemetry plane",
             "status": "Cooling" if state.get("cooling_to") else ("Active" if open_positions else "Monitoring"),
             "substatus": "Console and UI can now subscribe to the same backend state stream when run through the shared adapter.",
-            "metrics": [
-                {"label": "Equity", "value": _fmt_money(equity), "tone": "cyan", "delta": str(model_version)},
-                {"label": "Free Capital", "value": _fmt_money(free_capital), "tone": "teal", "delta": "deployable"},
-                {"label": "Locked Profit", "value": _fmt_money(locked_profit), "tone": "amber", "delta": "vaulted"},
-                {"label": "Open Positions", "value": str(open_positions), "tone": "slate" if open_positions == 0 else "amber", "delta": "live state"},
-                {"label": "Win Rate", "value": _fmt_pct(win_rate), "tone": "teal" if win_rate >= 55 else "rose", "delta": "backtest summary"},
-            ],
+            "metrics": mission_metrics,
         },
         "insights": {
             "summary": "This snapshot is built from the same repaired adapter/event contracts used by the execution runtimes.",

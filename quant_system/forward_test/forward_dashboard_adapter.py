@@ -138,6 +138,10 @@ class ForwardDashboardAdapter:
                     row = dict(payload)
                     row.setdefault("asset", asset)
                     rows.append(row)
+                elif isinstance(payload, pd.Series):
+                    row = payload.to_dict()
+                    row.setdefault("asset", asset)
+                    rows.append(row)
                 elif isinstance(payload, list):
                     for item in payload:
                         row = dict(item)

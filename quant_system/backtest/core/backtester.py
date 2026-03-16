@@ -25,6 +25,7 @@ from quant_system.execution.gating.confluence import ConfluenceEngine
 from quant_system.execution.gating.gates import GateEvaluator
 from quant_system.execution.gating.profit_ladder import ProfitLadderManager
 
+from quant_system.forward_test.forward_reasoning_attach import ReasoningAttach
 from quant_system.ml.registry.model_registry import ModelRegistry
 from quant_system.ml.predict.model_predictor import ModelPredictor, resolve_inference_preference
 from quant_system.config.config_loader import ConfigLoader
@@ -71,6 +72,7 @@ class Backtester:
         self.routing_mode = str(pref["routing_mode"])
         self.challenger_mode = str(pref["challenger_mode"])
         self.allow_hybrid_explicit = bool(pref["allow_hybrid_explicit"])
+        self.active_slot = str(pref.get("active_slot", "production"))
 
         self.simulator = ExecutionSimulator(self.cfg)
         self.tiering = TieringEngine(self.cfg)
@@ -85,14 +87,17 @@ class Backtester:
             routing_mode=self.routing_mode,
             challenger_mode=self.challenger_mode,
             allow_hybrid_explicit=self.allow_hybrid_explicit,
+            active_slot=self.active_slot,
         )
         self.mpc = MPCRiskManager(self.cfg)
         self.capital = CapitalAllocator(self.cfg)
         self.compound_cooling = CompoundCoolingPolicy(self.cfg)
         self.position_sizer = PositionSizer(self.cfg)
         self.exposure = ExposureTracker(self.cfg)
+        self.reason = ReasoningAttach()
 
         self.trade_log = TradeLog()
+        self.entry_reason_by_trade: Dict[str, Dict[str, Any]] = {}
 
         route_status = self.predictor.routing_status()
         LOG.info(
@@ -126,6 +131,9 @@ class Backtester:
 
         # Combined chronological index across assets
         timeline = self._merge_timelines(asset_frames)
+        timeline_total = len(timeline)
+        timeline_start = pd.Timestamp(timeline[0]) if timeline else None
+        timeline_end = pd.Timestamp(timeline[-1]) if timeline else None
 
         equity = float(self.exec_cfg.get("starting_equity", 0))
         free_capital = equity
@@ -135,6 +143,8 @@ class Backtester:
         cooling_until: Optional[pd.Timestamp] = None
         open_positions: Dict[str, Position] = {}
         equity_history = []
+        closed_trade_count = 0
+        closed_trade_rows = pd.DataFrame()
 
         # Loop through unified timeline
         for bar_index, t in enumerate(timeline):
@@ -174,6 +184,20 @@ class Backtester:
                             reason=ladder["reason"],
                             regime=row_enriched.get("regime_state"),
                         )
+                        if self.dashboard:
+                            self.dashboard.log_event(
+                                "exit",
+                                pos.trade_id,
+                                {
+                                    "asset": asset,
+                                    "reason": ladder["reason"],
+                                    "side": pos.side,
+                                    "leg": pos.metadata.get("leg", "core"),
+                                    "pnl": exit_info["pnl"],
+                                    "entry_ts": pos.open_time,
+                                    "exit_ts": t,
+                                },
+                            )
                         to_close.append(tid)
                         continue
 
@@ -196,6 +220,20 @@ class Backtester:
                         exit_info = self.simulator.exit_position(pos, exit_price, reason="hazard_exit")
                         free_capital += pos.size_usd + exit_info["pnl"]
                         self.trade_log.append_close(pos, exit_info["pnl"], t, exit_price, reason="hazard_exit", regime=row_enriched.get("regime_state"))
+                        if self.dashboard:
+                            self.dashboard.log_event(
+                                "exit",
+                                pos.trade_id,
+                                {
+                                    "asset": asset,
+                                    "reason": "hazard_exit",
+                                    "side": pos.side,
+                                    "leg": pos.metadata.get("leg", "core"),
+                                    "pnl": exit_info["pnl"],
+                                    "entry_ts": pos.open_time,
+                                    "exit_ts": t,
+                                },
+                            )
                         to_close.append(tid)
                     elif trail["action"] in ("tighten", "partial"):
                         pos.stop_price = trail["new_stop"]
@@ -235,6 +273,15 @@ class Backtester:
                 side = row_enriched.get("side", "long")
                 gate = self.gates.evaluate(row_enriched, side)
                 if not gate["passed"]:
+                    self._maybe_emit_scanner_event(
+                        asset=asset,
+                        ts=t,
+                        row=row_enriched,
+                        conf_score=conf_score,
+                        gate=gate,
+                        danger=danger,
+                        tier_result={"tier": "skip", "execute": False, "reason": "gate_blocked"},
+                    )
                     continue
 
                 # EVR
@@ -265,9 +312,31 @@ class Backtester:
                     hazard=danger["metrics"]["hazard"],
                 )
                 if not cooling_gate["allow"]:
+                    self._maybe_emit_scanner_event(
+                        asset=asset,
+                        ts=t,
+                        row=row_enriched,
+                        conf_score=conf_score,
+                        gate=gate,
+                        evr_result={"evr": evr_val, "median_r": median_r},
+                        tier_result=tier_result,
+                        danger=danger,
+                        cooling_gate=cooling_gate,
+                    )
                     continue
 
                 if not tier_result["execute"]:
+                    self._maybe_emit_scanner_event(
+                        asset=asset,
+                        ts=t,
+                        row=row_enriched,
+                        conf_score=conf_score,
+                        gate=gate,
+                        evr_result={"evr": evr_val, "median_r": median_r},
+                        tier_result=tier_result,
+                        danger=danger,
+                        cooling_gate=cooling_gate,
+                    )
                     continue
 
                 capital_out = self.capital.allocate(
@@ -370,6 +439,39 @@ class Backtester:
                         gate_reasons=gate.get("reasons"),
                     )
 
+                reason = self.reason.build(
+                    asset,
+                    row_enriched.to_dict(),
+                    conf_score,
+                    evr_result,
+                    tier_result["tier"],
+                    risk_perc,
+                    float(capital_out.get("hedge_ratio", 0.0) or 0.0),
+                )
+                reason["decision_path"] = {
+                    "gates": gate,
+                    "danger": danger,
+                    "cooling_gate": cooling_gate,
+                    "tiering": tier_result,
+                    "capital": {
+                        "ticket_usd": float(capital_out.get("ticket_usd", 0.0) or 0.0),
+                        "risk_mode": float(risk_perc),
+                        "hedge_ratio": float(capital_out.get("hedge_ratio", 0.0) or 0.0),
+                        "lock_fraction": float(capital_out.get("lock_fraction", 0.0) or 0.0),
+                        "session_ticket_multiplier": float(capital_out.get("session_ticket_multiplier", 1.0) or 1.0),
+                    },
+                    "position_sizer": {
+                        "value_usd": float(sizing.get("value", 0.0) or 0.0),
+                        "qty": float(sizing.get("qty", 0.0) or 0.0),
+                        "risk_dollars": float(sizing.get("risk_dollars", 0.0) or 0.0),
+                        "final_notional_usd": float(pos_size_usd),
+                    },
+                }
+                reason["timestamp"] = pd.Timestamp(t)
+                self.entry_reason_by_trade[pos_core.trade_id] = dict(reason)
+                if runner_frac > 0:
+                    self.entry_reason_by_trade[pos_runner.trade_id] = {**reason, "leg": "runner"}
+
                 free_capital -= pos_size_usd
 
                 if self.dashboard:
@@ -404,15 +506,31 @@ class Backtester:
 
             # Dashboard equity update
             if self.dashboard:
+                live_trades = self.trade_log.to_dataframe()
+                next_closed_count = int(live_trades["exit_ts"].notna().sum()) if not live_trades.empty and "exit_ts" in live_trades.columns else 0
+                if next_closed_count != closed_trade_count:
+                    closed_trade_count = next_closed_count
+                    closed_trade_rows = (
+                        live_trades.loc[live_trades["exit_ts"].notna()].copy()
+                        if not live_trades.empty and "exit_ts" in live_trades.columns
+                        else pd.DataFrame()
+                    )
                 self.dashboard.update_state({
                     "timestamp": t,
+                    "current_dt": pd.Timestamp(t),
                     "equity": equity,
                     "free_capital": free_capital,
                     "locked_profit": locked_profit,
                     "max_drawdown": dd,
                     "open_positions": len(open_positions),
                     "open_trades": open_positions,
+                    "closed_trades": closed_trade_rows,
                     "cooling_to": cooling_until.isoformat() if cooling_until is not None else None,
+                    "bar_index": bar_index + 1,
+                    "bars_total": timeline_total,
+                    "progress": ((bar_index + 1) / timeline_total) if timeline_total else 0.0,
+                    "window_start": timeline_start,
+                    "window_end": timeline_end,
                 })
             equity_history.append({
                 "timestamp": pd.Timestamp(t),
@@ -436,6 +554,7 @@ class Backtester:
             "metrics": metrics,
             "equity_curve": equity_curve_df,
             "execution_log": execution_log_df,
+            "reasoning": dict(self.entry_reason_by_trade),
             "candles": primary_frame[["timestamp", "dt", "open", "high", "low", "close", "volume"]].copy()
             if not primary_frame.empty and {"open", "high", "low", "close", "volume"}.issubset(primary_frame.columns)
             else primary_frame.copy(),
@@ -514,6 +633,83 @@ class Backtester:
         except Exception:
             pass
         return enriched
+
+    def _maybe_emit_scanner_event(
+        self,
+        *,
+        asset: str,
+        ts,
+        row: pd.Series,
+        conf_score: float,
+        gate: Dict[str, Any],
+        evr_result: Optional[Dict[str, Any]] = None,
+        tier_result: Optional[Dict[str, Any]] = None,
+        danger: Optional[Dict[str, Any]] = None,
+        cooling_gate: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not self.dashboard:
+            return
+
+        evr_pack = dict(evr_result or {})
+        tier_pack = dict(tier_result or {})
+        gate_passed = bool(gate.get("passed", False))
+        execute = bool(tier_pack.get("execute", False))
+        tier_name = str(tier_pack.get("tier") or "")
+        evr_val = float(evr_pack.get("evr", 0.0) or 0.0)
+        median_r = float(evr_pack.get("median_r", 0.0) or 0.0)
+        hazard = float(row.get("hazard", row.get("hazard_score", 0.0)) or 0.0)
+        flow_1h = float(row.get("p_flow_1h", row.get("prob_flow_1h", 0.0)) or 0.0)
+        cooling_allowed = True if cooling_gate is None else bool(cooling_gate.get("allow", False))
+
+        noteworthy = (
+            gate_passed
+            or conf_score >= 0.45
+            or evr_val >= 0.80
+            or tier_name in {"A+", "A", "B"}
+            or flow_1h >= 0.60
+        )
+        if not noteworthy or execute:
+            return
+
+        if not gate_passed:
+            reason_text = "gate_blocked"
+        elif not cooling_allowed:
+            reason_text = "cooling_blocked"
+        else:
+            reason_text = str(tier_pack.get("reason") or f"tier_{tier_name or 'skip'}").strip()
+
+        scanner_id = f"{asset}-{pd.Timestamp(ts).strftime('%Y%m%d%H%M')}-scanner"
+        reason = self.reason.build(
+            asset,
+            row.to_dict(),
+            conf_score,
+            {
+                "evr": evr_val,
+                "median_r": median_r,
+                **evr_pack,
+            },
+            tier_name or "skip",
+            None,
+            0.0,
+        )
+        reason.update(
+            {
+                "timestamp": pd.Timestamp(ts),
+                "side": row.get("side", "long"),
+                "flow_1h": flow_1h,
+                "hazard": hazard,
+                "reason": reason_text,
+                "scanner": True,
+                "candidate_rejected": True,
+            }
+        )
+        reason["decision_path"] = {
+            "gates": gate,
+            "danger": danger or {},
+            "cooling_gate": cooling_gate or {"allow": True},
+            "tiering": tier_pack or {"tier": "skip", "execute": False},
+        }
+        self.dashboard.log_event("scanner", scanner_id, reason)
 
     # ----------------------------------------------------------------------
     def _compute_confluence(self, row: pd.Series) -> Dict[str, Any]:
