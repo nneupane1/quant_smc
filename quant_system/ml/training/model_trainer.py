@@ -336,7 +336,15 @@ class ModelTrainer:
             return params
         return {"C": ModelTrainer._midpoint(hpo_space.get("C", [0.01, 10.0]), float)}
 
-    def _make_study(self, direction: str, cfg: Dict[str, Any]):
+    def _make_study(
+        self,
+        direction: str,
+        cfg: Dict[str, Any],
+        *,
+        study_name: Optional[str] = None,
+        storage_uri: Optional[str] = None,
+        load_if_exists: bool = True,
+    ):
         if optuna is None:
             return None
         sampler_name = str(
@@ -358,9 +366,46 @@ class ModelTrainer:
                 n_startup_trials=int(bayes_cfg.get("pruner_startup_trials", 5)),
                 n_warmup_steps=int(bayes_cfg.get("pruner_warmup_steps", 0)),
             )
+            if storage_uri:
+                return optuna.create_study(
+                    direction=direction,
+                    sampler=sampler,
+                    pruner=pruner,
+                    study_name=study_name,
+                    storage=storage_uri,
+                    load_if_exists=bool(load_if_exists),
+                )
             return optuna.create_study(direction=direction, sampler=sampler, pruner=pruner)
         except Exception:
+            if storage_uri:
+                return optuna.create_study(
+                    direction=direction,
+                    study_name=study_name,
+                    storage=storage_uri,
+                    load_if_exists=bool(load_if_exists),
+                )
             return optuna.create_study(direction=direction)
+
+    @staticmethod
+    def _completed_trial_count(study: Any) -> int:
+        if optuna is None or study is None:
+            return 0
+        done_states = {optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED, optuna.trial.TrialState.FAIL}
+        return int(sum(1 for tr in study.trials if tr.state in done_states))
+
+    @staticmethod
+    def _safe_best_study_params(study: Any) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
+        if study is None:
+            return None, None
+        try:
+            params = dict(study.best_params)
+        except Exception:
+            params = None
+        try:
+            value = float(study.best_value)
+        except Exception:
+            value = None
+        return params, value
 
     @staticmethod
     def _is_int_param(value: Any, bounds: Any) -> bool:
@@ -956,6 +1001,15 @@ class ModelTrainer:
                 best_algo = algo
                 best_model = model
                 best_metrics = metrics
+            if bool((metrics or {}).get("checkpoint_interrupted")):
+                best_metrics = best_metrics or {}
+                best_metrics["selected_algorithm"] = best_algo
+                best_metrics["challenger_scores"] = leaderboard
+                best_metrics["checkpoint_interrupted"] = True
+                best_metrics.setdefault("checkpoint_reason", "keyboard_interrupt")
+                best_metrics["challenger_interrupted"] = True
+                best_metrics["completed_challengers"] = len(leaderboard)
+                return best_model, best_metrics
 
         console_stage(
             f"{self._display_name(name)} champion selected",
@@ -1080,10 +1134,20 @@ class ModelTrainer:
                 started_at=t0,
             )
 
-        meta_model = meta_meta = None
+        meta_model = meta_meta = meta_metrics = None
         if "meta_model" in requested_models:
             LOG.info("[ModelTrainer] Training meta model (stacking)")
             meta_model, meta_meta = self._train_stack(df, specialists, meta_cfg, target_key="label_liq_flow")
+            meta_metrics = {
+                "selected_algorithm": meta_meta.get("selected_algorithm"),
+                "stack_inputs": meta_meta.get("stack_inputs", []),
+                "meta_feature_cols": meta_meta.get("meta_feature_cols", []),
+                "decision_threshold": meta_meta.get("decision_threshold"),
+                "calibration": meta_meta.get("calibration"),
+                "threshold_tuning": meta_meta.get("threshold_tuning"),
+                "challenger_scores": meta_meta.get("challenger_scores", {}),
+                **dict(meta_meta.get("training_metrics", {}) or {}),
+            }
             LOG.info("[ModelTrainer] Meta model done")
             completed_steps += 1
             self._log_bundle_progress(
@@ -1094,10 +1158,20 @@ class ModelTrainer:
                 started_at=t0,
             )
 
-        conf_model = conf_meta = None
+        conf_model = conf_meta = conf_metrics = None
         if "confluence_model" in requested_models:
             LOG.info("[ModelTrainer] Training confluence model")
             conf_model, conf_meta = self._train_stack(df, specialists, conf_cfg, target_key="label_liq_flow")
+            conf_metrics = {
+                "selected_algorithm": conf_meta.get("selected_algorithm"),
+                "stack_inputs": conf_meta.get("stack_inputs", []),
+                "meta_feature_cols": conf_meta.get("meta_feature_cols", []),
+                "decision_threshold": conf_meta.get("decision_threshold"),
+                "calibration": conf_meta.get("calibration"),
+                "threshold_tuning": conf_meta.get("threshold_tuning"),
+                "challenger_scores": conf_meta.get("challenger_scores", {}),
+                **dict(conf_meta.get("training_metrics", {}) or {}),
+            }
             LOG.info("[ModelTrainer] Confluence model done")
             completed_steps += 1
             self._log_bundle_progress(
@@ -1108,11 +1182,11 @@ class ModelTrainer:
                 started_at=t0,
             )
 
-        hazard_models = haz_conf = None
+        hazard_models = haz_conf = haz_metrics = None
         if "hazard" in requested_models:
             haz_cfg = self.model_cfg.get("hazard", {})
             LOG.info("[ModelTrainer] Training hazard models")
-            hazard_models, haz_conf = self._train_hazard(df, haz_cfg, haz_event, haz_time)
+            hazard_models, haz_conf, haz_metrics = self._train_hazard(df, haz_cfg, haz_event, haz_time)
             LOG.info(f"[ModelTrainer] Hazard models done ({len(hazard_models)} bins)")
             completed_steps += 1
             self._log_bundle_progress(
@@ -1123,11 +1197,11 @@ class ModelTrainer:
                 started_at=t0,
             )
 
-        quant_models = quant_conf = None
+        quant_models = quant_conf = quant_metrics = None
         if "quantile" in requested_models:
             q_cfg = self.model_cfg.get("quantile_forecaster", {})
             LOG.info("[ModelTrainer] Training quantile forecaster")
-            quant_models, quant_conf = self._train_quantile(df, q_cfg, prices)
+            quant_models, quant_conf, quant_metrics = self._train_quantile(df, q_cfg, prices)
             LOG.info("[ModelTrainer] Quantile forecaster done")
             completed_steps += 1
             self._log_bundle_progress(
@@ -1185,6 +1259,9 @@ class ModelTrainer:
                 cal=None,
                 config=meta_meta,
             )
+            if meta_metrics:
+                self.registry.save_metrics(f"{asset}_meta", version, meta_metrics)
+                self.registry.save_metrics("meta_model", version, meta_metrics)
         if conf_model is not None and conf_meta is not None:
             self.registry.save_model(
                 model_name=f"{asset}_confluence",
@@ -1200,6 +1277,9 @@ class ModelTrainer:
                 cal=None,
                 config=conf_meta,
             )
+            if conf_metrics:
+                self.registry.save_metrics(f"{asset}_confluence", version, conf_metrics)
+                self.registry.save_metrics("confluence_model", version, conf_metrics)
 
         if hazard_models is not None and haz_conf is not None:
             self.registry.save_hazard_model(
@@ -1214,6 +1294,9 @@ class ModelTrainer:
                 models=hazard_models,
                 config=haz_conf,
             )
+            if haz_metrics:
+                self.registry.save_metrics(f"{asset}_hazard", version, haz_metrics)
+                self.registry.save_metrics("hazard", version, haz_metrics)
 
         if quant_models is not None and quant_conf is not None:
             self.registry.save_model(
@@ -1223,6 +1306,9 @@ class ModelTrainer:
                 cal=None,
                 config=quant_conf,
             )
+            if quant_metrics:
+                self.registry.save_metrics(f"{asset}_quantile", version, quant_metrics)
+                self.registry.save_metrics("quantile", version, quant_metrics)
             self.registry.save_model(
                 model_name="quantile",
                 version=version,
@@ -1253,6 +1339,13 @@ class ModelTrainer:
             "dependency_models": dependency_models,
             "trained_models": persisted,
             "specialist_metrics": specialist_metrics,
+            "model_metrics": {
+                **specialist_metrics,
+                **({"meta_model": meta_metrics} if meta_metrics else {}),
+                **({"confluence_model": conf_metrics} if conf_metrics else {}),
+                **({"hazard": haz_metrics} if haz_metrics else {}),
+                **({"quantile": quant_metrics} if quant_metrics else {}),
+            },
         }
 
     @classmethod
@@ -1971,6 +2064,22 @@ class ModelTrainer:
             )
 
         default_params = self._default_params_for_algo(algo, hpo_space)
+        name_slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name)).strip("_") or "model"
+        storage_template = cfg.get("hpo_storage_template")
+        storage_uri = cfg.get("hpo_storage")
+        if storage_template:
+            storage_uri = str(storage_template).format(name=name_slug, algo=algo)
+        if storage_uri is not None:
+            storage_uri = str(storage_uri).strip() or None
+        study_name = cfg.get("hpo_study_name")
+        study_name_template = cfg.get("hpo_study_name_template")
+        if study_name_template:
+            study_name = str(study_name_template).format(name=name_slug, algo=algo)
+        elif study_name:
+            study_name = str(study_name).format(name=name_slug, algo=algo)
+        else:
+            study_name = name_slug
+        hpo_resume = bool(cfg.get("hpo_resume", True))
 
         def param_space(trial) -> Dict[str, Any]:
             if algo in ("lightgbm", "xgboost"):
@@ -2108,11 +2217,19 @@ class ModelTrainer:
             LOG.warning("[ModelTrainer] Optuna unavailable for %s; using default params=%s", name, default_params)
             best_params = {k: v for k, v in default_params.items() if v is not None}
             best_cv = ts_score(best_params, trial_label="default", trial_started_at=time.perf_counter())
+            hpo_trials_completed = 0
         else:
-            study = self._make_study(direction="minimize", cfg=cfg)
+            study = self._make_study(
+                direction="minimize",
+                cfg=cfg,
+                study_name=study_name,
+                storage_uri=storage_uri,
+                load_if_exists=hpo_resume,
+            )
             if study is None:
                 best_params = {k: v for k, v in default_params.items() if v is not None}
                 best_cv = ts_score(best_params, trial_label="default", trial_started_at=time.perf_counter())
+                hpo_trials_completed = 0
                 X_fit, mi_report = self._apply_mutual_info_filter(X_df, y, name, emit_log=True)
                 fit_num_cols, fit_cat_cols = self._split_feature_types(X_fit)
                 final_model, finalize_report = self._finalize_binary_model(
@@ -2136,6 +2253,7 @@ class ModelTrainer:
                     "cv_score": best_cv,
                     "best_params": best_params,
                     "hpo_trials": 0,
+                    "hpo_trials_completed": 0,
                     "class_counts": class_counts,
                     "selected_feature_cols": list(X_fit.columns),
                     "feature_selection": mi_report,
@@ -2145,16 +2263,79 @@ class ModelTrainer:
                 }
                 metrics.update(finalize_report)
                 return final_model, metrics
-            with self._suppress_low_signal_warnings():
-                study.optimize(objective, n_trials=n_trials, show_progress_bar=False, callbacks=[_cb])
-            best_params = study.best_params
-            best_cv = -study.best_value
+            completed_before = self._completed_trial_count(study) if storage_uri else 0
+            trials_to_run = max(int(n_trials) - int(completed_before), 0) if storage_uri else int(n_trials)
+            interrupted = False
+            if trials_to_run > 0:
+                try:
+                    with self._suppress_low_signal_warnings():
+                        study.optimize(objective, n_trials=trials_to_run, show_progress_bar=False, callbacks=[_cb])
+                except KeyboardInterrupt:
+                    interrupted = True
+            best_params_raw, best_value_raw = self._safe_best_study_params(study)
+            if interrupted and best_params_raw is None:
+                raise KeyboardInterrupt
+            if best_params_raw is None or best_value_raw is None:
+                best_params = {k: v for k, v in default_params.items() if v is not None}
+                best_cv = ts_score(best_params, trial_label="default", trial_started_at=time.perf_counter())
+            else:
+                best_params = best_params_raw
+                best_cv = -float(best_value_raw)
+            hpo_trials_completed = self._completed_trial_count(study)
             LOG.info(
                 f"[ModelTrainer] Best params {name}: {best_params} | cv_score={best_cv:.4f} "
                 f"HPO elapsed={time.perf_counter() - hpo_t0:.1f}s"
             )
             self._log_hpo_summary(name, best_cv, best_params, hpo_t0)
             best_params = {k: v for k, v in best_params.items() if v is not None}
+            if interrupted:
+                LOG.warning(
+                    "[ModelTrainer] %s interrupted; finalizing checkpoint from best completed trial (%s/%s completed).",
+                    name,
+                    hpo_trials_completed,
+                    n_trials,
+                )
+                X_fit, mi_report = self._apply_mutual_info_filter(X_df, y, name, emit_log=True)
+                fit_num_cols, fit_cat_cols = self._split_feature_types(X_fit)
+                final_model, finalize_report = self._finalize_binary_model(
+                    X_df=X_fit,
+                    y=y,
+                    cfg=cfg,
+                    name=name,
+                    algo=algo,
+                    params=best_params,
+                    num_cols=fit_num_cols,
+                    cat_cols=fit_cat_cols,
+                    class_weight=cw,
+                    scale_pos_weight=scale_pos,
+                )
+                console_stage(
+                    "Feature selection ready",
+                    f"{self._display_name(name)} selected={len(X_fit.columns)}/{len(X_df.columns)} leak_safe=cv-fold",
+                    status="ok",
+                )
+                metrics = {
+                    "cv_score": best_cv,
+                    "best_params": best_params,
+                    "hpo_trials": n_trials,
+                    "hpo_trials_completed": hpo_trials_completed,
+                    "class_counts": class_counts,
+                    "selected_feature_cols": list(X_fit.columns),
+                    "feature_selection": mi_report,
+                    "model_importance": self._extract_model_importance(final_model),
+                    "permutation_importance": self._permutation_importance_audit(final_model, X_fit, y),
+                    "feature_dominance_audit": {
+                        "skipped_due_to_interrupt": True,
+                    },
+                    "checkpoint_interrupted": True,
+                    "checkpoint_reason": "keyboard_interrupt",
+                    "metrics_partial": True,
+                    "hpo_storage": storage_uri,
+                    "hpo_study_name": study_name,
+                    "cv_metric_source": "optuna_best_trial",
+                }
+                metrics.update(finalize_report)
+                return final_model, metrics
 
         best_params, best_cv = self._evolutionary_refine(
             name=name,
@@ -2190,6 +2371,7 @@ class ModelTrainer:
             "cv_score": best_cv,
             "best_params": best_params,
             "hpo_trials": n_trials,
+            "hpo_trials_completed": hpo_trials_completed,
             # record label balance for downstream monitoring
             "class_counts": class_counts,
             "selected_feature_cols": list(X_fit.columns),
@@ -2197,6 +2379,8 @@ class ModelTrainer:
             "model_importance": importance_report,
             "permutation_importance": perm_report,
             "feature_dominance_audit": self._feature_dominance_audit(final_model, X_fit, y, name),
+            "hpo_storage": storage_uri,
+            "hpo_study_name": study_name,
         }
         metrics.update(finalize_report)
         return final_model, metrics
@@ -2358,6 +2542,9 @@ class ModelTrainer:
         )
         hazard_started = time.perf_counter()
         processed_bins = 0
+        per_bin_ap: Dict[str, float] = {}
+        per_bin_event_rate: Dict[str, float] = {}
+        per_bin_best_params: Dict[str, Dict[str, Any]] = {}
 
         # Optional challenger selection on a representative probe bin,
         # then reuse the winner for all hazard bins to control runtime.
@@ -2400,6 +2587,7 @@ class ModelTrainer:
                 continue
             processed_bins += 1
             bin_started = time.perf_counter()
+            per_bin_event_rate[str(b)] = float(y_bin.mean())
             if b == 1 or b == horizon or b % max(1, horizon // 6) == 0:
                 console_stage(
                     f"Hazard bin {processed_bins}/{max(eligible_total, 1)}",
@@ -2540,16 +2728,24 @@ class ModelTrainer:
                     with self._suppress_low_signal_warnings():
                         study.optimize(objective, n_trials=hpo_trials, show_progress_bar=False, callbacks=[_cb])
                     best_params = study.best_params
+                    per_bin_ap[str(b)] = float(-study.best_value)
                 else:
                     best_params = default_params
             else:
                 best_params = default_params
+            per_bin_best_params[str(b)] = dict(best_params)
 
             clf = build_estimator(best_params)
             pre = self._build_preprocessor(num_cols, cat_cols, algo=selected_algo)
             pipe = Pipeline([("pre", pre), ("clf", clf)])
             with self._suppress_low_signal_warnings():
                 pipe.fit(X_all, y_bin)
+                if str(b) not in per_bin_ap:
+                    prob_full = self._positive_class_proba(pipe, X_all)
+                    try:
+                        per_bin_ap[str(b)] = float(average_precision_score(y_bin, prob_full))
+                    except Exception:
+                        per_bin_ap[str(b)] = float("nan")
             models[b] = pipe
             total_elapsed = time.perf_counter() - hazard_started
             rate = processed_bins / max(total_elapsed, 1e-6)
@@ -2566,11 +2762,22 @@ class ModelTrainer:
             )
 
         LOG.info(f"[ModelTrainer] Hazard model trained with {len(models)} bins.")
+        metrics = {
+            "selected_algorithm": selected_algo,
+            "horizon_bars": horizon,
+            "eligible_bins": int(processed_bins),
+            "min_event_fraction": float(min_event_fraction),
+            "avg_bin_ap": float(np.nanmean(list(per_bin_ap.values()))) if per_bin_ap else None,
+            "per_bin_ap": per_bin_ap,
+            "per_bin_event_rate": per_bin_event_rate,
+            "per_bin_best_params": per_bin_best_params,
+            "feature_count": int(len(feature_cols)),
+        }
         return models, {
             "horizon_bars": horizon,
             "feature_cols": feature_cols,
             "selected_algorithm": selected_algo,
-        }
+        }, metrics
 
     # ------------------------------------------------------------------
     # Quantile forecaster (LightGBM regressor)
@@ -2607,6 +2814,8 @@ class ModelTrainer:
         )
         quant_started = time.perf_counter()
         total_q = len(quantiles)
+        per_q_loss: Dict[str, float] = {}
+        per_q_best_params: Dict[str, Dict[str, Any]] = {}
 
         for q_idx, q in enumerate(quantiles, start=1):
             LOG.info(f"[ModelTrainer] Training quantile model q={q}")
@@ -2724,6 +2933,10 @@ class ModelTrainer:
                     pipe = Pipeline([("pre", pre), ("reg", base_final)])
                     with self._suppress_low_signal_warnings():
                         pipe.fit(X_all, returns)
+                        pred_full = pipe.predict(X_all)
+                        e = returns - pred_full
+                        per_q_loss[str(q)] = float(np.mean(np.maximum(q * e, (q - 1) * e)))
+                    per_q_best_params[str(q)] = dict(best_params)
                     models[f"q_{q}"] = pipe
                     console_stage(
                         f"Quantile q={q} ready",
@@ -2754,6 +2967,7 @@ class ModelTrainer:
                 with self._suppress_low_signal_warnings():
                     study.optimize(objective, n_trials=n_trials, show_progress_bar=False, callbacks=[_cb])
                 best_params = study.best_params
+                per_q_loss[str(q)] = float(study.best_value)
                 self._log_hpo_summary(
                     q_name,
                     float(study.best_value),
@@ -2762,12 +2976,17 @@ class ModelTrainer:
                     metric_label="best_loss",
                     extra={"objective": "pinball"},
                 )
+            per_q_best_params[str(q)] = dict(best_params)
 
             base_final = build_quantile_model(best_params)
             pre = self._build_preprocessor(num_cols, cat_cols, algo=algo)
             pipe = Pipeline([("pre", pre), ("reg", base_final)])
             with self._suppress_low_signal_warnings():
                 pipe.fit(X_all, returns)
+                if str(q) not in per_q_loss:
+                    pred_full = pipe.predict(X_all)
+                    e = returns - pred_full
+                    per_q_loss[str(q)] = float(np.mean(np.maximum(q * e, (q - 1) * e)))
             models[f"q_{q}"] = pipe
             console_stage(
                 f"Quantile q={q} ready",
@@ -2787,4 +3006,13 @@ class ModelTrainer:
                 status="info",
             )
 
-        return models, {"quantiles": quantiles, "features": feature_cols}
+        metrics = {
+            "selected_algorithm": algo,
+            "quantiles": list(quantiles),
+            "cv_pinball_loss": float(np.mean(list(per_q_loss.values()))) if per_q_loss else None,
+            "per_quantile_cv_loss": per_q_loss,
+            "per_quantile_best_params": per_q_best_params,
+            "rows": int(len(X_all)),
+            "feature_count": int(len(feature_cols)),
+        }
+        return models, {"quantiles": quantiles, "features": feature_cols, "selected_algorithm": algo}, metrics

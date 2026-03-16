@@ -2118,6 +2118,13 @@ This applies to all specialist TCN entrypoints because they share the same gener
 - `train_BTCUSD_edp_tcn_model.py`
 - `train_BTCUSD_all_tcn_models.py`
 
+The same interrupt-checkpoint behavior now also applies to the newer stack entrypoints:
+
+- `train_BTCUSD_meta_tcn_model.py`
+- `train_BTCUSD_confluence_tcn_model.py`
+- `train_BTCUSD_meta_hybrid_model.py`
+- `train_BTCUSD_confluence_hybrid_model.py`
+
 During long Temporal Convolutional Network (TCN) runs, live progress is persisted to:
 
 - `artifacts/train/BTCUSD/<target>_tcn/hpo_progress.json` (latest snapshot)
