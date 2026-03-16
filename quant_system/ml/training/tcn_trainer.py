@@ -1261,6 +1261,220 @@ class TCNSpecialistTrainer:
             "lookback": int(params["lookback"]),
         }
 
+    def _compute_acceptance_report(
+        self,
+        *,
+        final_fit: Dict[str, Any],
+        X_dev: pd.DataFrame,
+        X_accept: Optional[pd.DataFrame],
+        y_accept: Optional[np.ndarray],
+        acceptance_rows: int,
+        cv_score: float,
+    ) -> Dict[str, Any]:
+        acceptance_cfg = deepcopy(self.cfg.get("acceptance", {}))
+        acceptance_report: Dict[str, Any] = {
+            "enabled": bool(acceptance_cfg.get("enabled", True)),
+            "rows": int(acceptance_rows),
+            "metrics": None,
+            "gate": {"pass": None, "reasons": []},
+        }
+        if X_accept is None or y_accept is None or len(X_accept) <= 0:
+            return acceptance_report
+
+        lookback = int(final_fit.get("lookback", 1))
+        context_rows = max(lookback - 1, 0)
+        X_context = X_dev.tail(context_rows) if context_rows > 0 else X_dev.iloc[0:0]
+        X_eval = pd.concat([X_context, X_accept], axis=0)
+        p_eval_full = final_fit["model"].predict_proba(X_eval)[:, 1]
+        p_accept = np.asarray(p_eval_full[-len(X_accept):], dtype=float)
+        decision_thr = float(final_fit.get("threshold_tuning", {}).get("threshold", 0.5))
+        acceptance_metrics = self._evaluate_binary_predictions(y_accept, p_accept, decision_thr)
+        acceptance_report["metrics"] = acceptance_metrics
+
+        reasons: List[str] = []
+        max_drop = float(acceptance_cfg.get("max_score_drop", 0.05))
+        min_score = acceptance_cfg.get("min_score", None)
+        min_precision = float(acceptance_cfg.get("min_precision_at_threshold", 0.10))
+        if min_score is not None and float(acceptance_metrics["score"]) < float(min_score):
+            reasons.append("acceptance_score_below_min")
+        if (float(cv_score) - float(acceptance_metrics["score"])) > max_drop:
+            reasons.append("acceptance_drop_exceeds_tolerance")
+        if float(acceptance_metrics["precision_at_threshold"]) < min_precision:
+            reasons.append("acceptance_precision_below_min")
+        acceptance_report["gate"] = {
+            "pass": len(reasons) == 0,
+            "reasons": reasons,
+            "max_score_drop": max_drop,
+            "min_score": min_score,
+            "min_precision_at_threshold": min_precision,
+        }
+        return acceptance_report
+
+    def _read_tree_baseline(self) -> Optional[float]:
+        tree_baseline = None
+        if self.tree_manifest_path is not None and self.tree_manifest_path.exists():
+            try:
+                payload = json.loads(self.tree_manifest_path.read_text(encoding="utf-8"))
+                tree_baseline = (
+                    payload.get("metrics", {})
+                    .get("by_model", {})
+                    .get(self.target, {})
+                    .get("cv_score")
+                )
+                if tree_baseline is not None:
+                    tree_baseline = float(tree_baseline)
+            except Exception:
+                tree_baseline = None
+        return tree_baseline
+
+    @staticmethod
+    def _best_study_value(study: optuna.Study) -> Optional[float]:
+        try:
+            return float(study.best_value)
+        except Exception:
+            return None
+
+    def _build_interrupt_checkpoint_result(
+        self,
+        *,
+        study: optuna.Study,
+        X_dev: pd.DataFrame,
+        y_dev: np.ndarray,
+        X_accept: Optional[pd.DataFrame],
+        y_accept: Optional[np.ndarray],
+        acceptance_rows: int,
+        feature_cols: List[str],
+        class_counts: Dict[Any, Any],
+        started: float,
+        run_started_epoch: float,
+        n_trials: int,
+        study_name: str,
+        storage_uri: Optional[str],
+        reason: str,
+    ) -> Dict[str, Any]:
+        complete_trials = [t for t in study.trials if t.state == TrialState.COMPLETE]
+        if not complete_trials:
+            self._write_progress_snapshot(
+                {
+                    "status": "interrupted",
+                    "phase": "hpo",
+                    "asset": self.asset,
+                    "target": self.target,
+                    "run_started_at_epoch": float(run_started_epoch),
+                    "requested_trials": int(n_trials),
+                    "completed_trials": int(self._count_completed_trials(study)),
+                    "remaining_trials": int(max(n_trials - self._count_completed_trials(study), 0)),
+                    "elapsed_sec": float(time.time() - float(run_started_epoch)),
+                    "study_name": study_name,
+                    "hpo_storage": storage_uri,
+                    "checkpoint_saved": False,
+                    "checkpoint_reason": reason,
+                },
+                append_event=True,
+            )
+            raise KeyboardInterrupt
+
+        console_stage(
+            f"{self.target} TCN checkpoint",
+            "interrupt received | finalizing best completed trial",
+            status="warn",
+        )
+        best_params = deepcopy(study.best_params)
+        best_value = self._best_study_value(study)
+        if best_value is None:
+            best_value = float("nan")
+        final_fit = self._fit_final_model(X_dev, y_dev, best_params)
+        acceptance_report = self._compute_acceptance_report(
+            final_fit=final_fit,
+            X_dev=X_dev,
+            X_accept=X_accept,
+            y_accept=y_accept,
+            acceptance_rows=acceptance_rows,
+            cv_score=float(best_value),
+        )
+        tree_baseline = self._read_tree_baseline()
+        metrics = {
+            "cv_score": float(best_value),
+            "cv_ap": float(best_value) if np.isfinite(best_value) else None,
+            "cv_auc": None,
+            "cv_score_std": None,
+            "best_params": best_params,
+            "hpo_trials": int(n_trials),
+            "hpo_trials_completed": int(self._count_completed_trials(study)),
+            "hpo_study_name": study.study_name,
+            "hpo_storage": storage_uri,
+            "class_counts": class_counts,
+            "dev_rows": int(len(X_dev)),
+            "acceptance_rows": int(acceptance_rows),
+            "selected_feature_cols": feature_cols,
+            "feature_transform_dim": int(final_fit["transform_dim"]),
+            "folds": [],
+            "calibration": final_fit["calibration"],
+            "threshold_tuning": final_fit["threshold_tuning"],
+            "stability": {
+                "enabled": bool(deepcopy(self.cfg.get("stability", {})).get("enabled", True)),
+                "rows": [],
+                "gate": {"pass": None},
+                "skipped_due_to_interrupt": True,
+            },
+            "acceptance": acceptance_report,
+            "feature_dominance_audit": {
+                "skipped_due_to_interrupt": True,
+            },
+            "tree_baseline_cv_score": tree_baseline,
+            "delta_vs_tree_cv_score": (
+                float(best_value) - tree_baseline
+                if tree_baseline is not None and np.isfinite(best_value)
+                else None
+            ),
+            "tcn_fit_runtime_sec": float(time.perf_counter() - started),
+            "checkpoint_interrupted": True,
+            "checkpoint_reason": reason,
+            "metrics_partial": True,
+            "cv_metric_source": "optuna_best_trial",
+        }
+        self._write_progress_snapshot(
+            {
+                "status": "checkpoint_saved",
+                "phase": "interrupted_checkpoint",
+                "asset": self.asset,
+                "target": self.target,
+                "run_started_at_epoch": float(run_started_epoch),
+                "elapsed_sec": float(time.time() - float(run_started_epoch)),
+                "requested_trials": int(n_trials),
+                "completed_trials": int(self._count_completed_trials(study)),
+                "remaining_trials": int(max(n_trials - self._count_completed_trials(study), 0)),
+                "cv_score": float(metrics["cv_score"]) if metrics.get("cv_score") is not None else None,
+                "tree_baseline_cv_score": metrics.get("tree_baseline_cv_score"),
+                "delta_vs_tree_cv_score": metrics.get("delta_vs_tree_cv_score"),
+                "acceptance_gate": (metrics.get("acceptance", {}) or {}).get("gate"),
+                "stability_gate": (metrics.get("stability", {}) or {}).get("gate"),
+                "study_name": study_name,
+                "hpo_storage": storage_uri,
+                "best_params": best_params,
+                "threshold": ((metrics.get("threshold_tuning", {}) or {}).get("threshold")),
+                "checkpoint_saved": True,
+                "checkpoint_reason": reason,
+                "metrics_partial": True,
+            },
+            append_event=True,
+        )
+        console_stage(
+            f"{self.target} TCN checkpoint saved",
+            (
+                f"cv_score={metrics['cv_score']:.4f} "
+                f"completed_trials={metrics['hpo_trials_completed']}/{metrics['hpo_trials']}"
+            ),
+            status="warn",
+        )
+        return {
+            "model": final_fit["model"],
+            "metrics": metrics,
+            "feature_cols": feature_cols,
+            "runtime_sec": float(time.perf_counter() - started),
+            "outcome": "checkpoint_saved",
+        }
+
     def train(self, train_df: pd.DataFrame) -> Dict[str, Any]:
         started = time.perf_counter()
         if self.label_col not in train_df.columns:
@@ -1482,19 +1696,37 @@ class TCNSpecialistTrainer:
                 append_event=True,
             )
 
-        if trials_to_run > 0:
-            study.optimize(
-                objective,
-                n_trials=trials_to_run,
-                show_progress_bar=False,
-                gc_after_trial=bool(self.cfg.get("hpo_gc_after_trial", True)),
-                callbacks=[_hpo_callback],
-            )
-        else:
-            console_stage(
-                f"{self.target} TCN HPO",
-                "resume hit: requested trials already completed, skipping optimization",
-                status="ok",
+        try:
+            if trials_to_run > 0:
+                study.optimize(
+                    objective,
+                    n_trials=trials_to_run,
+                    show_progress_bar=False,
+                    gc_after_trial=bool(self.cfg.get("hpo_gc_after_trial", True)),
+                    callbacks=[_hpo_callback],
+                )
+            else:
+                console_stage(
+                    f"{self.target} TCN HPO",
+                    "resume hit: requested trials already completed, skipping optimization",
+                    status="ok",
+                )
+        except KeyboardInterrupt:
+            return self._build_interrupt_checkpoint_result(
+                study=study,
+                X_dev=X_dev,
+                y_dev=y_dev,
+                X_accept=X_accept,
+                y_accept=y_accept,
+                acceptance_rows=acceptance_rows,
+                feature_cols=feature_cols,
+                class_counts=class_counts,
+                started=started,
+                run_started_epoch=float(run_started_epoch),
+                n_trials=n_trials,
+                study_name=study_name,
+                storage_uri=storage_uri,
+                reason="keyboard_interrupt",
             )
         done_after_hpo = self._count_completed_trials(study)
         try:
@@ -1635,58 +1867,18 @@ class TCNSpecialistTrainer:
             append_event=True,
         )
 
-        acceptance_cfg = deepcopy(self.cfg.get("acceptance", {}))
-        acceptance_report: Dict[str, Any] = {
-            "enabled": bool(acceptance_cfg.get("enabled", True)),
-            "rows": int(acceptance_rows),
-            "metrics": None,
-            "gate": {"pass": None, "reasons": []},
-        }
-        if X_accept is not None and y_accept is not None and len(X_accept) > 0:
-            lookback = int(final_fit.get("lookback", 1))
-            context_rows = max(lookback - 1, 0)
-            X_context = X_dev.tail(context_rows) if context_rows > 0 else X_dev.iloc[0:0]
-            X_eval = pd.concat([X_context, X_accept], axis=0)
-            p_eval_full = final_fit["model"].predict_proba(X_eval)[:, 1]
-            p_accept = np.asarray(p_eval_full[-len(X_accept):], dtype=float)
-            decision_thr = float(final_fit.get("threshold_tuning", {}).get("threshold", 0.5))
-            acceptance_metrics = self._evaluate_binary_predictions(y_accept, p_accept, decision_thr)
-            acceptance_report["metrics"] = acceptance_metrics
-
-            reasons: List[str] = []
-            max_drop = float(acceptance_cfg.get("max_score_drop", 0.05))
-            min_score = acceptance_cfg.get("min_score", None)
-            min_precision = float(acceptance_cfg.get("min_precision_at_threshold", 0.10))
-            if min_score is not None and float(acceptance_metrics["score"]) < float(min_score):
-                reasons.append("acceptance_score_below_min")
-            if (float(cv_best["score_mean"]) - float(acceptance_metrics["score"])) > max_drop:
-                reasons.append("acceptance_drop_exceeds_tolerance")
-            if float(acceptance_metrics["precision_at_threshold"]) < min_precision:
-                reasons.append("acceptance_precision_below_min")
-            acceptance_report["gate"] = {
-                "pass": len(reasons) == 0,
-                "reasons": reasons,
-                "max_score_drop": max_drop,
-                "min_score": min_score,
-                "min_precision_at_threshold": min_precision,
-            }
+        acceptance_report = self._compute_acceptance_report(
+            final_fit=final_fit,
+            X_dev=X_dev,
+            X_accept=X_accept,
+            y_accept=y_accept,
+            acceptance_rows=acceptance_rows,
+            cv_score=float(cv_best["score_mean"]),
+        )
 
         dominance_report = self._feature_dominance_audit(final_fit["model"], X_dev, y_dev)
 
-        tree_baseline = None
-        if self.tree_manifest_path is not None and self.tree_manifest_path.exists():
-            try:
-                payload = json.loads(self.tree_manifest_path.read_text(encoding="utf-8"))
-                tree_baseline = (
-                    payload.get("metrics", {})
-                    .get("by_model", {})
-                    .get(self.target, {})
-                    .get("cv_score")
-                )
-                if tree_baseline is not None:
-                    tree_baseline = float(tree_baseline)
-            except Exception:
-                tree_baseline = None
+        tree_baseline = self._read_tree_baseline()
 
         metrics = {
             "cv_score": float(cv_best["score_mean"]),
@@ -1758,4 +1950,5 @@ class TCNSpecialistTrainer:
             "metrics": metrics,
             "feature_cols": feature_cols,
             "runtime_sec": float(time.perf_counter() - started),
+            "outcome": "trained",
         }

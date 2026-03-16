@@ -1132,6 +1132,12 @@ Per-target HPO persistence:
 
 This allows interruption-safe resume without recomputing completed trials.
 
+The current TCN launcher also supports graceful interrupt checkpointing:
+
+- `Ctrl+C` during HPO saves the latest best completed trial as a versioned artifact
+- the saved manifest records `outcome=checkpoint_saved`
+- the next rerun resumes from the saved Optuna trial count, not from zero
+
 ### Adaptive Plateau Stop (Automatic Early Stop)
 
 If adaptive stop is enabled, HPO stops when both conditions hold:
@@ -1152,13 +1158,13 @@ After best-trial selection, the trainer runs additional safeguards:
 
 ### Saved Model Artifacts
 
-For each completed TCN specialist run:
+For each completed or interrupt-checkpointed TCN specialist run:
 
 - registry model saved as `BTCUSD_<target>_tcn` and alias `<target>_tcn`
 - versioned metrics saved in registry
 - `model_state.json` and `train_manifest.json` in target artifact folder
 
-This means trained TCN outputs are inference-ready and version-tracked, not just trial logs.
+If the run reached full completion, the manifest outcome is `trained`. If it was manually stopped after at least one completed HPO trial, the manifest outcome is `checkpoint_saved` and the artifact is still inference-ready and version-tracked.
 
 ## 9B. Temporal Convolutional Network (TCN) Design Rationale And Learning Mechanics
 
@@ -2092,6 +2098,25 @@ python train_BTCUSD_all_tree_models.py --include-extended
 ```
 
 Temporal Convolutional Network (TCN) HPO now supports SQLite-backed resume by default under each target artifact folder, so interrupted runs can continue without restarting from trial 1.
+
+If you stop a TCN run with `Ctrl+C`, the launcher now finalizes the latest best completed trial into a usable checkpoint artifact:
+
+- versioned registry model
+- versioned `metrics.json`
+- `model_state.json`
+- `train_manifest.json`
+
+That checkpoint artifact is marked as `outcome=checkpoint_saved`, while the Optuna study remains resumable. Re-running the same target continues the remaining HPO trials from the saved study state and can checkpoint again if interrupted later.
+
+This applies to all specialist TCN entrypoints because they share the same generic launcher:
+
+- `train_BTCUSD_liq_flow_tcn_model.py`
+- `train_BTCUSD_bos_cont_tcn_model.py`
+- `train_BTCUSD_flow_1h_tcn_model.py`
+- `train_BTCUSD_momo_tcn_model.py`
+- `train_BTCUSD_eop_tcn_model.py`
+- `train_BTCUSD_edp_tcn_model.py`
+- `train_BTCUSD_all_tcn_models.py`
 
 During long Temporal Convolutional Network (TCN) runs, live progress is persisted to:
 

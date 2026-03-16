@@ -76,7 +76,7 @@ def run_target(
         raise SystemExit(f"Unsupported target '{target}'. Choose from: {', '.join(sorted(TARGET_COLUMN_MAP))}")
 
     started = time.perf_counter()
-    completed = False
+    persisted = False
     root = Path("artifacts/train") / ASSET / f"{target}_tcn"
     root.mkdir(parents=True, exist_ok=True)
 
@@ -184,92 +184,145 @@ def run_target(
         metrics = train_result["metrics"]
         model_obj = train_result["model"]
         feature_cols = train_result["feature_cols"]
+        outcome = str(train_result.get("outcome", "trained"))
 
         registry_dir = _resolve_registry_dir(unified_cfg)
-        registry = ModelRegistry(str(registry_dir))
         versioner = ModelVersionManager(str(registry_dir / ".model_versions.json"))
         version = versioner.new_version(f"{ASSET}_tcn")
-
-        model_name_asset = f"{ASSET}_{target}_tcn"
-        model_name_alias = f"{target}_tcn"
-        model_config = {
-            "features": feature_cols,
-            "framework": "torch_tcn",
-            "target": target,
-            "label_col": TARGET_COLUMN_MAP[target],
-            "tcn": {
-                "best_params": metrics.get("best_params", {}),
-                "feature_transform_dim": metrics.get("feature_transform_dim"),
-                "decision_threshold": (metrics.get("threshold_tuning", {}) or {}).get("threshold"),
-            },
-        }
-
-        registry.save_model(model_name_asset, version, model_obj, None, model_config)
-        registry.save_model(model_name_alias, version, model_obj, None, model_config)
-        registry.save_metrics(model_name_asset, version, metrics)
-        registry.save_metrics(model_name_alias, version, metrics)
-
-        model_state = {
-            "asset": ASSET,
-            "version": version,
-            "requested_models": [f"{target}_tcn"],
-            "trained_models": [f"{target}_tcn"],
-            "dependency_models": [],
-            "registry_dir": str(registry_dir),
-        }
-        save_json(model_state_out, model_state)
-
-        manifest = {
-            "asset": ASSET,
-            "version": version,
-            "rows": int(len(train_df)),
-            "registry_dir": str(registry_dir),
-            "tf_dir": tf_dir,
-            "features_csv": features_csv,
-            "labels_csv": labels_csv,
-            "features_out": features_csv,
-            "labels_out": labels_csv,
-            "merged_out": str(merged_out),
-            "model_state_out": str(model_state_out),
-            "requested_models": [f"{target}_tcn"],
-            "trained_models": [f"{target}_tcn"],
-            "dependency_models": [],
-            "metrics": {
-                "summary": {
-                    "avg_cv_score": metrics.get("cv_score"),
-                    "specialists_with_metrics": [f"{target}_tcn"],
-                },
-                "by_model": {
-                    f"{target}_tcn": metrics,
-                },
-            },
-            "governance": {
-                "submitted": False,
-                "reason": "TCN benchmark model trained for comparison; promotion workflow remains tree-stack based.",
-                "available_metrics": [f"{target}_tcn"],
-                "acceptance_gate": (metrics.get("acceptance", {}) or {}).get("gate"),
-                "stability_gate": ((metrics.get("stability", {}) or {}).get("gate")),
-            },
-        }
-        save_json(manifest_out, manifest)
+        manifest = _persist_tcn_result(
+            asset=ASSET,
+            target=target,
+            registry_dir=registry_dir,
+            version=version,
+            train_df=train_df,
+            tf_dir=tf_dir,
+            features_csv=features_csv,
+            labels_csv=labels_csv,
+            merged_out=merged_out,
+            model_state_out=model_state_out,
+            manifest_out=manifest_out,
+            feature_cols=feature_cols,
+            metrics=metrics,
+            model_obj=model_obj,
+            outcome=outcome,
+        )
 
         console_stage(
             "TCN model launcher complete",
-            f"model={target}_tcn version={version} cv_score={metrics.get('cv_score'):.4f}",
-            status="ok",
+            (
+                f"model={target}_tcn version={version} outcome={outcome} "
+                f"cv_score={metrics.get('cv_score'):.4f}"
+            ),
+            status="warn" if outcome == "checkpoint_saved" else "ok",
         )
-        completed = True
+        persisted = True
         return manifest
     finally:
         console_stage(
             "TCN training runtime",
             f"target={target} elapsed={fmt_seconds(time.perf_counter() - started)}",
-            status="ok" if completed else "warn",
+            status="ok" if persisted else "warn",
         )
 
 
 def deepcopy_dict(value: dict) -> dict:
     return {k: v for k, v in (value or {}).items()}
+
+
+def _persist_tcn_result(
+    *,
+    asset: str,
+    target: str,
+    registry_dir: Path,
+    version: str,
+    train_df,
+    tf_dir: str,
+    features_csv: str,
+    labels_csv: str,
+    merged_out: Path,
+    model_state_out: Path,
+    manifest_out: Path,
+    feature_cols: list,
+    metrics: dict,
+    model_obj,
+    outcome: str,
+) -> dict:
+    registry = ModelRegistry(str(registry_dir))
+    model_name_asset = f"{asset}_{target}_tcn"
+    model_name_alias = f"{target}_tcn"
+    model_config = {
+        "features": feature_cols,
+        "framework": "torch_tcn",
+        "target": target,
+        "label_col": TARGET_COLUMN_MAP[target],
+        "training_outcome": outcome,
+        "tcn": {
+            "best_params": metrics.get("best_params", {}),
+            "feature_transform_dim": metrics.get("feature_transform_dim"),
+            "decision_threshold": (metrics.get("threshold_tuning", {}) or {}).get("threshold"),
+        },
+    }
+
+    registry.save_model(model_name_asset, version, model_obj, None, model_config)
+    registry.save_model(model_name_alias, version, model_obj, None, model_config)
+    registry.save_metrics(model_name_asset, version, metrics)
+    registry.save_metrics(model_name_alias, version, metrics)
+
+    model_state = {
+        "asset": asset,
+        "version": version,
+        "requested_models": [f"{target}_tcn"],
+        "trained_models": [f"{target}_tcn"],
+        "dependency_models": [],
+        "registry_dir": str(registry_dir),
+        "outcome": outcome,
+        "checkpoint_interrupted": bool(metrics.get("checkpoint_interrupted", False)),
+        "hpo_trials_completed": metrics.get("hpo_trials_completed"),
+        "hpo_trials_requested": metrics.get("hpo_trials"),
+    }
+    save_json(model_state_out, model_state)
+
+    manifest = {
+        "asset": asset,
+        "version": version,
+        "rows": int(len(train_df)),
+        "registry_dir": str(registry_dir),
+        "tf_dir": tf_dir,
+        "features_csv": features_csv,
+        "labels_csv": labels_csv,
+        "features_out": features_csv,
+        "labels_out": labels_csv,
+        "merged_out": str(merged_out),
+        "model_state_out": str(model_state_out),
+        "requested_models": [f"{target}_tcn"],
+        "trained_models": [f"{target}_tcn"],
+        "dependency_models": [],
+        "outcome": outcome,
+        "checkpoint_interrupted": bool(metrics.get("checkpoint_interrupted", False)),
+        "metrics": {
+            "summary": {
+                "avg_cv_score": metrics.get("cv_score"),
+                "specialists_with_metrics": [f"{target}_tcn"],
+            },
+            "by_model": {
+                f"{target}_tcn": metrics,
+            },
+        },
+        "governance": {
+            "submitted": False,
+            "reason": (
+                "TCN checkpoint artifact saved from latest completed HPO trial; "
+                "resume the same target to continue remaining trials."
+                if outcome == "checkpoint_saved"
+                else "TCN benchmark model trained for comparison; promotion workflow remains tree-stack based."
+            ),
+            "available_metrics": [f"{target}_tcn"],
+            "acceptance_gate": (metrics.get("acceptance", {}) or {}).get("gate"),
+            "stability_gate": ((metrics.get("stability", {}) or {}).get("gate")),
+        },
+    }
+    save_json(manifest_out, manifest)
+    return manifest
 
 
 def main() -> None:
