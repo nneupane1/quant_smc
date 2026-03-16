@@ -133,6 +133,9 @@ models:
     challenger_hpo_trials: 10
     calibrator: "platt"
     hpo_trials: 20
+    hpo_resume: true
+    hpo_storage_template: "sqlite:///artifacts/train/BTCUSD/{name}/optuna_{algo}.db"
+    hpo_study_name_template: "{name}_{algo}"
     cv_splits: 3
     specialist_inputs: ["liq_flow", "bos_cont", "flow_1h", "momo", "eop", "edp"]
     hpo_space:
@@ -148,6 +151,9 @@ models:
     challenger_hpo_trials: 10
     calibrator: "isotonic"
     hpo_trials: 20
+    hpo_resume: true
+    hpo_storage_template: "sqlite:///artifacts/train/BTCUSD/{name}/optuna_{algo}.db"
+    hpo_study_name_template: "{name}_{algo}"
     cv_splits: 3
     specialist_inputs: ["liq_flow", "bos_cont", "flow_1h", "momo", "eop", "edp"]
     hpo_space:
@@ -336,6 +342,94 @@ tcn_training:
         lookback: [16, 64]
         max_epochs: [8, 20]
 
+# =======================================================
+# Long-range benchmark (PatchTST specialist classifiers)
+# =======================================================
+patchtst_training:
+  default:
+    random_seed: 42
+    hpo_trials: 12
+    hpo_resume: true
+    hpo_storage: null
+    hpo_study_name: null
+    hpo_pruner_warmup_steps: 1
+    hpo_gc_after_trial: true
+    hpo_log_every_n_trials: 1
+    hpo_adaptive_stop: true
+    hpo_adaptive_min_completed_trials: 6
+    hpo_adaptive_no_improve_trials: 4
+    hpo_adaptive_min_delta: 0.001
+    fold_heartbeat: true
+    epoch_heartbeat_seconds: 120
+    progress_snapshot_filename: "hpo_progress.json"
+    progress_events_filename: "hpo_progress.ndjson"
+    cv_splits: 4
+    embargo_bars: 2
+    feature_source: "tree_manifest"
+    calibrator: "auto"
+    holdout_frac: 0.15
+    acceptance:
+      enabled: true
+      holdout_frac: 0.10
+      min_rows: 4096
+      max_score_drop: 0.05
+      min_score: null
+      min_precision_at_threshold: 0.10
+    stability:
+      enabled: true
+      seeds: [42, 52, 62]
+      max_std: 0.02
+      max_drop_vs_best: 0.04
+    threshold_tuning:
+      enabled: true
+      metric: "f1"
+      beta: 1.0
+      min_precision: 0.10
+      min_recall: 0.01
+      default_threshold: 0.50
+      max_candidates: 256
+    feature_dominance_audit:
+      enabled: true
+      min_rows: 4096
+      sample_rows: 20000
+      random_state: 42
+      min_top_drop: 0.01
+      dominance_share_warn: 0.55
+      monitor_features_by_target:
+        flow_1h: ["flow_age_bars_1h", "flow_ok_1h", "flow_signal_1h"]
+    device: "cpu"
+    torch_num_threads: 1
+    torch_num_interop_threads: 1
+    mkldnn_enabled: false
+    preprocessing:
+      num_imputer: "median"
+      cat_imputer: "most_frequent"
+      scaler: "standard"
+      outlier_clip: true
+      clip_quantiles: [0.005, 0.995]
+    hpo_space:
+      lookback: [64, 256]
+      patch_len: [8, 32]
+      stride: [4, 16]
+      d_model: [32, 128]
+      depth: [2, 4]
+      dropout: [0.0, 0.30]
+      lr: [0.0001, 0.003]
+      weight_decay: [0.00000001, 0.001]
+      batch_size_choices: [32, 64, 128]
+      max_epochs: [8, 24]
+      patience: [3, 7]
+      n_head_choices: [2, 4, 8]
+      ff_mult_choices: [2, 4]
+  overrides:
+    flow_1h:
+      hpo_trials: 16
+      hpo_space:
+        lookback: [96, 256]
+    momo:
+      hpo_space:
+        lookback: [48, 192]
+
 # -------------------------------------------------------
 # Runtime inference routing
 # -------------------------------------------------------
@@ -349,3 +443,75 @@ inference_preference:
   challenger_mode: tcn
   # Hybrid stays disabled until dedicated *_hybrid stack artifacts exist.
   allow_hybrid_explicit: false
+  # Active route slot used by predictor resolution, e.g. production or hybrid_candidate.
+  active_slot: production
+
+# -------------------------------------------------------
+# Post-backtest trade-policy overlay training
+# -------------------------------------------------------
+trade_policy_training:
+  dataset:
+    # Binary label: realized R > threshold.
+    positive_r_threshold: 0.0
+    include_gate_features: true
+    include_reasoning: true
+  preprocessing:
+    num_imputer: median
+    cat_imputer: most_frequent
+    scaler: standard
+    scale_for_tree_models: false
+    outlier_clip: true
+    clip_quantiles: [0.01, 0.99]
+    feature_selection:
+      enabled: true
+      max_missing_ratio: 0.45
+      drop_exact_duplicates: true
+      correlation_threshold: 0.92
+      min_features: 12
+      use_mutual_info: true
+      mutual_info_top_k: 64
+      mutual_info_random_state: 42
+    threshold_tuning:
+      enabled: true
+      holdout_frac: 0.20
+      min_rows: 256
+      min_holdout_rows: 64
+      metric: "f1"
+      min_precision: 0.35
+      min_recall: 0.10
+      default_threshold: 0.50
+      max_candidates: 128
+  quality_model:
+    # Trade-policy rows are tabular entry-state observations, not raw sequences.
+    # Use a linear baseline and let tree challengers compete.
+    algorithm: logistic
+    challenger_enabled: true
+    challenger_algorithms: [lightgbm, xgboost]
+    challenger_hpo_trials: 12
+    calibrator: isotonic
+    hpo_trials: 30
+    cv_splits: 4
+    class_weight: balanced
+    hpo_space:
+      C: [0.01, 5.0]
+      n_estimators: [100, 500]
+      num_leaves: [15, 127]
+      max_depth: [3, 8]
+      learning_rate: [0.003, 0.12]
+      subsample: [0.6, 1.0]
+      colsample_bytree: [0.6, 1.0]
+      reg_alpha: [0.0, 5.0]
+      reg_lambda: [0.0, 5.0]
+  return_quantile_model:
+    # Quantile model estimates realized-R distribution for sizing / veto / ranking overlays.
+    algorithm: lightgbm
+    quantiles: [0.1, 0.5, 0.9]
+    hpo_trials: 24
+    cv_splits: 4
+    hpo_space:
+      n_estimators: [100, 500]
+      num_leaves: [15, 127]
+      max_depth: [3, 8]
+      learning_rate: [0.003, 0.12]
+      subsample: [0.6, 1.0]
+      colsample_bytree: [0.6, 1.0]

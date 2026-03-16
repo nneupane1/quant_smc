@@ -2554,6 +2554,8 @@ If a later stage fails, the right response is usually to inspect the expected ou
 
 `train_BTCUSD_meta_model.py` and `train_BTCUSD_confluence_model.py` now reuse saved specialist registry artifacts when they already exist. They only fall back to specialist retraining if a required dependency is missing or incompatible with the current training frame.
 
+Those two tree stackers also persist Optuna studies to `artifacts/train/BTCUSD/meta_model/` and `artifacts/train/BTCUSD/confluence_model/`, so an interrupted run can save a best-so-far artifact and later resume remaining HPO trials on rerun.
+
 ### Minimum Safe Sequence
 
 1. `python fetch_BTCUSD_resample.py`

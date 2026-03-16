@@ -1208,7 +1208,13 @@ class ModelTrainer:
         meta_model = meta_meta = meta_metrics = None
         if "meta_model" in requested_models:
             LOG.info("[ModelTrainer] Training meta model (stacking)")
-            meta_model, meta_meta = self._train_stack(df, specialists, meta_cfg, target_key="label_liq_flow")
+            meta_model, meta_meta = self._train_stack(
+                df,
+                specialists,
+                meta_cfg,
+                target_key="label_liq_flow",
+                stack_name="meta_model",
+            )
             meta_metrics = {
                 "selected_algorithm": meta_meta.get("selected_algorithm"),
                 "stack_inputs": meta_meta.get("stack_inputs", []),
@@ -1232,7 +1238,13 @@ class ModelTrainer:
         conf_model = conf_meta = conf_metrics = None
         if "confluence_model" in requested_models:
             LOG.info("[ModelTrainer] Training confluence model")
-            conf_model, conf_meta = self._train_stack(df, specialists, conf_cfg, target_key="label_liq_flow")
+            conf_model, conf_meta = self._train_stack(
+                df,
+                specialists,
+                conf_cfg,
+                target_key="label_liq_flow",
+                stack_name="confluence_model",
+            )
             conf_metrics = {
                 "selected_algorithm": conf_meta.get("selected_algorithm"),
                 "stack_inputs": conf_meta.get("stack_inputs", []),
@@ -2488,13 +2500,22 @@ class ModelTrainer:
     # ------------------------------------------------------------------
     # Stacking (meta / confluence)
     # ------------------------------------------------------------------
-    def _train_stack(self, df: pd.DataFrame, specialists: Dict[str, Dict[str, Any]], cfg: Dict[str, Any], target_key: str):
+    def _train_stack(
+        self,
+        df: pd.DataFrame,
+        specialists: Dict[str, Dict[str, Any]],
+        cfg: Dict[str, Any],
+        target_key: str,
+        *,
+        stack_name: str,
+    ):
         inputs = cfg.get("specialist_inputs", list(specialists.keys()))
         cv_splits = int(cfg.get("cv_splits", 3))
         y_meta = df[target_key].astype(int).values if target_key in df else df["label_liq_flow"].astype(int).values
+        stack_train_name = f"{stack_name}_{target_key}_stack"
 
         self._log_training_header(
-            name=f"{target_key}_stack",
+            name=stack_train_name,
             algo=f"{cfg.get('algorithm', 'logistic')}_stack",
             rows=len(df),
             features=len(inputs),
@@ -2547,7 +2568,7 @@ class ModelTrainer:
             X_df=X_train_df,
             y=y_train,
             cfg=cfg,
-            name=f"{target_key}_stack",
+            name=stack_train_name,
             num_cols=list(X_train_df.columns),
             cat_cols=[],
             default_algo="logistic",
