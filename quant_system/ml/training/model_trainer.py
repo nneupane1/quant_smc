@@ -353,6 +353,10 @@ class ModelTrainer:
         ).lower()
         bayes_cfg = self.optim_cfg.get("bayesian", {}) or {}
         seed = int(bayes_cfg.get("seed", 42))
+        if storage_uri and str(storage_uri).startswith("sqlite:///") and str(storage_uri) != "sqlite:///:memory:":
+            sqlite_path = str(storage_uri).split("?", 1)[0][10:]
+            if sqlite_path:
+                Path(sqlite_path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
 
         try:
             if sampler_name == "random":
