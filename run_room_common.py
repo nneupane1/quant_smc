@@ -22,7 +22,6 @@ REQUIRED_GENERIC_MODELS = [
     "momo",
     "eop",
     "edp",
-    "meta_model",
     "confluence_model",
     "hazard",
     "quantile",
